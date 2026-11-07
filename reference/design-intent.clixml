@@ -1,0 +1,50 @@
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">
+  <Obj RefId="0">
+    <TN RefId="0">
+      <T>System.Management.Automation.PSCustomObject</T>
+      <T>System.Object</T>
+    </TN>
+    <MS>
+      <S N="Telos">It's Notepad until it isn't.</S>
+      <Obj N="InteractionContract" RefId="1">
+        <TN RefId="1">
+          <T>System.Object[]</T>
+          <T>System.Array</T>
+          <T>System.Object</T>
+        </TN>
+        <LST>
+          <S>Immediate plain-text editing</S>
+          <S>Familiar typing, selection, scrolling, tabs, save, undo/redo and shortcuts</S>
+          <S>Advanced appearance controls stay optional</S>
+        </LST>
+      </Obj>
+      <Obj N="CurrentWork" RefId="2">
+        <TNRef RefId="1" />
+        <LST>
+          <S>Minimize and Alt+Tab reliability</S>
+          <S>Material across title bar, editor canvas and panels</S>
+          <S>Background opacity independent of foreground</S>
+          <S>Editable color roles and restrained gradients</S>
+          <S>Optional stock-icon catalog and cycling</S>
+        </LST>
+      </Obj>
+      <Obj N="FutureOnly" RefId="3">
+        <TNRef RefId="1" />
+        <LST>
+          <S>ConPTY backend</S>
+          <S>Percept-based syntax highlighting</S>
+        </LST>
+      </Obj>
+      <S N="LoweredAppliance">Must not require SMA or pwsh runtime</S>
+      <Obj N="UserPreferences" RefId="4">
+        <TNRef RefId="1" />
+        <LST>
+          <S>Purple-charcoal palette colors without branded theme names</S>
+          <S>Consolas remains available</S>
+          <S>No system settings changed by the app</S>
+        </LST>
+      </Obj>
+      <DT N="TimeUtc">2026-11-05T15:43:40.3535199Z</DT>
+    </MS>
+  </Obj>
+</Objs>
