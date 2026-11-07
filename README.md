@@ -38,8 +38,7 @@ pwsh -NoProfile -STA -File .\Notepad.ps1 -Compare
 pwsh -NoProfile -STA -File .\Notepad.ps1 -Compare -RefreshReal
 ```
 
-`Compare-Notepad.ps1` forwards to that entry point for compatibility. Logs and
-typed evidence remain in `evidence`. Original files and the SHA-256 manifests
+Logs and typed evidence remain in `evidence`. Original files and the SHA-256 manifests
 are retained beside the edits for review. UNKNOWN properties remain unverified.
 
 **Settings → Appearance** includes Mica, Acrylic and Reverse Mica (DWM MicaAlt),
