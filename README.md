@@ -8,7 +8,7 @@ or Windows Forms. The original HTML is included as a fidelity reference.
 ## Run
 
 Requires Windows x64 and PowerShell 7. Tested here on PowerShell 7.6.6.
-Extract the entire ZIP, then double-click **Start Notepad.cmd**.
+The application is the single script `Notepad.ps1`; double-click **Start Notepad.cmd**.
 
 For a visible error console:
 
@@ -104,8 +104,8 @@ the final effects/presentation path is still to be selected and verified.
 ## Validation
 
 ```powershell
-pwsh -NoProfile -File .\tests\Model.Verify.ps1
-pwsh -NoProfile -STA -File .\tests\Graphics.Smoke.ps1
+pwsh -NoProfile -File .\Notepad.ps1 -VerifyModel
+pwsh -NoProfile -STA -File .\Notepad.ps1 -VerifyGraphics
 pwsh -NoProfile -STA -File .\Notepad.ps1 -NoSession -RunSeconds 2
 pwsh -NoProfile -STA -File .\Notepad.ps1 -Compare -VerifyNativeFeatures
 ```
@@ -118,15 +118,21 @@ establish screenshot equality or complete input-method support.
 
 ## Files
 
-- `Notepad.ps1`: application state orchestration, retained views, input and rendering.
-- `src/Design.ps1`: inline restricted design data, CSS, generated HTML tree and SVGs.
-- `src/Graphics.Windows.ps1`: direct Direct2D/DirectWrite operations.
-- `src/Window.Windows.ps1`: native window, DPI, input queue and message pump.
-- `src/Services.Windows.ps1`: Windows file dialogs and clipboard.
-- `src/Model.ps1`: document/edit/find/persistence operations.
-- `src/Native.ps1`: QuickPS-derived native delegate binder with PSObject unwrapping
-  and explicit native numeric argument conversion fixes in this project copy.
-- `reference/notepad.html`: unchanged original design.
+- `Notepad.ps1`: the whole application in one script, consolidated by PSC from the
+  former `src` and `tests` scripts, each now a function:
+  - `Invoke-Design`: inline restricted design data, CSS, generated HTML tree and SVGs.
+  - `Invoke-Graphics.Windows`: direct Direct2D/DirectWrite operations.
+  - `Invoke-Window.Windows`: native window, DPI, input queue and message pump.
+  - `Invoke-Services.Windows`: Windows file dialogs and clipboard.
+  - `Invoke-Model`: document/edit/find/persistence operations.
+  - `Invoke-Native`: QuickPS-derived native delegate binder with PSObject unwrapping
+    and explicit native numeric argument conversion fixes in this project copy.
+  - `Invoke-Model.Verify` and `Invoke-Graphics.Smoke`: the checks behind `-VerifyModel`
+    and `-VerifyGraphics`.
+- `reference/notepad.html.original`: the original HTML/JS design (the SHA-256 the design data records).
+- `reference/notepad.html`: the corrected reference page, loading `notepad.design.js`.
+- `reference/notepad.ts`, `reference/notepad.design.ts`: the TypeScript extracted from the original, with
+  their compiled JavaScript, source maps and trace build.
 - `reference/PORT-STUDY.md`: detailed initial source study.
 - `QuickPS-LICENSE`: attribution/license for the copied binder.
 
