@@ -1,0 +1,117 @@
+[CmdletBinding()]
+param([hashtable]$Settings=@{})
+if($MyInvocation.InvocationName -eq '.'){throw 'Invoke Model.ps1 with &.'}
+New-Module -AsCustomObject -ArgumentList $Settings -ScriptBlock {
+    param($Settings)
+    $script:state=@{Settings=$Settings;Tabs=[Collections.Generic.List[object]]::new();ActiveId=0;NextId=1;Find=@{Query='';Replacement='';MatchCase=$false;Wrap=$true;Matches=@();Index=-1}}
+    function State {$state}
+    function Active {foreach($tab in $state.Tabs){if($tab.Id -eq $state.ActiveId){return $tab}}}
+    function NewTab([string]$Title='Untitled',[string]$Text='',[string]$Path=$null,[bool]$Markdown=$false){
+        # New documents use Windows line endings. Only an opened LF file selects LF mode.
+        $lineEnding=if($Path -and $Text.Contains("`n") -and -not $Text.Contains("`r`n")){'Unix (LF)'}else{'Windows (CRLF)'}
+        $tab=@{Id=$state.NextId++;Title=$Title;Text=$Text.Replace("`r`n","`n").Replace("`r","`n");Path=$Path;Markdown=$Markdown;LineEnding=$lineEnding;Encoding='UTF-8';Bom=$false;Modified=$false;Revision=0;Anchor=0;Focus=0;ScrollX=0.0;ScrollY=0.0;Undo=[Collections.Generic.Stack[object]]::new();Redo=[Collections.Generic.Stack[object]]::new();LastEdit=[datetime]::MinValue}
+        $state.Tabs.Add($tab);$state.ActiveId=$tab.Id
+        $tab
+    }
+    function SwitchTab([int]$Id){if(@($state.Tabs|Where-Object Id -eq $Id).Count){$state.ActiveId=$Id;Find}}
+    function CloseTab([int]$Id){
+        for($i=0;$i -lt $state.Tabs.Count;$i++){if($state.Tabs[$i].Id -eq $Id){$state.Tabs.RemoveAt($i);if($state.ActiveId -eq $Id -and $state.Tabs.Count){$state.ActiveId=$state.Tabs[[Math]::Max(0,$i-1)].Id};break}}
+        if(-not $state.Tabs.Count){$null=NewTab};Find
+    }
+    function Snapshot($Tab){@{Text=$Tab.Text;Anchor=$Tab.Anchor;Focus=$Tab.Focus}}
+    function Select-Range([int]$Anchor,[int]$Focus){$tab=Active;$tab.Anchor=[Math]::Clamp($Anchor,0,$tab.Text.Length);$tab.Focus=[Math]::Clamp($Focus,0,$tab.Text.Length)}
+    function Select([int]$Anchor,[int]$Focus){Select-Range $Anchor $Focus}
+    function Insert([string]$Text,[bool]$Coalesce=$false){
+        $tab=Active;$start=[Math]::Min($tab.Anchor,$tab.Focus);$end=[Math]::Max($tab.Anchor,$tab.Focus)
+        if(-not $Coalesce -or ([DateTime]::UtcNow-$tab.LastEdit).TotalMilliseconds -gt 700 -or $start -ne $end){$tab.Undo.Push((Snapshot $tab))}
+        $tab.Redo.Clear();$Text=$Text.Replace("`r`n","`n").Replace("`r","`n")
+        $tab.Text=$tab.Text.Substring(0,$start)+$Text+$tab.Text.Substring($end)
+        $tab.Focus=$start+$Text.Length;$tab.Anchor=$tab.Focus;$tab.Modified=$true;$tab.Revision++;$tab.LastEdit=[DateTime]::UtcNow
+        Find
+    }
+    function Boundary([string]$Text,[int]$Position,[int]$Direction){
+        $offsets=[Globalization.StringInfo]::ParseCombiningCharacters($Text)
+        if($Direction -lt 0){for($i=$offsets.Length-1;$i -ge 0;$i--){if($offsets[$i] -lt $Position){return $offsets[$i]}};return 0}
+        foreach($offset in $offsets){if($offset -gt $Position){return $offset}};$Text.Length
+    }
+    function Delete([bool]$Backspace){
+        $tab=Active
+        if($tab.Anchor -eq $tab.Focus){$other=Boundary $tab.Text $tab.Focus $(if($Backspace){-1}else{1});if($other -eq $tab.Focus){return};$tab.Anchor=$other}
+        Insert ''
+    }
+    function Undo([bool]$Redo=$false){
+        $tab=Active;$from=$tab.Undo;$to=$tab.Redo;if($Redo){$from=$tab.Redo;$to=$tab.Undo}
+        if(-not $from.Count){return};$to.Push((Snapshot $tab));$saved=$from.Pop();$tab.Text=$saved.Text;$tab.Anchor=$saved.Anchor;$tab.Focus=$saved.Focus;$tab.Modified=$true;$tab.Revision++;$tab.LastEdit=[DateTime]::MinValue;Find
+    }
+    function Move([string]$Direction,[bool]$Extend=$false,[bool]$Word=$false){
+        $tab=Active;$pos=$tab.Focus
+        if($Direction -eq 'left' -and -not $Extend -and $tab.Anchor -ne $pos){$pos=[Math]::Min($tab.Anchor,$pos)}
+        elseif($Direction -eq 'right' -and -not $Extend -and $tab.Anchor -ne $pos){$pos=[Math]::Max($tab.Anchor,$pos)}
+        else{switch($Direction){
+            'left'{$pos=Boundary $tab.Text $pos -1;if($Word){while($pos -gt 0 -and [char]::IsWhiteSpace($tab.Text[$pos])){$pos=Boundary $tab.Text $pos -1};while($pos -gt 0 -and -not [char]::IsWhiteSpace($tab.Text[$pos-1])){$pos=Boundary $tab.Text $pos -1}}}
+            'right'{$pos=Boundary $tab.Text $pos 1;if($Word){while($pos -lt $tab.Text.Length -and -not [char]::IsWhiteSpace($tab.Text[$pos])){$pos=Boundary $tab.Text $pos 1};while($pos -lt $tab.Text.Length -and [char]::IsWhiteSpace($tab.Text[$pos])){$pos=Boundary $tab.Text $pos 1}}}
+            'home'{$pos=if($Word){0}else{$tab.Text.LastIndexOf("`n",[Math]::Max(0,$pos-1))+1};if($tab.Focus -eq 0){$pos=0}}
+            'end'{$pos=if($Word){$tab.Text.Length}else{$p=$tab.Text.IndexOf("`n",$pos);if($p -lt 0){$tab.Text.Length}else{$p}}}
+        }}
+        $tab.Focus=$pos;if(-not $Extend){$tab.Anchor=$pos};$tab.LastEdit=[DateTime]::MinValue
+    }
+    function Status {
+        $tab=Active;$start=[Math]::Min($tab.Anchor,$tab.Focus);$before=$tab.Text.Substring(0,$start);$lines=$before.Split("`n")
+        @{Line=$lines.Length;Column=$lines[-1].Length+1;Characters=$tab.Text.Length;Selected=[Math]::Abs($tab.Focus-$tab.Anchor)}
+    }
+    function Find {
+        $tab=Active;if(-not $tab){return};$find=$state.Find;$find.Matches=@();$find.Index=-1
+        if(-not $find.Query){return}
+        $comparison=if($find.MatchCase){[StringComparison]::Ordinal}else{[StringComparison]::OrdinalIgnoreCase}
+        $positions=[Collections.Generic.List[object]]::new();$offset=0
+        while($offset -le $tab.Text.Length-$find.Query.Length){$index=$tab.Text.IndexOf($find.Query,$offset,$comparison);if($index -lt 0){break};$positions.Add(@{Start=$index;End=$index+$find.Query.Length});$offset=$index+$find.Query.Length}
+        $find.Matches=$positions.ToArray()
+        if($positions.Count){$find.Index=0;for($i=0;$i -lt $positions.Count;$i++){if($positions[$i].Start -ge [Math]::Min($tab.Anchor,$tab.Focus)){$find.Index=$i;break}}}
+    }
+    function SelectMatch([int]$Step=0){
+        $find=$state.Find;if(-not $find.Matches.Count){Find};if(-not $find.Matches.Count){return}
+        $next=$find.Index+$Step
+        if($find.Wrap){$next=($next+$find.Matches.Count)%$find.Matches.Count}elseif($next -lt 0 -or $next -ge $find.Matches.Count){return}
+        $find.Index=$next;$match=$find.Matches[$next];Select-Range $match.Start $match.End
+    }
+    function Replace([bool]$All=$false){
+        $find=$state.Find;if(-not $find.Query){return}
+        if($All){Find;$tab=Active;$text=$tab.Text;for($i=$find.Matches.Count-1;$i -ge 0;$i--){$m=$find.Matches[$i];$text=$text.Substring(0,$m.Start)+$find.Replacement+$text.Substring($m.End)};if($find.Matches.Count){Select-Range 0 $tab.Text.Length;Insert $text}}
+        elseif($find.Matches.Count){$m=$find.Matches[$find.Index];Select-Range $m.Start $m.End;Insert $find.Replacement;SelectMatch}
+    }
+    function Save([int]$Id,[string]$Path){
+        $tab=$state.Tabs|Where-Object Id -eq $Id|Select-Object -First 1
+        if(-not $tab){throw "Unknown document $Id"}
+        $text=$tab.Text;if($tab.LineEnding -eq 'Windows (CRLF)'){$text=$text.Replace("`n","`r`n")}
+        $fullPath=[IO.Path]::GetFullPath($Path)
+        # Write a sibling temporary file first, then replace the destination. A
+        # failed write cannot mark a document clean or truncate the old contents.
+        $temporary=Join-Path ([IO.Path]::GetDirectoryName($fullPath)) ('.notepad-'+[Guid]::NewGuid().ToString('N')+'.tmp')
+        try{[IO.File]::WriteAllText($temporary,$text,[Text.UTF8Encoding]::new([bool]$tab.Bom));[IO.File]::Move($temporary,$fullPath,$true)}
+        finally{if([IO.File]::Exists($temporary)){[IO.File]::Delete($temporary)}}
+        $tab.Path=$fullPath;$tab.Title=[IO.Path]::GetFileName($fullPath);$tab.Modified=$false
+        @{Outcome='Saved';Id=$tab.Id;Path=$fullPath}
+    }
+    function Open([string]$Path){
+        $bytes=[IO.File]::ReadAllBytes($Path)
+        $bom=$bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191
+        $utf8=[Text.UTF8Encoding]::new($false,$true);$text=$utf8.GetString($bytes).TrimStart([char]0xFEFF)
+        $tab=NewTab ([IO.Path]::GetFileName($Path)) $text ([IO.Path]::GetFullPath($Path)) ($Path -match '\.md$');$tab.Bom=$bom
+        $tab
+    }
+    function ExportSession {
+        @{NextId=$state.NextId;ActiveId=$state.ActiveId;Tabs=@(foreach($tab in $state.Tabs){@{Id=$tab.Id;Title=$tab.Title;Text=$tab.Text;Path=$tab.Path;Markdown=$tab.Markdown;LineEnding=$tab.LineEnding;Encoding=$tab.Encoding;Bom=$tab.Bom;Modified=$tab.Modified;Anchor=$tab.Anchor;Focus=$tab.Focus;ScrollX=$tab.ScrollX;ScrollY=$tab.ScrollY}})}
+    }
+    function ImportSession([hashtable]$Session){
+        if(-not $Session.Tabs.Count){return};$state.Tabs.Clear();$ids=[Collections.Generic.HashSet[int]]::new()
+        foreach($saved in $Session.Tabs){
+            if(-not ($saved.Text -is [string]) -or -not $ids.Add([int]$saved.Id)){throw 'Invalid session document'}
+            $tab=NewTab $saved.Title $saved.Text $saved.Path $saved.Markdown
+            foreach($key in @('Id','LineEnding','Encoding','Bom','Modified','Anchor','Focus','ScrollX','ScrollY')){if($saved.ContainsKey($key)){$tab[$key]=$saved[$key]}}
+            $tab.Focus=[Math]::Clamp([int]$tab.Focus,0,$tab.Text.Length);$tab.Anchor=[Math]::Clamp([int]$tab.Anchor,0,$tab.Text.Length)
+        }
+        $state.NextId=[Math]::Max([int]$Session.NextId,([int]($state.Tabs.Id|Measure-Object -Maximum).Maximum+1))
+        $state.ActiveId=$state.Tabs[0].Id;if($ids.Contains([int]$Session.ActiveId)){$state.ActiveId=[int]$Session.ActiveId}
+    }
+    Export-ModuleMember -Function State,Active,NewTab,SwitchTab,CloseTab,Select,Insert,Delete,Undo,Move,Status,Find,SelectMatch,Replace,Save,Open,ExportSession,ImportSession
+}

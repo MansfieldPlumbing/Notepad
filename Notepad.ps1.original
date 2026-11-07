@@ -1,0 +1,569 @@
+[CmdletBinding()]
+param([string]$Path,[int]$Width=1280,[int]$Height=720,[switch]$NoSession,[int]$RunSeconds=0,[string]$DiagnosticPath)
+if($MyInvocation.InvocationName -eq '.'){throw 'Invoke Notepad.ps1 with &, not dot-sourcing.'}
+$ErrorActionPreference='Stop'
+if(-not $IsWindows){throw 'This direct Windows implementation requires PowerShell 7 on Windows.'}
+if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Launch with pwsh -STA -File Notepad.ps1.'}
+$design=& "$PSScriptRoot\src\Design.ps1"
+$settings=$design.DefaultSettings.Clone()
+$store=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'NotepadPS1'
+if(-not $NoSession -and (Test-Path "$store\settings.json")){
+    try{$saved=Get-Content "$store\settings.json" -Raw|ConvertFrom-Json -AsHashtable;foreach($key in $settings.Keys.Clone()){if($saved.ContainsKey($key)){$settings[$key]=$saved[$key]}}}catch{Write-Warning 'Saved settings could not be loaded; using defaults.'}
+}
+$model=& "$PSScriptRoot\src\Model.ps1" -Settings $settings
+$state=$model.State()
+if(-not $NoSession -and $settings.startupOption -eq 'continueSession' -and (Test-Path "$store\session.json")){
+    try{$model.ImportSession((Get-Content "$store\session.json" -Raw|ConvertFrom-Json -AsHashtable))}catch{Write-Warning 'Saved session could not be restored.'}
+}
+if(-not $state.Tabs.Count){$null=$model.NewTab()}
+if($Path){$null=$model.Open($Path);if($state.Tabs[0].Text -eq '' -and $state.Tabs.Count -eq 2){$model.CloseTab($state.Tabs[0].Id)}}
+$native=& "$PSScriptRoot\src\Native.ps1"
+$window=$null;$graphics=$null;$services=$null
+$ui=@{Dirty=$true;Running=$true;Hover='';Pressed='';Focus='editor-area';Menu='';Submenu='';Settings=$false;Expanded=@{};SettingsScroll=0.0;Find=$false;Replace=$false;Modal=$null;Dropdown=$null;Drag=$false;Blink=$true;LastBlink=[DateTime]::UtcNow;LastSession=[DateTime]::UtcNow;Width=0.0;Height=0.0;Dpi=96.0;Generation=0;Nodes=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal);Hits=[Collections.Generic.List[object]]::new();NextHits=$null;TextCache=@{};EditorLayout=[IntPtr]::Zero;EditorKey='';EditorOrigin=@(16.0,92.0);EditorRect=@(0,78,1280,614);EditorMetrics=@{};EnsureCaret=$true;InputAnchor=0;InputFocus=0;InputBuffers=@{};PendingHigh='';Focused=$true}
+$palette=@{}
+function Resolve-Theme {
+    $theme=$settings.theme
+    if($theme -eq 'system'){$value=Get-ItemPropertyValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name AppsUseLightTheme -ErrorAction SilentlyContinue;$theme=if($value -eq 1){'light'}else{'dark'}}
+    $script:palette=@{}
+    foreach($rule in $design.Styles.Rules){if($rule.Header -eq ':root' -or ($theme -eq 'light' -and $rule.Header -eq '[data-theme="light"]')){foreach($declaration in $rule.Declarations){$palette[$declaration.Property]=$declaration.Value}}}
+    $ui.Theme=$theme;$ui.Dirty=$true
+}
+function Color([string]$Name){$palette['--'+$Name]}
+function Persist {
+    if($NoSession){return}
+    New-Item -ItemType Directory -Path $store -Force|Out-Null
+    foreach($item in @(@{Name='settings';Value=$settings},@{Name='session';Value=$(if($settings.startupOption -eq 'continueSession'){$model.ExportSession()}else{@{Tabs=@()}})})){
+        $temporary=Join-Path $store ($item.Name+'.tmp');$destination=Join-Path $store ($item.Name+'.json')
+        [IO.File]::WriteAllText($temporary,($item.Value|ConvertTo-Json -Depth 32),[Text.UTF8Encoding]::new($false));[IO.File]::Move($temporary,$destination,$true)
+    }
+}
+function Invalidate([bool]$Caret=$false){$ui.Dirty=$true;if($Caret){$ui.EnsureCaret=$true;$ui.Blink=$true;$ui.LastBlink=[DateTime]::UtcNow}}
+function Node([string]$Id,[double]$X,[double]$Y,[double]$W,[double]$H,[string]$Action,[object]$Data=$null,[string]$Cursor='pointer'){
+    if(-not $ui.Nodes.ContainsKey($Id)){$ui.Nodes[$Id]=@{Id=$Id}}
+    $node=$ui.Nodes[$Id];$node.Rect=@($X,$Y,$W,$H);$node.Action=$Action;$node.Data=$Data;$node.Cursor=$Cursor;$node.Generation=$ui.Generation+1;$node.Clip=$ui.HitClip
+    $ui.NextHits.Add($node.Clone())
+}
+function Label([string]$Text,[double]$X,[double]$Y,[double]$W,[string]$Color,[double]$Size=13,[string]$Family='Segoe UI',[int]$Weight=400){
+    $key="$Text|$W|$Size|$Family|$Weight"
+    if(-not $ui.TextCache.ContainsKey($key)){$ui.TextCache[$key]=$graphics.Layout($Text,$Family,[single]$Size,[single][Math]::Max(1,$W),$false,$Weight,$false,0)}
+    $graphics.DrawLayout($ui.TextCache[$key],[single]$X,[single]$Y,$Color)
+}
+function Icon([string]$Name,[double]$X,[double]$Y,[double]$Size,[string]$Fill='',[double]$Rotation=0){if(-not $Fill){$Fill=Color 'text-primary'};$graphics.Icon($design.Icons[$Name],[single]$X,[single]$Y,[single]$Size,$Fill,$Rotation)}
+function Button([string]$Id,[double]$X,[double]$Y,[double]$W,[double]$H,[string]$Action,[string]$Text='',[string]$Icon='',[object]$Data=$null,[bool]$Primary=$false,[bool]$Border=$false,[double]$IconSize=16){
+    Node $Id $X $Y $W $H $Action $Data
+    $hover=$ui.Hover -eq $Id;$pressed=$ui.Pressed -eq $Id
+    $bg=if($Primary){Color $(if($hover){'accent-hover'}else{'accent-color'})}elseif($pressed){Color 'bg-control-active'}elseif($hover){Color 'bg-control-hover'}elseif($Border){Color 'bg-control'}else{'transparent'}
+    $fg=Color 'text-primary'
+    if($Id -in @('btn-win-close','settings-win-close') -and $hover){$bg='#c42b1c';$fg='#ffffff'}
+    if($Primary){$fg='#ffffff'}
+    if($bg -ne 'transparent'){$graphics.Fill($X,$Y,$W,$H,$bg,4)}
+    if($Border -and -not $Primary){$graphics.Stroke($X,$Y,$W,$H,(Color 'border-control'),4,1)}
+    if($Icon){Icon $Icon ($X+($W-$IconSize)/2) ($Y+($H-$IconSize)/2) $IconSize $fg}
+    if($Text){$layout=$graphics.Layout($Text,'Segoe UI',13,$W,$false,400,$false,0);try{$m=$graphics.Metrics($layout);$graphics.DrawLayout($layout,($X+($W-$m.Width)/2),($Y+($H-$m.Height)/2),$fg)}finally{$graphics.ReleaseLayout($layout)}}
+}
+function InputBox([string]$Id,[string]$Value,[double]$X,[double]$Y,[double]$W,[string]$Placeholder='',[double]$H=30){
+    Node $Id $X $Y $W $H 'focusInput' $Id 'text'
+    $graphics.Fill($X,$Y,$W,$H,(Color 'bg-window'),4);$graphics.Stroke($X,$Y,$W,$H,(Color 'border-control'),4,1)
+    $focused=$ui.Focus -eq $Id
+    if($focused){$graphics.Fill(($X+1),($Y+$H-2),($W-2),2,(Color 'accent-color'),0)}
+    $graphics.Clip(($X+7),($Y+2),($W-14),($H-4))
+    $layout=$graphics.Layout($Value,'Segoe UI',13,100000,$false,400,$false,0)
+    try{
+        $metrics=$graphics.Metrics($layout);$originY=$Y+($H-$metrics.Height)/2
+        $offset=0.0
+        if($focused){
+            $focus=[Math]::Clamp([int]$ui.InputFocus,0,$Value.Length);$anchor=[Math]::Clamp([int]$ui.InputAnchor,0,$Value.Length)
+            $caret=$graphics.Caret($layout,$focus,$false);$offset=[Math]::Max(0,$caret.X-($W-22))
+            foreach($rect in @($graphics.Selection($layout,[Math]::Min($focus,$anchor),[Math]::Abs($focus-$anchor)))){$graphics.Fill(($X+8+$rect.X-$offset),($originY+$rect.Y),$rect.Width,$rect.Height,(Color 'selection-bg'),0)}
+            if($ui.Blink){$graphics.Fill(($X+8+$caret.X-$offset),($originY+$caret.Y),1,$caret.Height,(Color 'text-primary'),0)}
+        }
+        if($Value){$graphics.DrawLayout($layout,($X+8-$offset),$originY,(Color 'text-primary'))}else{Label $Placeholder ($X+8) $originY ($W-16) (Color 'text-secondary') 13}
+    }finally{$graphics.ReleaseLayout($layout);$graphics.Unclip()}
+}
+function Open-Modal([string]$Title,[string]$Message,[object[]]$Buttons,[bool]$Input=$false,[string]$Value=''){
+    $ui.Menu='';$ui.Dropdown=$null;$ui.Modal=@{Title=$Title;Message=$Message;Buttons=$Buttons;Input=$Input;Value=$Value;Markdown=$null}
+    if($Input){$ui.Focus='dialog-input';$ui.InputAnchor=0;$ui.InputFocus=$Value.Length}else{$ui.Focus='modal'}
+    Invalidate
+}
+function Save-Document([object]$Tab,[bool]$SaveAs=$false){
+    try{
+        $destination=$Tab.Path
+        if($SaveAs -or -not $destination){$suggested=$Tab.Title;if(-not [IO.Path]::GetExtension($suggested)){$suggested+='.txt'};$destination=$services.FileDialog($true,$suggested)}
+        if(-not $destination){return $false}
+        $null=$model.Save($Tab.Id,$destination);Persist;Invalidate;return $true
+    }catch{Open-Modal 'Notepad' $_.Exception.Message @(@{Text='Close';Action='dismiss';Primary=$true});return $false}
+}
+function Request-Close([int]$TabId=0){
+    if($TabId){$tab=$state.Tabs|Where-Object Id -eq $TabId|Select-Object -First 1;if(-not $tab.Modified){$model.CloseTab($TabId);Invalidate $true;return};Open-Modal 'Notepad' "Do you want to save changes to $($tab.Title)?" @(@{Text='Save';Action='saveCloseTab';Data=$TabId;Primary=$true},@{Text="Don't Save";Action='discardTab';Data=$TabId},@{Text='Cancel';Action='dismiss'})}
+    elseif(@($state.Tabs|Where-Object Modified).Count){Open-Modal 'Notepad' 'You have unsaved changes. Do you want to save before closing?' @(@{Text='Save All';Action='saveCloseWindow';Primary=$true},@{Text="Don't Save";Action='discardWindow'},@{Text='Cancel';Action='dismiss'})}
+    else{$ui.Running=$false}
+}
+function Command([string]$Action,[object]$Data=$null){
+    $tab=$model.Active()
+    switch($Action){
+        'newTab'{$null=$model.NewTab();$ui.Focus='editor-area'}
+        'newMarkdownTab'{$null=$model.NewTab('Untitled.md',"# Markdown Document`n`nWrite here...",$null,$true);$ui.Focus='editor-area'}
+        'newWindow'{$start=[Diagnostics.ProcessStartInfo]::new('pwsh');foreach($a in @('-NoProfile','-STA','-File',"$PSScriptRoot\Notepad.ps1")){$start.ArgumentList.Add($a)};$start.UseShellExecute=$true;$null=[Diagnostics.Process]::Start($start)}
+        'switchTab'{$model.SwitchTab([int]$Data);$ui.Focus='editor-area'}
+        'closeTab'{Request-Close $tab.Id}
+        'closeSpecific'{Request-Close ([int]$Data)}
+        'closeWindow'{Request-Close}
+        'exit'{Request-Close}
+        'save'{$null=Save-Document $tab}
+        'saveAs'{$null=Save-Document $tab $true}
+        'saveAll'{foreach($document in $state.Tabs){if($document.Modified -and -not (Save-Document $document)){break}}}
+        'openFile'{try{$file=$services.FileDialog($false,'');if($file){$null=$model.Open($file);$ui.Focus='editor-area'}}catch{Open-Modal 'Open file' $_.Exception.Message @(@{Text='Close';Action='dismiss';Primary=$true})}}
+        'undo'{$model.Undo($false)}
+        'redo'{$model.Undo($true)}
+        'selectAll'{$model.Select(0,$tab.Text.Length)}
+        'copy'{$start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor);if($length){$services.WriteClipboard($tab.Text.Substring($start,$length))}}
+        'cut'{$start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor);if($length){$services.WriteClipboard($tab.Text.Substring($start,$length));$model.Insert('',$false)}}
+        'paste'{$model.Insert($services.ReadClipboard(),$false)}
+        'delete'{$model.Delete($false)}
+        'timeDate'{$now=[DateTime]::Now;$model.Insert(($now.ToString('t')+' '+$now.ToString('M/d/yyyy',[Globalization.CultureInfo]::InvariantCulture)),$false)}
+        'find' {Open-Find $false}
+        'replace'{Open-Find $true}
+        'closeFind'{$ui.Find=$false;$ui.Focus='editor-area'}
+        'findNext'{$model.SelectMatch(1)}
+        'findPrevious'{$model.SelectMatch(-1)}
+        'findCase'{$state.Find.MatchCase=-not $state.Find.MatchCase;$model.Find();$model.SelectMatch(0)}
+        'findWrap'{$state.Find.Wrap=-not $state.Find.Wrap}
+        'toggleReplace'{$ui.Replace=-not $ui.Replace;if($ui.Replace){Focus-Input 'replace-query-input'}}
+        'doReplace'{$model.Replace($false)}
+        'doReplaceAll'{$model.Replace($true)}
+        'goTo'{$s=$model.Status();Open-Modal 'Go to line' 'Line number:' @(@{Text='Go to';Action='gotoConfirm';Primary=$true},@{Text='Cancel';Action='dismiss'}) $true ([string]$s.Line)}
+        'gotoConfirm'{$line=0;if([int]::TryParse([string]$Data,[ref]$line) -and $line -gt 0){$lines=$tab.Text.Split("`n");$pos=0;for($i=0;$i -lt [Math]::Min($line-1,$lines.Length);$i++){$pos+=$lines[$i].Length+1};$model.Select([Math]::Min($pos,$tab.Text.Length),[Math]::Min($pos,$tab.Text.Length))};$ui.Focus='editor-area'}
+        'zoomIn'{$settings.zoom=[Math]::Min(500,[int]$settings.zoom+10)}
+        'zoomOut'{$settings.zoom=[Math]::Max(20,[int]$settings.zoom-10)}
+        'zoomReset'{$settings.zoom=100}
+        'toggleStatusBar'{$settings.showStatusBar=-not $settings.showStatusBar}
+        'toggleWordWrap'{$settings.wordWrap=-not $settings.wordWrap}
+        'lineEnding'{$tab.LineEnding=if($tab.LineEnding -eq 'Unix (LF)'){'Windows (CRLF)'}else{'Unix (LF)'};$tab.Modified=$true}
+        'openSettings'{$ui.Settings=$true;$ui.Menu='';$ui.Focus='settings'}
+        'openFontSettings'{$ui.Settings=$true;$ui.Expanded['card-font-setting']=$true;$ui.SettingsScroll=0;$ui.Focus='settings'}
+        'back'{$ui.Settings=$false;$ui.Dropdown=$null;$ui.Focus='editor-area'}
+        'accordion'{$ui.Expanded[$Data]=-not $ui.Expanded[$Data]}
+        'toggleSetting'{$settings[$Data]=-not $settings[$Data]}
+        'startup'{$settings.startupOption=$Data}
+        'settingSelect'{$ui.Dropdown=@{Key=$Data.Key;Options=$Data.Options;Rect=$Data.Rect;Id=$Data.Id}}
+        'chooseSetting'{$settings[$Data.Key]=$Data.Value;$ui.Dropdown=$null;if($Data.Key -eq 'theme'){Resolve-Theme}}
+        'toggleMenu'{$ui.Menu=if($ui.Menu -eq $Data){''}else{$Data};$ui.Submenu=''}
+        'submenu'{$ui.Submenu=$Data}
+        'minimize'{$window.Caption('minimize')}
+        'maximize'{$window.Caption('maximize')}
+        'drag'{$window.Caption('drag')}
+        'focusInput'{Focus-Input $Data}
+        'discardTab'{$model.CloseTab([int]$Data);$ui.Focus='editor-area'}
+        'saveCloseTab'{$document=$state.Tabs|Where-Object Id -eq $Data|Select-Object -First 1;if(Save-Document $document){$model.CloseTab([int]$Data);$ui.Focus='editor-area'}}
+        'discardWindow'{$ui.Running=$false}
+        'saveCloseWindow'{$success=$true;foreach($document in $state.Tabs){if($document.Modified -and -not(Save-Document $document)){$success=$false;break}};if($success){$ui.Running=$false}}
+        'dismiss'{$ui.Focus='editor-area'}
+        'toggleMarkdownPreview'{Open-Modal ('Markdown Preview: '+$tab.Title) '' @(@{Text='Close';Action='dismiss';Primary=$true});$ui.Modal.Markdown=$tab.Text}
+        'link'{if($Data -match '^https://'){$start=[Diagnostics.ProcessStartInfo]::new($Data);$start.UseShellExecute=$true;$null=[Diagnostics.Process]::Start($start)}}
+        'clearFormatting'{}
+        'pageSetup'{Open-Modal 'Page setup' 'Native print layout is not implemented in this build.' @(@{Text='Close';Action='dismiss';Primary=$true})}
+        'print'{Open-Modal 'Print' 'Native printing is not implemented in this build.' @(@{Text='Close';Action='dismiss';Primary=$true})}
+    }
+    Invalidate $true
+}
+function Open-Find([bool]$Replace){
+    $ui.Find=$true;$ui.Replace=$Replace;$ui.Menu='';$tab=$model.Active();$selected=$tab.Text.Substring([Math]::Min($tab.Anchor,$tab.Focus),[Math]::Abs($tab.Focus-$tab.Anchor))
+    if($selected -and -not $selected.Contains("`n")){$state.Find.Query=$selected}
+    $model.Find();$model.SelectMatch(0);Focus-Input 'find-query-input'
+}
+function Input-Value([string]$Id){switch($Id){'find-query-input'{$state.Find.Query};'replace-query-input'{$state.Find.Replacement};'dialog-input'{$ui.Modal.Value};default{''}}}
+function Set-InputValue([string]$Id,[string]$Value){switch($Id){'find-query-input'{$state.Find.Query=$Value;$model.Find();$model.SelectMatch(0)};'replace-query-input'{$state.Find.Replacement=$Value};'dialog-input'{$ui.Modal.Value=$Value}}}
+function Focus-Input([string]$Id){$ui.Focus=$Id;$value=Input-Value $Id;$ui.InputAnchor=0;$ui.InputFocus=$value.Length}
+function Input-Insert([string]$Text){$value=Input-Value $ui.Focus;$start=[Math]::Min($ui.InputAnchor,$ui.InputFocus);$end=[Math]::Max($ui.InputAnchor,$ui.InputFocus);Set-InputValue $ui.Focus ($value.Substring(0,$start)+$Text+$value.Substring($end));$ui.InputFocus=$start+$Text.Length;$ui.InputAnchor=$ui.InputFocus}
+
+function Paint-Editor {
+    $tab=$model.Active();$bottom=if($settings.showStatusBar){28}else{0};$h=[Math]::Max(1,$ui.Height-78-$bottom)
+    $ui.EditorRect=@(0.0,78.0,$ui.Width,$h)
+    $graphics.Fill(0,78,$ui.Width,$h,(Color 'bg-editor'),0)
+    Node 'editor-area' 0 78 $ui.Width $h 'editor' $null 'text'
+    $fontSize=[int]$settings.fontSize*96/72*([int]$settings.zoom/100)
+    $lineHeight=$fontSize*1.45;$weight=if($settings.fontStyle.Contains('Bold')){700}else{400};$italic=$settings.fontStyle.Contains('Italic')
+    $available=[Math]::Max(1,$ui.Width-32-12)
+    $key="$($tab.Id)|$($tab.Revision)|$available|$fontSize|$($settings.fontFamily)|$($settings.fontStyle)|$($settings.wordWrap)"
+    if($key -ne $ui.EditorKey){
+        if($ui.EditorLayout -ne [IntPtr]::Zero){$graphics.ReleaseLayout($ui.EditorLayout)}
+        $ui.EditorLayout=$graphics.Layout($tab.Text,$settings.fontFamily,$fontSize,$available,[bool]$settings.wordWrap,$weight,$italic,$lineHeight)
+        $ui.EditorKey=$key;$ui.EditorMetrics=$graphics.Metrics($ui.EditorLayout)
+    }
+    $layout=$ui.EditorLayout;$caret=$graphics.Caret($layout,[uint32]$tab.Focus,$false)
+    if($ui.EnsureCaret){
+        if($caret.Y -lt $tab.ScrollY){$tab.ScrollY=$caret.Y}
+        if($caret.Y+$caret.Height -gt $tab.ScrollY+$h-28){$tab.ScrollY=$caret.Y+$caret.Height-$h+28}
+        if(-not $settings.wordWrap){if($caret.X -lt $tab.ScrollX){$tab.ScrollX=$caret.X};if($caret.X -gt $tab.ScrollX+$available-2){$tab.ScrollX=$caret.X-$available+2}}else{$tab.ScrollX=0}
+        $ui.EnsureCaret=$false
+    }
+    $tab.ScrollY=[Math]::Clamp([double]$tab.ScrollY,0,[Math]::Max(0,$ui.EditorMetrics.Height-$h+28))
+    $ox=16-$tab.ScrollX;$oy=92-$tab.ScrollY;$ui.EditorOrigin=@($ox,$oy)
+    $graphics.Clip(0,78,($ui.Width-12),$h)
+    $start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor)
+    $rects=@($graphics.Selection($layout,$start,$length))
+    foreach($rect in $rects){$graphics.Fill(($ox+$rect.X),($oy+$rect.Y),[Math]::Max(1,$rect.Width),$rect.Height,(Color 'selection-bg'),0)}
+    $graphics.DrawLayout($layout,$ox,$oy,(Color 'text-primary'))
+    # Repaint selected glyphs through each selection clip, using selection-text.
+    foreach($rect in $rects){$graphics.Clip(($ox+$rect.X),($oy+$rect.Y),[Math]::Max(1,$rect.Width),$rect.Height);$graphics.DrawLayout($layout,$ox,$oy,(Color 'selection-text'));$graphics.Unclip()}
+    if($ui.Focus -eq 'editor-area' -and $ui.Focused -and $ui.Blink -and -not $ui.Modal -and -not $ui.Settings){$graphics.Fill(($ox+$caret.X),($oy+$caret.Y),1,$caret.Height,(Color 'accent-color'),0)}
+    $graphics.Unclip()
+    if($ui.EditorMetrics.Height -gt $h-28){
+        $track=$h-6;$thumb=[Math]::Max(24,$track*($h-28)/$ui.EditorMetrics.Height);$ty=81+($track-$thumb)*$tab.ScrollY/[Math]::Max(1,($ui.EditorMetrics.Height-$h+28))
+        $graphics.Fill(($ui.Width-9),$ty,6,$thumb,'rgba(255,255,255,0.2)',3)
+        Node 'editor-scrollbar' ($ui.Width-12) 78 12 $h 'scrollbar' $null 'default'
+    }
+}
+function Paint-Chrome {
+    $w=$ui.Width;$tab=$model.Active();$graphics.Fill(0,0,$w,40,(Color 'bg-titlebar'),0);$graphics.Fill(0,39.2,$w,0.8,(Color 'border-subtle'),0)
+    Node 'titlebar-drag' 0 0 $w 40 'drag' $null 'default';Icon 'app' 10 11 18
+    $x=40.0;$right=$w-138
+    $graphics.Clip(40,0,[Math]::Max(0,$right-76),40)
+    foreach($document in $state.Tabs){
+        $id='tab-'+$document.Id;$active=$document.Id -eq $state.ActiveId;$hover=$ui.Hover.StartsWith($id)
+        $measure=$graphics.Layout($document.Title,'Segoe UI',12,10000,$false,400,$false,0);try{$tw=[Math]::Clamp(($graphics.Metrics($measure).Width+52),130,220)}finally{$graphics.ReleaseLayout($measure)}
+        $bg=if($active){Color 'bg-tab-active'}elseif($hover){Color 'bg-tab-hover'}else{'transparent'}
+        if($bg -ne 'transparent'){$graphics.Fill($x,5.2,$tw,34,$bg,7);$graphics.Fill($x,32,($tw),7.2,$bg,0)}
+        if($active){$graphics.Stroke($x,5.2,$tw,34,(Color 'border-subtle'),7,0.8)}
+        Node $id $x 5.2 $tw 34 'switchTab' $document.Id
+        $graphics.Clip(($x+12),8,($tw-44),28);Label $document.Title ($x+12) 14 ($tw-44) (Color $(if($active -or $hover){'text-primary'}else{'text-secondary'})) 12;$graphics.Unclip()
+        if($active -or $hover){
+            if($document.Modified -and -not $hover){$graphics.Fill(($x+$tw-32),19.5,4.6,6,(Color 'text-secondary'),3)}
+            $cx=$x+$tw-28
+            Node ($id+'-close') $cx 12.2 20 20 'closeSpecific' $document.Id
+            if($ui.Hover -eq $id+'-close'){$graphics.Fill($cx,12.2,20,20,(Color 'bg-control-hover'),4)}
+            Icon 'close' ($cx+2.3) 14.5 15.4 '#000000'
+        }elseif($document.Modified){$graphics.Fill(($x+$tw-21),19.5,6,6,(Color 'text-secondary'),3)}
+        $x+=$tw+2
+    }
+    $graphics.Unclip();$x=[Math]::Min($x+4,$right-36)
+    Button 'btn-add-tab' $x 6 32 32 'newTab' '' 'plus' $null $false $false 14
+    Button 'btn-win-min' ($w-138) 0 46 40 'minimize' '' 'minimize' $null $false $false 10
+    Button 'btn-win-max' ($w-92) 0 46 40 'maximize' '' 'maximize' $null $false $false 10
+    Button 'btn-win-close' ($w-46) 0 46 40 'closeWindow' '' 'close' $null $false $false 10
+    $graphics.Fill(0,40,$w,38,(Color 'bg-menubar'),0);$graphics.Fill(0,77.2,$w,0.8,(Color 'border-subtle'),0)
+    $mx=8.0
+    foreach($entry in @(@('file','File',44),@('edit','Edit',44),@('view','View',48))){
+        if($ui.Menu -eq $entry[0]){$graphics.Fill($mx,44,($entry[2]),28,(Color 'bg-control-hover'),4)}
+        Button ('menu-btn-'+$entry[0]) $mx 44 $entry[2] 28 'toggleMenu' $entry[1] '' $entry[0]
+        $mx+=$entry[2]+2
+    }
+    Button 'btn-whats-new' ($w-76) 43 32 32 'none' '' 'megaphone'
+    $graphics.Fill(($w-56),49,6,6,'#0090f1',3)
+    Button 'btn-settings-toggle' ($w-40) 43 32 32 'openSettings' '' 'gear'
+    if($settings.showStatusBar){
+        $y=$ui.Height-28;$graphics.Fill(0,$y,$w,28,(Color 'bg-statusbar'),0);$graphics.Fill(0,$y,$w,0.8,(Color 'border-subtle'),0)
+        $status=$model.Status();$cursor="Ln $($status.Line), Col $($status.Column)";$count=if($status.Selected){"$($status.Selected) selected"}else{"$($status.Characters) characters"}
+        Label $cursor 26 ($y+6) 170 (Color 'text-secondary') 12
+        $graphics.Fill(126,($y+7),0.8,14,(Color 'border-subtle'),0);Label $count 137 ($y+6) 200 (Color 'text-secondary') 12
+        $items=@(@{Id='sb-doc-type';Text=$(if($tab.Markdown){'Markdown'}else{'Plain text'});Width=100;Action='none'},@{Id='sb-zoom-level';Text=([string]$settings.zoom+'%');Width=70;Action='zoomReset'},@{Id='sb-line-ending';Text=$tab.LineEnding;Width=114;Action='lineEnding'},@{Id='sb-encoding';Text=$tab.Encoding;Width=74;Action='none'})
+        $sx=$w-374
+        foreach($item in $items){Node $item.Id $sx $y $item.Width 28 $item.Action;if($ui.Hover -eq $item.Id){$graphics.Fill($sx,$y,$item.Width,28,(Color 'bg-control-hover'),0)};Label $item.Text ($sx+10) ($y+6) ($item.Width-20) (Color 'text-secondary') 12;$sx+=$item.Width;$graphics.Fill($sx,($y+7),0.8,14,(Color 'border-subtle'),0)}
+    }
+}
+function Paint-Find {
+    if(-not $ui.Find){return}
+    $w=460.0;$x=$ui.Width-24-$w;$y=88.0;$h=if($ui.Replace){88}else{48}
+    $graphics.Fill($x,$y,$w,$h,(Color 'bg-flyout'),8);$graphics.Stroke($x,$y,$w,$h,(Color 'border-control'),8,1)
+    Node 'find-replace-panel' $x $y $w $h 'none'
+    InputBox 'find-query-input' $state.Find.Query ($x+10) ($y+9) 228 'Find' 28
+    $count=if(-not $state.Find.Query){'0 of 0'}elseif(-not $state.Find.Matches.Count){'No results'}else{"$($state.Find.Index+1) of $($state.Find.Matches.Count)"}
+    Label $count ($x+174) ($y+16) 62 (Color 'text-secondary') 12
+    $bx=$x+244
+    foreach($button in @(@('prev','arrowUp','findPrevious'),@('next','arrowDown','findNext'),@('case','caseSensitive','findCase'),@('wrap','wrapAround','findWrap'),@('replace','chevronDown','toggleReplace'),@('close','close','closeFind'))){
+        if(($button[0] -eq 'case' -and $state.Find.MatchCase) -or ($button[0] -eq 'wrap' -and $state.Find.Wrap)){$graphics.Fill($bx,($y+9),28,28,(Color 'bg-control-active'),4)}
+        Button ('find-btn-'+$button[0]) $bx ($y+9) 28 28 $button[2] '' $button[1] $null $false $false 14;$bx+=34
+    }
+    if($ui.Replace){InputBox 'replace-query-input' $state.Find.Replacement ($x+10) ($y+47) 253 'Replace with' 28;Button 'btn-do-replace' ($x+269) ($y+47) 74 28 'doReplace' 'Replace' '' $null $false $true;Button 'btn-do-replace-all' ($x+349) ($y+47) 100 28 'doReplaceAll' 'Replace all' '' $null $false $true}
+}
+function Paint-MenuRows([object[]]$Rows,[double]$X,[double]$Y,[double]$W,[string]$Prefix){
+    $h=8.0;foreach($row in $Rows){$h+=$(if($row.Separator){7}else{28})}
+    $graphics.Fill($X,$Y,$W,$h,(Color 'bg-flyout'),8);$graphics.Stroke($X,$Y,$W,$h,(Color 'border-control'),8,1)
+    Node ($Prefix+'-background') $X $Y $W $h 'none'
+    $ry=$Y+4
+    foreach($row in $Rows){
+        if($row.Separator){$graphics.Fill(($X+10),($ry+3),($W-20),1,(Color 'border-subtle'),0);$ry+=7;continue}
+        $id=$Prefix+'-'+$row.Action
+        if(-not $row.Disabled){Node $id ($X+4) $ry ($W-8) 28 $row.Action $row.Data}
+        if($ui.Hover -eq $id -and -not $row.Disabled){$graphics.Fill(($X+4),$ry,($W-8),28,(Color 'bg-flyout-item-hover'),4)}
+        $tx=$X+14
+        if($row.ContainsKey('Checked')){if($row.Checked){Icon 'check' $tx ($ry+8) 12};$tx+=22}
+        Label $row.Text $tx ($ry+5) ($W-28) (Color $(if($row.Disabled){'text-disabled'}else{'text-primary'})) 13
+        if($row.Shortcut){Label $row.Shortcut ($X+$W-113) ($ry+6) 96 (Color 'text-secondary') 12}
+        if($row.Submenu){Icon 'chevronRight' ($X+$W-24) ($ry+9) 10 (Color 'text-secondary');if($ui.Submenu -eq $row.Submenu){Paint-MenuRows $row.Rows ($X+$W-1) ($ry-4) 220 ($Prefix+'-sub')}}
+        $ry+=28
+    }
+}
+function Paint-Menus {
+    if(-not $ui.Menu){return}
+    $rows=switch($ui.Menu){
+        'file'{@(@{Text='New tab';Action='newTab';Shortcut='Ctrl+N'},@{Text='New window';Action='newWindow';Shortcut='Ctrl+Shift+N'},@{Text='New Markdown tab';Action='newMarkdownTab'},@{Text='Open';Action='openFile';Shortcut='Ctrl+O'},@{Text='Recent';Action='submenu';Data='recent';Submenu='recent';Rows=@(@{Text='No recent files';Action='none';Disabled=$true})},@{Text='Save';Action='save';Shortcut='Ctrl+S'},@{Text='Save as';Action='saveAs';Shortcut='Ctrl+Shift+S'},@{Text='Save all';Action='saveAll';Shortcut='Ctrl+Alt+S'},@{Separator=$true},@{Text='Page setup';Action='pageSetup'},@{Text='Print';Action='print';Shortcut='Ctrl+P'},@{Separator=$true},@{Text='Close tab';Action='closeTab';Shortcut='Ctrl+W'},@{Text='Close window';Action='closeWindow';Shortcut='Ctrl+Shift+W'},@{Text='Exit';Action='exit'})}
+        'edit'{@(@{Text='Undo';Action='undo';Shortcut='Ctrl+Z'},@{Separator=$true},@{Text='Cut';Action='cut';Shortcut='Ctrl+X'},@{Text='Copy';Action='copy';Shortcut='Ctrl+C'},@{Text='Paste';Action='paste';Shortcut='Ctrl+V'},@{Text='Delete';Action='delete';Shortcut='Del'},@{Separator=$true},@{Text='Clear formatting';Action='clearFormatting'},@{Text='Find';Action='find';Shortcut='Ctrl+F'},@{Text='Find next';Action='findNext';Shortcut='F3'},@{Text='Find previous';Action='findPrevious';Shortcut='Shift+F3'},@{Text='Replace';Action='replace';Shortcut='Ctrl+H'},@{Text='Go to';Action='goTo';Shortcut='Ctrl+G'},@{Separator=$true},@{Text='Select all';Action='selectAll';Shortcut='Ctrl+A'},@{Text='Time/Date';Action='timeDate';Shortcut='F5'},@{Separator=$true},@{Text='Font';Action='openFontSettings'})}
+        'view'{@(@{Text='Zoom';Action='submenu';Data='zoom';Submenu='zoom';Rows=@(@{Text='Zoom in';Action='zoomIn';Shortcut='Ctrl+Plus'},@{Text='Zoom out';Action='zoomOut';Shortcut='Ctrl+Minus'},@{Text='Restore default zoom';Action='zoomReset';Shortcut='Ctrl+0'})},@{Text='Status bar';Action='toggleStatusBar';Checked=[bool]$settings.showStatusBar},@{Text='Word wrap';Action='toggleWordWrap';Checked=[bool]$settings.wordWrap},@{Text='Markdown';Action='submenu';Data='markdown';Submenu='markdown';Rows=@(@{Text='Preview Markdown';Action='toggleMarkdownPreview'})})}
+    }
+    $x=switch($ui.Menu){'file'{8};'edit'{54};'view'{100}}
+    Paint-MenuRows $rows $x 76 260 ('flyout-'+$ui.Menu)
+}
+function Select-Control([string]$Id,[string]$Key,[object[]]$Options,[double]$X,[double]$Y,[double]$W){
+    $text=[string]$settings[$Key];foreach($option in $Options){if($option.Value -eq $settings[$Key]){$text=$option.Text;break}}
+    $data=@{Id=$Id;Key=$Key;Options=$Options;Rect=@($X,$Y,$W,32)}
+    Button $Id $X $Y $W 32 'settingSelect' '' '' $data $false $true
+    Label $text ($X+12) ($Y+7) ($W-36) (Color 'text-primary') 13
+    Icon 'chevronDown' ($X+$W-22) ($Y+10) 12 '#9d9d9d'
+}
+function Toggle-Control([string]$Key,[double]$X,[double]$Y){
+    $on=[bool]$settings[$Key];$id='toggle-setting-'+$Key
+    Node $id $X $Y 78 24 'toggleSetting' $Key
+    $track=if($on){Color 'accent-color'}elseif($ui.Theme -eq 'light'){'#e0e0e0'}else{'#333333'}
+    $border=if($on){Color 'accent-color'}elseif($ui.Theme -eq 'light'){'#999999'}else{'#777777'}
+    $graphics.Fill($X,($Y+2),40,20,$track,10);$graphics.Stroke($X,($Y+2),40,20,$border,10,1)
+    $knob=if($on){'#ffffff'}elseif($ui.Theme -eq 'light'){'#555555'}else{'#cecece'}
+    $graphics.Fill(($X+3+$(if($on){18}else{0})),($Y+$(if($on){5}else{6})),($(if($on){14}else{12})),($(if($on){14}else{12})),$knob,7)
+    Label $(if($on){'On'}else{'Off'}) ($X+50) ($Y+4) 28 (Color 'text-primary') 13
+}
+function Paint-Settings {
+    if(-not $ui.Settings){return}
+    $w=$ui.Width;$h=$ui.Height;$graphics.Fill(0,0,$w,$h,(Color 'bg-window'),0);Node 'settings-view' 0 0 $w $h 'none' $null 'default'
+    $graphics.Fill(0,39.2,$w,0.8,(Color 'border-subtle'),0)
+    Button 'settings-btn-back' 8 4 32 32 'back' '' 'back';Icon 'app' 48 11 18;Label 'Notepad' 88 12 200 (Color 'text-primary') 12
+    Button 'settings-win-min' ($w-138) 0 46 40 'none' '' 'minimize' $null $false $false 10
+    Button 'settings-win-max' ($w-92) 0 46 40 'none' '' 'maximize' $null $false $false 10
+    Button 'settings-win-close' ($w-46) 0 46 40 'back' '' 'close' $null $false $false 10
+    $gridWidth=[Math]::Min(1080,[Math]::Max(600,$w-92));$left=($w-12-$gridWidth)/2;$col=$gridWidth-320;$right=$left+$col+40
+    $y=64-$ui.SettingsScroll
+    $graphics.Clip(0,40,($w-12),($h-40));$ui.HitClip=@(0,40,($w-12),($h-40))
+    Label 'Settings' $left $y $col (Color 'text-primary') 28 'Segoe UI' 600
+    Label 'About this app' $right $y 280 (Color 'text-primary') 14 'Segoe UI' 600
+    Label 'Windows Notepad 11.2606.15.0' $right ($y+32) 280 (Color 'text-primary') 13
+    Label '© 2026 Microsoft. All rights reserved.' $right ($y+55) 280 (Color 'text-secondary') 12
+    $ay=$y+90
+    foreach($link in @(@('Microsoft Software License Terms','https://www.microsoft.com/useterms'),@('Microsoft Services Agreement','https://www.microsoft.com/servicesagreement'),@('Microsoft Privacy Statement','https://privacy.microsoft.com'),@('Third-Party Software Acknowledgments','#acknowledgments'))){Label $link[0] $right $ay 280 (Color 'text-link') 13;Node ('link-'+$ay) $right $ay 280 20 'link' $link[1];$ay+=27}
+    Button 'btn-send-feedback' $right ($ay+8) 180 34 'none' 'Send feedback' '' $null $false $true
+    Button 'btn-help' $right ($ay+52) 180 34 'none' 'Help' '' $null $false $true
+    $y+=91
+    Label 'Appearance' $left $y $col (Color 'text-primary') 14 'Segoe UI' 600;$y+=24
+    $cards=@(
+        @{Title='App theme';Subtitle='Select which app theme to display';Icon='theme';Key='theme';Select=@(@{Text='Dark';Value='dark'},@{Text='Light';Value='light'},@{Text='Use system setting';Value='system'});SelectWidth=170}
+        @{Section='Text Formatting'}
+        @{Title='Font';Icon='font';Accordion='card-font-setting'}
+        @{Title='Word wrap';Subtitle='Fit text within window by default';Icon='wordWrap';Key='wordWrap';Toggle=$true}
+        @{Title='Formatting';Icon='formatting';Key='formatting';Toggle=$true}
+        @{Section='Opening Notepad'}
+        @{Title='Opening files';Subtitle='Choose where your files are opened';Icon='openFiles';Key='openingFiles';Select=@(@{Text='Open in a new tab';Value='newTab'},@{Text='Open in a new window';Value='newWindow'});SelectWidth=184}
+        @{Title='When Notepad starts';Icon='tabsApp';Accordion='card-startup-setting'}
+        @{Title='Recent Files';Icon='recentFiles';Key='recentFilesEnabled';Toggle=$true}
+        @{Section='Spelling'}
+        @{Title='Spell check';Icon='spellCheck';Key='spellCheck';Toggle=$true}
+    )
+    foreach($card in $cards){
+        if($card.Section){$y+=24;Label $card.Section $left $y $col (Color 'text-primary') 14 'Segoe UI' 600;$y+=28;continue}
+        $height=if($card.Subtitle){68.0}else{49.6}
+        $expanded=$card.Accordion -and $ui.Expanded[$card.Accordion]
+        if($card.Accordion){$height=51.6;if($expanded){$height=if($card.Accordion -eq 'card-font-setting'){296.125}else{147.6}}}
+        $graphics.Fill($left,$y,$col,$height,(Color 'bg-card'),8);$graphics.Stroke($left,$y,$col,$height,(Color 'border-subtle'),8,0.8)
+        $headerHeight=if($card.Subtitle){68}else{51.6};Icon $card.Icon ($left+17) ($y+($headerHeight-18)/2) 18
+        Label $card.Title ($left+52) ($y+$(if($card.Subtitle){14}else{16})) ($col-230) (Color 'text-primary') 14
+        if($card.Subtitle){Label $card.Subtitle ($left+52) ($y+36) ($col-230) (Color 'text-secondary') 12}
+        if($card.Select){Select-Control ('setting-'+$card.Key) $card.Key $card.Select ($left+$col-$card.SelectWidth-16) ($y+($height-32)/2) $card.SelectWidth}
+        if($card.Toggle){Toggle-Control $card.Key ($left+$col-94) ($y+($height-24)/2)}
+        if($card.Accordion){
+            Node ('header-'+$card.Accordion) $left $y $col 51.6 'accordion' $card.Accordion
+            Icon 'chevronDown' ($left+$col-34) ($y+18.8) 14 (Color 'text-secondary') $(if($expanded){180}else{0})
+            if($expanded){
+                $graphics.Fill(($left+16),($y+51.6),($col-32),0.8,(Color 'border-subtle'),0)
+                if($card.Accordion -eq 'card-font-setting'){
+                    $fy=$y+68
+                    $fontOptions=@(@{Label='Family';Key='fontFamily';Options=@('Consolas','Cascadia Code','Segoe UI','Courier New');Width=130},@{Label='Style';Key='fontStyle';Options=@('Regular','Bold','Italic','Bold Italic');Width=112},@{Label='Size';Key='fontSize';Options=@('8','9','10','11','12','14','16','18','20','24','28','36');Width=68})
+                    foreach($row in $fontOptions){Label $row.Label ($left+24) ($fy+7) 150 (Color 'text-primary') 13;$options=@($row.Options|ForEach-Object{@{Text=$_;Value=$_}});Select-Control ('setting-'+$row.Key) $row.Key $options ($left+$col-24-$row.Width) $fy $row.Width;$fy+=46}
+                    $fy+=5;$graphics.Fill(($left+16),$fy,($col-32),70.125,$(if($ui.Theme -eq 'light'){'#f7f7f7'}else{'#202020'}),6);$graphics.Stroke(($left+16),$fy,($col-32),70.125,(Color 'border-subtle'),6,0.8)
+                    $layout=$graphics.Layout('The sound of ocean waves calms my soul.',$settings.fontFamily,([int]$settings.fontSize*96/72),($col-64),$false,$(if($settings.fontStyle.Contains('Bold')){700}else{400}),$settings.fontStyle.Contains('Italic'),0)
+                    try{$m=$graphics.Metrics($layout);$graphics.DrawLayout($layout,($left+($col-$m.Width)/2),($fy+(70.125-$m.Height)/2),(Color 'text-primary'))}finally{$graphics.ReleaseLayout($layout)}
+                }else{
+                    $ry=$y+73
+                    foreach($radio in @(@('continueSession','Continue previous session'),@('newSession','Start new session and discard unsaved changes'))){
+                        Node ('radio-'+$radio[0]) ($left+24) $ry ($col-48) 26 'startup' $radio[0]
+                        $selected=$settings.startupOption -eq $radio[0];$graphics.Stroke(($left+24),($ry+2),18,18,$(if($selected){Color 'accent-color'}else{'#888888'}),9,$(if($selected){2}else{1}));if($selected){$graphics.Fill(($left+28),($ry+6),10,10,(Color 'accent-color'),5)}
+                        Label $radio[1] ($left+54) ($ry+2) ($col-80) (Color 'text-primary') 13;$ry+=33
+                    }
+                }
+            }
+        }
+        $y+=$height+4
+    }
+    $ui.SettingsExtent=$y+60+$ui.SettingsScroll-40
+    $graphics.Unclip();$ui.HitClip=$null
+    if($ui.SettingsExtent -gt $h-40){$track=$h-46;$thumb=[Math]::Max(24,$track*($h-40)/$ui.SettingsExtent);$ty=43+($track-$thumb)*$ui.SettingsScroll/[Math]::Max(1,$ui.SettingsExtent-$h+40);$graphics.Fill(($w-9),$ty,6,$thumb,'rgba(255,255,255,0.2)',3)}
+}
+function Paint-Dropdown {
+    if(-not $ui.Dropdown){return}
+    $drop=$ui.Dropdown;$r=$drop.Rect;$height=$drop.Options.Count*28+8;$y=$r[1]+$r[3]+2
+    if($y+$height -gt $ui.Height-8){$y=[Math]::Max(42,$r[1]-$height-2)}
+    $rows=@(foreach($option in $drop.Options){@{Text=$option.Text;Action='chooseSetting';Data=@{Key=$drop.Key;Value=$option.Value};Checked=($settings[$drop.Key] -eq $option.Value)}})
+    Paint-MenuRows $rows $r[0] $y ([Math]::Max(160,$r[2])) ('dropdown-'+$drop.Key)
+}
+function Paint-Modal {
+    if(-not $ui.Modal){return}
+    $m=$ui.Modal;$width=[Math]::Min(440,$ui.Width*0.9);$bodyWidth=$width-48
+    $messageLayout=$graphics.Layout($m.Message,'Segoe UI',13,$bodyWidth,$true,400,$false,19.5)
+    try{$messageHeight=if($m.Message){($graphics.Metrics($messageLayout)).Height}else{0}
+        $height=24+25.2+16+$messageHeight+16+34+24+8
+        if($m.Input){$height+=54};if($null -ne $m.Markdown){$height+=[Math]::Min(380,[Math]::Max(60,($m.Markdown.Split("`n").Count*23+24)))}
+        $height=[Math]::Min($height,$ui.Height-40);$x=($ui.Width-$width)/2;$y=($ui.Height-$height)/2
+        $graphics.Fill(0,0,$ui.Width,$ui.Height,'rgba(0,0,0,0.5)',0);Node 'notepad-modal' 0 0 $ui.Width $ui.Height 'none' $null 'default'
+        $graphics.Fill($x,$y,$width,$height,(Color 'bg-dialog'),8);$graphics.Stroke($x,$y,$width,$height,(Color 'border-control'),8,1)
+        Label $m.Title ($x+24) ($y+24) $bodyWidth (Color 'text-primary') 18 'Segoe UI' 600
+        $by=$y+65.2
+        if($m.Message){$graphics.DrawLayout($messageLayout,($x+24),$by,(Color 'text-secondary'));$by+=$messageHeight+16}
+        if($m.Input){InputBox 'dialog-input' $m.Value ($x+24) $by $bodyWidth '' 36;$by+=54}
+        if($null -ne $m.Markdown){
+            $previewHeight=[Math]::Max(20,$height-($by-$y)-74)
+            $graphics.Fill(($x+24),$by,$bodyWidth,$previewHeight,'rgba(0,0,0,0.2)',6);$graphics.Clip(($x+24),$by,$bodyWidth,$previewHeight)
+            $my=$by+12
+            foreach($line in $m.Markdown.Split("`n")){
+                $size=14;$weight=400;$content=$line
+                if($line -match '^(#{1,3}) (.*)$'){$size=switch($Matches[1].Length){1{28};2{21};3{16.38}};$weight=700;$content=$Matches[2]}
+                Label $content ($x+36) $my ($bodyWidth-24) (Color 'text-primary') $size 'Segoe UI' $weight;$my+=$size*1.4
+            }
+            $graphics.Unclip()
+        }
+        $total=0;foreach($button in $m.Buttons){$total+=[Math]::Max(66,$button.Text.Length*7+32)+8}
+        $bx=$x+$width-24-$total+8;$buttonIndex=0
+        foreach($button in $m.Buttons){$bw=[Math]::Max(66,$button.Text.Length*7+32);Button ('modal-button-'+$buttonIndex) $bx ($y+$height-58) $bw 34 'modalAction' $button.Text '' $button ([bool]$button.Primary) $true;$bx+=$bw+8;$buttonIndex++}
+    }finally{$graphics.ReleaseLayout($messageLayout)}
+}
+function Paint {
+    $ui.NextHits=[Collections.Generic.List[object]]::new()
+    $graphics.Begin((Color 'bg-window'))
+    Paint-Editor;Paint-Chrome;Paint-Find;Paint-Menus;Paint-Settings;Paint-Dropdown;Paint-Modal
+    $graphics.End()
+    $ui.Generation++;$ui.Hits=$ui.NextHits;$ui.Dirty=$false
+    if($ui.TextCache.Count -gt 1000){foreach($layout in $ui.TextCache.Values){$graphics.ReleaseLayout($layout)};$ui.TextCache.Clear()}
+}
+function Hit([double]$X,[double]$Y){
+    for($i=$ui.Hits.Count-1;$i -ge 0;$i--){$node=$ui.Hits[$i];$r=$node.Rect;if($node.Clip){$c=$node.Clip;if($X -lt $c[0] -or $Y -lt $c[1] -or $X -ge $c[0]+$c[2] -or $Y -ge $c[1]+$c[3]){continue}};if($X -ge $r[0] -and $Y -ge $r[1] -and $X -lt $r[0]+$r[2] -and $Y -lt $r[1]+$r[3]){return $node}}
+}
+function Editor-Hit([double]$X,[double]$Y,[bool]$Extend=$false){
+    $hit=$graphics.HitText($ui.EditorLayout,($X-$ui.EditorOrigin[0]),($Y-$ui.EditorOrigin[1]));$tab=$model.Active()
+    $anchor=if($Extend){$tab.Anchor}else{$hit.Position};$model.Select($anchor,$hit.Position);$ui.Focus='editor-area';Invalidate $true
+}
+function Key-Input($Event){
+    $key=[int]$Event.W;$ctrl=$Event.Ctrl;$shift=$Event.Shift
+    if($key -eq 27){if($ui.Dropdown){$ui.Dropdown=$null}elseif($ui.Modal){$ui.Modal=$null;$ui.Focus='editor-area'}elseif($ui.Menu){$ui.Menu='';$ui.Submenu=''}elseif($ui.Find){$ui.Find=$false;$ui.Focus='editor-area'}elseif($ui.Settings){$ui.Settings=$false;$ui.Focus='editor-area'};Invalidate;return}
+    if($ui.Modal -and $ui.Focus -ne 'dialog-input'){
+        if($key -eq 13){$button=$ui.Modal.Buttons|Where-Object Primary|Select-Object -First 1;if(-not $button){$button=$ui.Modal.Buttons[0]};$ui.Modal=$null;Command $button.Action $button.Data};return
+    }
+    if($ui.Focus -in @('find-query-input','replace-query-input','dialog-input')){
+        $value=Input-Value $ui.Focus
+        if($ctrl -and $key -eq 65){$ui.InputAnchor=0;$ui.InputFocus=$value.Length}
+        elseif($ctrl -and $key -eq 86){Input-Insert $services.ReadClipboard()}
+        elseif($ctrl -and $key -in @(67,88)){$start=[Math]::Min($ui.InputAnchor,$ui.InputFocus);$len=[Math]::Abs($ui.InputFocus-$ui.InputAnchor);$services.WriteClipboard($value.Substring($start,$len));if($key -eq 88){Input-Insert ''}}
+        elseif($key -in @(8,46)){
+            if($ui.InputAnchor -eq $ui.InputFocus){if($key -eq 8 -and $ui.InputFocus -gt 0){$ui.InputAnchor--}elseif($key -eq 46 -and $ui.InputFocus -lt $value.Length){$ui.InputAnchor++}}
+            Input-Insert ''
+        }elseif($key -in @(37,39,36,35)){
+            $pos=switch($key){37{[Math]::Max(0,$ui.InputFocus-1)};39{[Math]::Min($value.Length,$ui.InputFocus+1)};36{0};35{$value.Length}};$ui.InputFocus=$pos;if(-not $shift){$ui.InputAnchor=$pos}
+        }elseif($key -eq 13){if($ui.Focus -eq 'dialog-input'){$m=$ui.Modal;$ui.Modal=$null;$button=$m.Buttons|Where-Object Primary|Select-Object -First 1;Command $button.Action $m.Value}elseif($shift){$model.SelectMatch(-1)}else{$model.SelectMatch(1)}}
+        elseif($key -eq 9){if($ui.Focus -eq 'find-query-input' -and $ui.Replace){Focus-Input 'replace-query-input'}else{$ui.Focus='editor-area'}}
+        Invalidate $true;return
+    }
+    if($ctrl){
+        $action=switch($key){78{if($shift){'newWindow'}else{'newTab'}};79{'openFile'};83{if($Event.Alt){'saveAll'}elseif($shift){'saveAs'}else{'save'}};87{if($shift){'closeWindow'}else{'closeTab'}};70{'find'};72{'replace'};71{'goTo'};80{'print'};65{'selectAll'};67{'copy'};88{'cut'};86{'paste'};90{if($shift){'redo'}else{'undo'}};89{'redo'};187{'zoomIn'};107{'zoomIn'};189{'zoomOut'};109{'zoomOut'};48{'zoomReset'}}
+        if($action){Command $action;return}
+    }
+    if($key -eq 114){Command $(if($shift){'findPrevious'}else{'findNext'});return}
+    if($key -eq 116){Command 'timeDate';return}
+    if($ui.Focus -ne 'editor-area' -or $ui.Settings){return}
+    switch($key){
+        8{$model.Delete($true)};46{$model.Delete($false)}
+        37{$model.Move('left',$shift,$ctrl)};39{$model.Move('right',$shift,$ctrl)}
+        36{$model.Move('home',$shift,$ctrl)};35{$model.Move('end',$shift,$ctrl)}
+        {$_ -in @(38,40,33,34)}{
+            $tab=$model.Active();$caret=$graphics.Caret($ui.EditorLayout,$tab.Focus,$false);$distance=if($key -in @(33,34)){$ui.EditorRect[3]-28}else{$caret.Height};$dy=if($key -in @(38,33)){-$distance}else{$distance}
+            $hit=$graphics.HitText($ui.EditorLayout,$caret.X,($caret.Y+$caret.Height/2+$dy));$model.Select($(if($shift){$tab.Anchor}else{$hit.Position}),$hit.Position)
+        }
+    }
+    Invalidate $true
+}
+function Handle-Event($Event){
+    if($Event.Kind -eq 'close'){Request-Close;return}
+    if($Event.Kind -eq 'paint'){Invalidate;return}
+    if($Event.Kind -in @('focus','blur')){$ui.Focused=$Event.Kind -eq 'focus';Invalidate;return}
+    if($Event.Kind -eq 'resize'){
+        $info=$window.Info();$ui.Dpi=$info.Dpi;$ui.Width=$info.Width*96/$info.Dpi;$ui.Height=$info.Height*96/$info.Dpi
+        $graphics.Resize($info.Width,$info.Height,$info.Dpi);Invalidate $true;return
+    }
+    if($Event.Kind -ne 'input'){return}
+    $msg=$Event.Message
+    if($msg -in @(0x100,0x104)){Key-Input $Event;return}
+    if($msg -eq 0x102){
+        if($Event.Ctrl -or $Event.Alt){return};$char=[char]$Event.W
+        if($Event.W -in @(8,27) -or ($Event.W -lt 32 -and $Event.W -notin @(9,13))){return}
+        if([char]::IsHighSurrogate($char)){$ui.PendingHigh=[string]$char;return}
+        $text=[string]$char;if([char]::IsLowSurrogate($char) -and $ui.PendingHigh){$text=$ui.PendingHigh+$text};$ui.PendingHigh=''
+        if($ui.Focus -eq 'editor-area' -and -not $ui.Modal -and -not $ui.Settings){if($Event.W -eq 13){$text="`n"};$model.Insert($text,($text -ne "`n" -and $text -ne "`t"))}
+        elseif($ui.Focus -in @('find-query-input','replace-query-input','dialog-input') -and $Event.W -ge 32){Input-Insert $text}
+        Invalidate $true;return
+    }
+    $px=[int]($Event.L -band 0xffff);if($px -ge 32768){$px-=65536};$py=[int](($Event.L -shr 16)-band 0xffff);if($py -ge 32768){$py-=65536}
+    $x=$px*96/$ui.Dpi;$y=$py*96/$ui.Dpi
+    if($msg -eq 0x20A){
+        $delta=[int](($Event.W -shr 16)-band 0xffff);if($delta -ge 32768){$delta-=65536}
+        if($Event.Ctrl){Command $(if($delta -gt 0){'zoomIn'}else{'zoomOut'})}
+        elseif($ui.Settings){$ui.SettingsScroll=[Math]::Clamp($ui.SettingsScroll-$delta/120*72,0,[Math]::Max(0,$ui.SettingsExtent-$ui.Height+40));Invalidate}
+        elseif(-not $ui.Modal){$tab=$model.Active();$tab.ScrollY=[Math]::Max(0,$tab.ScrollY-$delta/120*64);$ui.EnsureCaret=$false;Invalidate}
+        return
+    }
+    $hit=Hit $x $y;$id=if($hit){$hit.Id}else{''}
+    if($msg -eq 0x200){
+        if($ui.Hover -ne $id){$ui.Hover=$id;Invalidate
+            if($hit -and $hit.Action -eq 'submenu'){$ui.Submenu=$hit.Data;Invalidate}
+            if($ui.Menu -and $id.StartsWith('menu-btn-')){$ui.Menu=$hit.Data;$ui.Submenu='';Invalidate}
+        }
+        $window.Cursor($(if($hit){$hit.Cursor}else{'default'}))
+        if($ui.Drag){Editor-Hit $x $y $true}
+        return
+    }
+    if($msg -in @(0x201,0x203)){
+        if($ui.Dropdown -and -not $id.StartsWith('dropdown-')){$ui.Dropdown=$null;Invalidate;return}
+        if($ui.Menu -and -not $id.StartsWith('flyout-') -and -not $id.StartsWith('menu-btn-')){$ui.Menu='';$ui.Submenu='';Invalidate}
+        $ui.Pressed=$id;Invalidate
+        if($hit -and $hit.Action -eq 'editor'){
+            Editor-Hit $x $y $Event.Shift
+            if($msg -eq 0x203){$tab=$model.Active();$pos=$tab.Focus;$start=$pos;$end=$pos;while($start -gt 0 -and -not [char]::IsWhiteSpace($tab.Text[$start-1])){$start--};while($end -lt $tab.Text.Length -and -not [char]::IsWhiteSpace($tab.Text[$end])){$end++};$model.Select($start,$end)}
+            $ui.Drag=$true;$window.Capture($true)
+        }elseif($hit -and $hit.Action -eq 'drag'){$window.Caption('drag')}
+        return
+    }
+    if($msg -eq 0x202){
+        if($ui.Drag){$ui.Drag=$false;$window.Capture($false)}
+        if($hit -and $id -eq $ui.Pressed -and $hit.Action -notin @('editor','drag')){
+            if($hit.Action -eq 'modalAction'){$button=$hit.Data;$value=$ui.Modal.Value;$ui.Modal=$null;Command $button.Action $(if($button.Action -eq 'gotoConfirm'){$value}else{$button.Data})}
+            else{if($id.StartsWith('flyout-') -and $hit.Action -ne 'submenu'){$ui.Menu='';$ui.Submenu=''};Command $hit.Action $hit.Data}
+        }
+        $ui.Pressed='';Invalidate
+    }
+}
+
+Resolve-Theme
+try{
+    $window=& "$PSScriptRoot\src\Window.Windows.ps1" -Native $native -Width $Width -Height $Height
+    $info=$window.Info();$ui.Dpi=$info.Dpi;$ui.Width=$info.Width*96/$info.Dpi;$ui.Height=$info.Height*96/$info.Dpi
+    $graphics=& "$PSScriptRoot\src\Graphics.Windows.ps1" -Native $native -Hwnd $window.Handle() -Width $info.Width -Height $info.Height -Dpi $info.Dpi
+    $services=& "$PSScriptRoot\src\Services.Windows.ps1" -Native $native -Hwnd $window.Handle()
+    $window.Show();$start=[DateTime]::UtcNow
+    while($ui.Running -and $window.Info().Alive){
+        foreach($event in @($window.Drain())){Handle-Event $event}
+        $now=[DateTime]::UtcNow
+        if(($now-$ui.LastBlink).TotalMilliseconds -ge 530){$ui.Blink=-not $ui.Blink;$ui.LastBlink=$now;if($ui.Focus -in @('editor-area','find-query-input','replace-query-input','dialog-input')){Invalidate}}
+        if($ui.Dirty -and $ui.Width -gt 0 -and $ui.Height -gt 0){Paint}
+        if(($now-$ui.LastSession).TotalSeconds -ge 2){Persist;$ui.LastSession=$now}
+        if($RunSeconds -gt 0 -and ($now-$start).TotalSeconds -ge $RunSeconds){$ui.Running=$false}
+        Start-Sleep -Milliseconds 8
+    }
+    Persist
+}catch{
+    $_|Out-String|Set-Content (Join-Path $PSScriptRoot 'artifacts\last-error.txt');throw
+}finally{
+    if($DiagnosticPath){@{Generation=$ui.Generation;Width=$ui.Width;Height=$ui.Height;Theme=$ui.Theme;Focus=$ui.Focus;EditorMetrics=$ui.EditorMetrics;Status=$model.Status();Nodes=@($ui.Nodes.Values|ForEach-Object{@{Id=$_.Id;Rect=$_.Rect;Action=$_.Action;Generation=$_.Generation}});Session=$model.ExportSession()}|ConvertTo-Json -Depth 32|Set-Content -LiteralPath $DiagnosticPath}
+    if($graphics){$graphics.Dispose()};if($window){$window.Dispose()};$native.Dispose()
+}

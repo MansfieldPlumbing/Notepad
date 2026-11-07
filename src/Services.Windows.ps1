@@ -1,0 +1,81 @@
+[CmdletBinding()]
+param([Parameter(Mandatory)][object]$Native,[Parameter(Mandatory)][IntPtr]$Hwnd)
+if($MyInvocation.InvocationName -eq '.'){throw 'Invoke Services.Windows.ps1 with &.'}
+New-Module -AsCustomObject -ArgumentList $Native,$Hwnd -ScriptBlock {
+    param($Native,$Hwnd)
+    $script:n=$Native;$script:hwnd=$Hwnd
+    function Bind($Dll,$Name,$Return,$Types){$n.GetExportCall($Dll,$Name,$Return,[Type[]]$Types)}
+    function FileDialog([bool]$Save,[string]$Suggested='Untitled.txt'){
+        # OPENFILENAMEW x64 layout, commdlg.h. All buffers outlive the modal call.
+        $memory=$n.Allocate(152);$file=$n.Allocate(65536)
+        $filter=[Runtime.InteropServices.Marshal]::StringToHGlobalUni("Text documents (*.txt;*.md)`0*.txt;*.md`0All files (*.*)`0*.*`0`0")
+        $extension=[Runtime.InteropServices.Marshal]::StringToHGlobalUni('txt')
+        try{
+            if($Save){$chars=([Text.Encoding]::Unicode.GetBytes($Suggested+[char]0));[Runtime.InteropServices.Marshal]::Copy($chars,0,$file,[Math]::Min($chars.Length,65534))}
+            [Runtime.InteropServices.Marshal]::WriteInt32($memory,0,152)
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($memory,8,$hwnd)
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($memory,24,$filter)
+            [Runtime.InteropServices.Marshal]::WriteInt32($memory,44,1)
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($memory,48,$file)
+            [Runtime.InteropServices.Marshal]::WriteInt32($memory,56,32768)
+            [Runtime.InteropServices.Marshal]::WriteInt32($memory,96,$(if($Save){0x8080A}else{0x81808}))
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($memory,104,$extension)
+            $call=Bind 'comdlg32.dll' $(if($Save){'GetSaveFileNameW'}else{'GetOpenFileNameW'}) ([bool]) @([IntPtr])
+            if($call.DynamicInvoke($memory)){return [Runtime.InteropServices.Marshal]::PtrToStringUni($file)}
+            $errorCall=Bind 'comdlg32.dll' 'CommDlgExtendedError' ([uint32]) @()
+            $code=$errorCall.DynamicInvoke();if($code){throw "File dialog failed: $code"}
+            $null
+        }finally{$n.Free($memory);$n.Free($file);[Runtime.InteropServices.Marshal]::FreeHGlobal($filter);[Runtime.InteropServices.Marshal]::FreeHGlobal($extension)}
+    }
+    function ReadClipboard {
+        $open=Bind 'user32.dll' 'OpenClipboard' ([bool]) @([IntPtr]);$close=Bind 'user32.dll' 'CloseClipboard' ([bool]) @()
+        if(-not $open.DynamicInvoke($hwnd)){throw 'Clipboard is busy'}
+        try{
+            $get=Bind 'user32.dll' 'GetClipboardData' ([IntPtr]) @([uint32]);$handle=$get.DynamicInvoke([uint32]13)
+            if($handle -eq [IntPtr]::Zero){return ''}
+            $lock=Bind 'kernel32.dll' 'GlobalLock' ([IntPtr]) @([IntPtr]);$unlock=Bind 'kernel32.dll' 'GlobalUnlock' ([bool]) @([IntPtr]);$ptr=$lock.DynamicInvoke($handle)
+            if($ptr -eq [IntPtr]::Zero){throw 'Clipboard lock failed'}
+            try{[Runtime.InteropServices.Marshal]::PtrToStringUni($ptr)}finally{$null=$unlock.DynamicInvoke($handle)}
+        }finally{$null=$close.DynamicInvoke()}
+    }
+    function WriteClipboard([string]$Text){
+        $open=Bind 'user32.dll' 'OpenClipboard' ([bool]) @([IntPtr]);$close=Bind 'user32.dll' 'CloseClipboard' ([bool]) @()
+        $allocate=Bind 'kernel32.dll' 'GlobalAlloc' ([IntPtr]) @([uint32],[UIntPtr]);$lock=Bind 'kernel32.dll' 'GlobalLock' ([IntPtr]) @([IntPtr]);$unlock=Bind 'kernel32.dll' 'GlobalUnlock' ([bool]) @([IntPtr]);$free=Bind 'kernel32.dll' 'GlobalFree' ([IntPtr]) @([IntPtr])
+        $bytes=[Text.Encoding]::Unicode.GetBytes($Text+[char]0);$handle=$allocate.DynamicInvoke([uint32]2,[UIntPtr]$bytes.Length);$owned=$true
+        if($handle -eq [IntPtr]::Zero){throw 'Clipboard allocation failed'}
+        try{
+            $ptr=$lock.DynamicInvoke($handle);if($ptr -eq [IntPtr]::Zero){throw 'Clipboard lock failed'}
+            try{[Runtime.InteropServices.Marshal]::Copy($bytes,0,$ptr,$bytes.Length)}finally{$null=$unlock.DynamicInvoke($handle)}
+            if(-not $open.DynamicInvoke($hwnd)){throw 'Clipboard is busy'}
+            try{
+                $empty=Bind 'user32.dll' 'EmptyClipboard' ([bool]) @();if(-not $empty.DynamicInvoke()){throw 'Cannot clear clipboard'}
+                $set=Bind 'user32.dll' 'SetClipboardData' ([IntPtr]) @([uint32],[IntPtr]);if($set.DynamicInvoke([uint32]13,$handle) -eq [IntPtr]::Zero){throw 'Clipboard transfer failed'};$owned=$false
+            }finally{$null=$close.DynamicInvoke()}
+        }finally{if($owned){$null=$free.DynamicInvoke($handle)}}
+    }
+    function WriteClipboardFile([string]$Text,[string]$Title){
+        # MansfieldPlumbing feature addition: CF_HDROP owns a path to a durable UTF-8 snapshot.
+        $folder=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('NotepadPS1\Clipboard\'+[guid]::NewGuid().ToString('N'))
+        $null=[IO.Directory]::CreateDirectory($folder)
+        $name=[IO.Path]::GetFileNameWithoutExtension($Title)
+        foreach($invalid in [IO.Path]::GetInvalidFileNameChars()){$name=$name.Replace([string]$invalid,'_')}
+        if(-not $name){$name='Untitled'}
+        $file=Join-Path $folder ($name+'.txt');[IO.File]::WriteAllText($file,$Text,[Text.UTF8Encoding]::new($false))
+        $paths=[Text.Encoding]::Unicode.GetBytes($file+[char]0+[char]0)
+        $allocate=Bind 'kernel32.dll' 'GlobalAlloc' ([IntPtr]) @([uint32],[UIntPtr]);$lock=Bind 'kernel32.dll' 'GlobalLock' ([IntPtr]) @([IntPtr]);$unlock=Bind 'kernel32.dll' 'GlobalUnlock' ([bool]) @([IntPtr]);$free=Bind 'kernel32.dll' 'GlobalFree' ([IntPtr]) @([IntPtr])
+        $handle=$allocate.DynamicInvoke([uint32]0x42,[UIntPtr](20+$paths.Length));$owned=$true
+        if($handle -eq [IntPtr]::Zero){throw 'File clipboard allocation failed'}
+        try{
+            $ptr=$lock.DynamicInvoke($handle);if($ptr -eq [IntPtr]::Zero){throw 'File clipboard lock failed'}
+            try{[Runtime.InteropServices.Marshal]::WriteInt32($ptr,0,20);[Runtime.InteropServices.Marshal]::WriteInt32($ptr,16,1);[Runtime.InteropServices.Marshal]::Copy($paths,0,[IntPtr]::Add($ptr,20),$paths.Length)}finally{$null=$unlock.DynamicInvoke($handle)}
+            $open=Bind 'user32.dll' 'OpenClipboard' ([bool]) @([IntPtr]);$close=Bind 'user32.dll' 'CloseClipboard' ([bool]) @()
+            if(-not $open.DynamicInvoke($hwnd)){throw 'Clipboard is busy'}
+            try{
+                $empty=Bind 'user32.dll' 'EmptyClipboard' ([bool]) @();if(-not $empty.DynamicInvoke()){throw 'Cannot clear clipboard'}
+                $set=Bind 'user32.dll' 'SetClipboardData' ([IntPtr]) @([uint32],[IntPtr]);if($set.DynamicInvoke([uint32]15,$handle) -eq [IntPtr]::Zero){throw 'File clipboard transfer failed'};$owned=$false
+            }finally{$null=$close.DynamicInvoke()}
+        }finally{if($owned){$null=$free.DynamicInvoke($handle)}}
+    }
+    
+    Export-ModuleMember -Function FileDialog,ReadClipboard,WriteClipboard,WriteClipboardFile
+}

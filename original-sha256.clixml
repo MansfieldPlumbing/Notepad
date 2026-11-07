@@ -1,0 +1,125 @@
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">
+  <Obj RefId="0">
+    <TN RefId="0">
+      <T>System.Management.Automation.PSCustomObject</T>
+      <T>System.Object</T>
+    </TN>
+    <MS>
+      <S N="RelativePath">artifacts.zip</S>
+      <I64 N="Length">92928</I64>
+      <S N="SHA256">B3297AFB5C6A7297BF879337D5BF97B41075503C096FF878500F5153A2957090</S>
+    </MS>
+  </Obj>
+  <Obj RefId="1">
+    <TNRef RefId="0" />
+    <MS>
+      <S N="RelativePath">Notepad.ps1</S>
+      <I64 N="Length">49269</I64>
+      <S N="SHA256">A488716883829913C6EBBDEA444141C26578B275773C9C82E687BB630EEBD5AD</S>
+    </MS>
+  </Obj>
+  <Obj RefId="2">
+    <TNRef RefId="0" />
+    <MS>
+      <S N="RelativePath">QuickPS-LICENSE</S>
+      <I64 N="Length">1097</I64>
+      <S N="SHA256">308786B7F51FDFD9D476E6721779E8682D08530624EFB19FD21D428D5D26676F</S>
+    </MS>
+  </Obj>
+  <Obj RefId="3">
+    <TNRef RefId="0" />
+    <MS>
+      <S N="RelativePath">README.md</S>
+      <I64 N="Length">4923</I64>
+      <S N="SHA256">CB79D6D399B52D3C197D7956825BCEDC3DD2480FEFF932CC687EF81999DC1CD6</S>
+    </MS>
+  </Obj>
+  <Obj RefId="4">
+    <TNRef RefId="0" />
+    <MS>
+      <S N="RelativePath">reference\notepad.html</S>
+      <I64 N="Length">101175</I64>
+      <S N="SHA256">3F0981401C086BC4EB9D1BB0C8716AC57797C59B1B30E3078C07F820044236E7</S>
+    </MS>
+  </Obj>
+  <Obj RefId="5">
+    <TNRef RefId="0" />
+    <MS>
+      <S N="RelativePath">reference\PORT-STUDY.md</S>
+      <I64 N="Length">23782</I64>
+      <S N="SHA256">F0F58C7729827CCD0CF1AE79198DEA0A4573D1CB8CADD633C24B1DF8B67A857A</S>
+    </MS>
+  </Obj>
+  <Obj RefId="6">
+    <TNRef RefId="0" />
+    <MS>
+      <S N="RelativePath">src\Design.ps1</S>
+      <I64 N="Length">428629</I64>
+      <S N="SHA256">7841A0C91D731264C817146B01CF04349084441782BBFF23A92405510A21B7F8</S>
+    </MS>
+  </Obj>
+  <Obj RefId="7">
+    <TNRef RefId="0" />
+    <MS>
+      <S N="RelativePath">src\Graphics.Windows.ps1</S>
+      <I64 N="Length">17203</I64>
+      <S N="SHA256">6A518D53069AD345D44ECDCAA57FB55F447F8A8CCEE94F003BAC71E88930A86F</S>
+    </MS>
+  </Obj>
+  <Obj RefId="8">
+    <TNRef RefId="0" />
+    <MS>
+      <S N="RelativePath">src\Model.ps1</S>
+      <I64 N="Length">9671</I64>
+      <S N="SHA256">1F46E68BC18060D04C02D311E4D7491493A26BDE8CED328C012E0DC3C9A3DA1F</S>
+    </MS>
+  </Obj>
+  <Obj RefId="9">
+    <TNRef RefId="0" />
+    <MS>
+      <S N="RelativePath">src\Native.ps1</S>
+      <I64 N="Length">6531</I64>
+      <S N="SHA256">3133C91789DFF6340FD2540C0E9E5DE078456E30D8AA640B1139BF6FDC66678C</S>
+    </MS>
+  </Obj>
+  <Obj RefId="10">
+    <TNRef RefId="0" />
+    <MS>
+      <S N="RelativePath">src\Services.Windows.ps1</S>
+      <I64 N="Length">4622</I64>
+      <S N="SHA256">333B348E18F718E520ED4F66F791CCAEC752AE847FD203B9352E6AAB7C20CA57</S>
+    </MS>
+  </Obj>
+  <Obj RefId="11">
+    <TNRef RefId="0" />
+    <MS>
+      <S N="RelativePath">src\Window.Windows.ps1</S>
+      <I64 N="Length">9261</I64>
+      <S N="SHA256">9C1842FBB7685BAA95C5D859FCBC2350C17F38975F0E598E427E54049C0C7EAE</S>
+    </MS>
+  </Obj>
+  <Obj RefId="12">
+    <TNRef RefId="0" />
+    <MS>
+      <S N="RelativePath">Start Notepad.cmd</S>
+      <I64 N="Length">215</I64>
+      <S N="SHA256">44EC25C0C053E7F64615FED3EFB2A1D7BC601BD66285E72BD57A4E70C95F80F0</S>
+    </MS>
+  </Obj>
+  <Obj RefId="13">
+    <TNRef RefId="0" />
+    <MS>
+      <S N="RelativePath">tests\Graphics.Smoke.ps1</S>
+      <I64 N="Length">2008</I64>
+      <S N="SHA256">39548EB3CEA1C6B60E048F45DFADBCE8AD75BE4AC206F229A238AC3D3BDFB4A3</S>
+    </MS>
+  </Obj>
+  <Obj RefId="14">
+    <TNRef RefId="0" />
+    <MS>
+      <S N="RelativePath">tests\Model.Verify.ps1</S>
+      <I64 N="Length">3290</I64>
+      <S N="SHA256">64D134B20C1EED1ADB32FA6A02BCA140EE6CC863E84EA70F02A48F83D10D3DB2</S>
+    </MS>
+  </Obj>
+</Objs>
