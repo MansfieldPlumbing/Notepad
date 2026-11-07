@@ -1,106 +1,50 @@
-# Notepad PS1 — native prototype
+# Notepad
 
-A direct Windows/PowerShell port in progress of MansfieldPlumbing/JS2PS's
-`experiments/notepad.html`, guided by QuickPS. The application is PowerShell;
-it does not embed a browser, JavaScript runtime, compiled custom bridge, WPF,
-or Windows Forms. The original HTML is included as a fidelity reference.
+Windows 11 Notepad, rebuilt in PowerShell 7 from an HTML/JS simulacrum, as one script, `Notepad.ps1`.
+It embeds no browser, JavaScript runtime, compiled bridge, WPF or Windows Forms. It is on its way,
+through PSC, to a single NativeAOT executable; that executable does not exist yet.
+
+## How it was made
+
+1. **The simulacrum.** `reference/notepad.html` is an HTML/CSS/JS imitation of Windows 11 Notepad,
+   written in a web container: MansfieldPlumbing/JS2PS `experiments/notepad.html`, 101,175 bytes,
+   SHA-256 `3f0981401c086bc4eb9d1bb0c8716ac57797c59b1b30e3078c07f820044236e7`.
+2. **Extraction.** `-ExtractTypeScript` drives a browser over the DevTools protocol and pulls the page's
+   script out as `reference/notepad.ts`; `-BuildTypeScript` and `-BuildDesign` compile it with `tsc`
+   under Node (`notepad.compiled.js`, `notepad.design.ts`/`.js`, a trace build). What came out is the
+   design data inline in `Notepad.ps1`: a PSD1-compatible `data` block holding the original CSS, the
+   generated HTML tree and the SVGs. Node and TypeScript were needed to port, not to run.
+3. **The native port.** A direct Win32 window and input loop, Direct2D drawing and DirectWrite text, a
+   QuickPS-derived native delegate binder, retained application state with stable view IDs and hit
+   regions, and a piece-table document. Layout is mapped into explicit drawing routines; there is no CSS
+   cascade engine.
+4. **Measured against its sources.** `-Compare` runs real Windows Notepad, the reference page and this
+   port, and judges each property in a Windows/reference/PowerShell verdict table.
+5. **One script.** The port began as `Notepad.ps1` running six scripts from `src` and two tests. PSC
+   (`Invoke-PSC.ps1 -Mode Consolidate`) folded each into `Notepad.ps1` as a function; the checks the
+   tests held are its `-VerifyModel` and `-VerifyGraphics` switches.
+6. **NativeAOT, in progress.** PSC lowers PowerShell to IL and links a NativeAOT executable. Of
+   `Notepad.ps1`'s 89 members, 23 lower today: the piece-table document core and two functions. What
+   remains is by category: member access on dynamically typed values, cmdlets and pipelines, the folded
+   scripts' dynamic modules, catches that read `$_`, and a few single constructs. When it builds, its
+   resource use will be compared with the simulacrum in a browser and with Windows Notepad.
+
+Nothing here uses WinForms or WPF, so an Android port replaces the window, graphics and services
+layers with a JNI canvas rather than rewriting the application.
 
 ## Run
 
-Requires Windows x64 and PowerShell 7. Tested here on PowerShell 7.6.6.
-The application is the single script `Notepad.ps1`; double-click **Start Notepad.cmd**.
-
-For a visible error console:
+Requires Windows x64 and PowerShell 7. Double-click **Start Notepad.cmd**, or:
 
 ```powershell
 pwsh -NoProfile -STA -File .\Notepad.ps1
-```
-
-Open a file:
-
-```powershell
 pwsh -NoProfile -STA -File .\Notepad.ps1 -Path C:\example\notes.txt
 ```
 
-Use `-NoSession` to avoid loading or writing application preferences/session
-data. Normally they live in `%LOCALAPPDATA%\NotepadPS1`.
+`-NoSession` neither loads nor writes preferences and session data (normally in
+`%LOCALAPPDATA%\NotepadPS1`). `-NoAnimation` skips the entrance animation.
 
-Open **Settings → Compare with Windows Notepad** to run the comparison inside
-the application and inspect the Windows/reference/PowerShell verdict table.
-The work runs in a separate process while the editor stays available. The
-Windows baseline is reused when its machine, build, executable hash, DPI and
-paired screenshot hashes still match. **Refresh baseline** captures it again.
-
-The same instrument is inline in `Notepad.ps1` and can print its table directly:
-
-```powershell
-pwsh -NoProfile -STA -File .\Notepad.ps1 -Compare
-pwsh -NoProfile -STA -File .\Notepad.ps1 -Compare -RefreshReal
-```
-
-Logs and typed evidence remain in `evidence`. Original files and the SHA-256 manifests
-are retained beside the edits for review. UNKNOWN properties remain unverified.
-
-**Settings → Appearance** includes Mica, Acrylic and Reverse Mica (DWM MicaAlt),
-plus curved/straight corners. The window has a minimum track size of 768 × 478
-device-independent pixels. The formatting toolbar provides headings, lists,
-bold, italic, strikethrough, links and more options. These actions edit Markdown
-source; the editor does not yet provide Windows Notepad's full styled Markdown
-presentation. **Copy** in the ribbon copies the whole active document. Its settings
-rocker switches between Unicode text and a UTF-8 `.txt` snapshot on the Windows
-file clipboard; those snapshots remain in `%LOCALAPPDATA%\NotepadPS1\Clipboard`
-so pasting still works after the app closes.
-
-Startup paints a complete frame while hidden, then slides in from beyond the
-right edge of the virtual desktop while fading over 320 ms. DWM's border color
-is disabled. The ordinary window style and selected material are restored after
-the entrance. `-NoAnimation` skips the entrance for stable comparison captures.
-
-## Implemented
-
-- Retained application state, stable view IDs and hit regions published after painting.
-- Inline PSD1-compatible design data preserving the reference CSS and SVGs.
-- Direct Win32 window and input loop, Direct2D drawing, DirectWrite text layout.
-- Original SVG path geometry, including endpoint arcs and chevron rotation.
-- Custom editor drawing, caret and selection from shared DirectWrite measurements.
-- Text entry, grapheme-aware left/right/backspace/delete, mouse selection,
-  word selection, clipboard, undo/redo, wrapping, scrolling and zoom.
-- Tabs, menus, settings, theme/font choices, find/replace, Go To, status bar,
-  close prompts, UTF-8 file opening/saving and session persistence.
-- DWM material and corner controls, formatting toolbar, whole-document clipboard
-  modes, and an integrated comparison page with cached native evidence.
-- Save operations target each document's own buffer. Cancelled/failed saves
-  do not close documents or mark them saved.
-
-## Current limits — do not mistake this for completed parity
-
-This is the initial native prototype. Exact visual/behavioral parity has
-**not** been established. Rendering currently maps the source layout into
-explicit native drawing routines; a complete CSS cascade/layout engine is
-not implemented. The extracted HTML tree is included in the design contract;
-the native view is constructed by the application routines.
-
-Remaining work includes source-accurate blur/shadows and timed transitions,
-complete clipping/overflow and keyboard menu behavior, text caret geometry
-calibration across font/DPI combinations, IME/TSF composition, UI Automation
-accessibility, spell-check, native printing/page setup, and a complete rich
-Markdown preview. The current Markdown preview supports heading sizes but
-does not yet reproduce inline emphasis/code styles. Literal replace-all uses
-.NET ordinal matching and literal replacement, so some JavaScript Unicode
-case/replacement-token behavior differs. Editor tab stops and baseline are
-initial measurements requiring browser comparison. Long-tab scrolling,
-dragging scrollbars, context menus, input-field pointer placement and
-selection affinity at bidi/wrap boundaries need further work.
-
-Printing/Page setup display an explicit unimplemented message. Recent files and
-opening-files preference are shown/stored but native open currently
-creates a tab. Session save/restore and close safety intentionally improve
-some source behaviors. Only UTF-8 file decoding is currently supported.
-
-The first surface uses a software Direct2D HWND render target for portability;
-the final effects/presentation path is still to be selected and verified.
-
-## Validation
+## Checks
 
 ```powershell
 pwsh -NoProfile -File .\Notepad.ps1 -VerifyModel
@@ -109,31 +53,41 @@ pwsh -NoProfile -STA -File .\Notepad.ps1 -NoSession -RunSeconds 2
 pwsh -NoProfile -STA -File .\Notepad.ps1 -Compare -VerifyNativeFeatures
 ```
 
-The graphics smoke exercises all 25 icons, native window creation, Direct2D,
-DirectWrite, text metrics, caret/hit-test round trips and selection rectangles.
-The model checks include saving an inactive document, Unicode edits, undo,
-find/replace, UTF-8/BOM/CRLF and session restoration. These checks do not
-establish screenshot equality or complete input-method support.
+`-VerifyModel` checks saving an inactive document, Unicode edits, undo/redo, find/replace,
+UTF-8/BOM/CRLF and session restoration. `-VerifyGraphics` checks all 25 icons, native window creation,
+Direct2D, DirectWrite, text metrics, caret/hit-test round trips and selection rectangles. `-Compare`
+writes its typed evidence to `evidence`; **Settings → Compare with Windows Notepad** runs it inside the
+application. None of these establishes screenshot equality or complete input-method support.
+
+## Implemented
+
+- Text entry, grapheme-aware cursor and deletion, mouse and word selection, clipboard, undo/redo,
+  wrapping, scrolling and zoom.
+- Tabs, menus, settings, theme and font choices, find/replace, Go To, status bar, close prompts, UTF-8
+  file opening and saving, and session persistence.
+- DWM materials (Mica, Acrylic, Reverse Mica) and curved or straight corners; a formatting toolbar
+  that edits Markdown source; whole-document Copy as text or as a UTF-8 file.
+- Saves target each document's own buffer; a cancelled or failed save neither closes a document nor
+  marks it saved.
+
+## Not yet
+
+Parity with Windows Notepad is not established. Still to do: source-accurate blur, shadows and timed
+transitions; clipping and overflow; keyboard menu behaviour; caret geometry across fonts and DPI;
+IME/TSF composition; UI Automation; spell-check; printing and page setup (they show an unimplemented
+message); a rich Markdown preview (headings only today); movable tabs; kinetic scrolling; scrollbar
+dragging; context menus; non-UTF-8 decoding. Literal replace-all uses .NET ordinal matching, so some
+JavaScript Unicode case and replacement-token behaviour differs. Drawing uses a software Direct2D HWND
+render target; the final presentation path is not chosen.
 
 ## Files
 
-- `Notepad.ps1`: the whole application in one script, consolidated by PSC from the
-  former `src` and `tests` scripts, each now a function:
-  - `Invoke-Design`: inline restricted design data, CSS, generated HTML tree and SVGs.
-  - `Invoke-Graphics.Windows`: direct Direct2D/DirectWrite operations.
-  - `Invoke-Window.Windows`: native window, DPI, input queue and message pump.
-  - `Invoke-Services.Windows`: Windows file dialogs and clipboard.
-  - `Invoke-Model`: document/edit/find/persistence operations.
-  - `Invoke-Native`: QuickPS-derived native delegate binder with PSObject unwrapping
-    and explicit native numeric argument conversion fixes in this project copy.
-  - `Invoke-Model.Verify` and `Invoke-Graphics.Smoke`: the checks behind `-VerifyModel`
-    and `-VerifyGraphics`.
-- `reference/notepad.html.original`: the original HTML/JS design (the SHA-256 the design data records).
-- `reference/notepad.html`: the corrected reference page, loading `notepad.design.js`.
-- `reference/notepad.ts`, `reference/notepad.design.ts`: the TypeScript extracted from the original, with
-  their compiled JavaScript, source maps and trace build.
-- `reference/PORT-STUDY.md`: detailed initial source study.
-- `QuickPS-LICENSE`: attribution/license for the copied binder.
-
-Your existing QuickPS repository was not changed. No package downloads or
-Node.js/TypeScript installation are required to run this application.
+- `Notepad.ps1`: the whole application, its design data and its checks.
+- `Start Notepad.cmd`: starts it.
+- `reference/notepad.html`: the original simulacrum.
+- `reference/notepad.design.html`: the corrected reference page `-BuildDesign` generates, loading
+  `notepad.design.js`.
+- `reference/notepad.ts`, `reference/notepad.design.ts`: the TypeScript extracted from it, with their
+  compiled JavaScript, source maps, trace build and `design-intent.clixml`.
+- `reference/PORT-STUDY.md`: the initial study of the source.
+- `QuickPS-LICENSE`: attribution and license for the native binder.

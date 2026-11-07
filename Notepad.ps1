@@ -12205,7 +12205,7 @@ $iconEvidence | Export-Clixml (Join-Path $EvidenceDirectory 'fluent-glyph-cubics
 [pscustomobject]@{ Glyphs = $iconEvidence.Count; Cubics = @($iconEvidence | ForEach-Object { $_.Cubics.Count } | Measure-Object -Sum).Sum; FontSHA256 = if ($iconEvidence.Count) { $iconEvidence[0].FontSHA256 } else { $null } }
 
 if (-not $SkipBrowser) {
-    $originalPath = Join-Path $PSScriptRoot 'reference\notepad.original.html'
+    $originalPath = Join-Path $PSScriptRoot 'reference\notepad.html'
     $browser = Connect-EdgePage $originalPath
     try {
         $null = Invoke-Cdp $browser 'Page.enable'
@@ -12471,15 +12471,14 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
                 ($designSemanticsJson | ConvertFrom-Json -Depth 100) |
                     Export-Clixml (Join-Path $EvidenceDirectory 'design-node-semantics.clixml')
             }
-            $originalManifest = Import-Clixml (Join-Path $PSScriptRoot 'original-sha256.clixml')
-            $originalEntry = $originalManifest | Where-Object RelativePath -eq 'reference\notepad.html'
-            $currentReference = Join-Path $PSScriptRoot 'reference\notepad.html'
-            $currentHash = (Get-FileHash $currentReference -Algorithm SHA256).Hash
-            if ($currentHash -ne $originalEntry.SHA256 -and $currentHash -ne (Get-FileHash (Join-Path $PSScriptRoot 'reference\notepad.html.original') -Algorithm SHA256).Hash) {
+            # The corrected reference page is generated beside the original (reference\notepad.html), never over it.
+            $currentReference = Join-Path $PSScriptRoot 'reference\notepad.design.html'
+            if (Test-Path $currentReference) {
                 # A previously generated reference may be updated, but an unrecognized edit is preserved.
+                $currentHash = (Get-FileHash $currentReference -Algorithm SHA256).Hash
                 $generatedHashFile = Join-Path $EvidenceDirectory 'generated-reference-hash.clixml'
                 if (-not (Test-Path $generatedHashFile) -or $currentHash -ne (Import-Clixml $generatedHashFile).SHA256) {
-                    throw 'The current reference differs from both the original and the last instrument build.'
+                    throw 'The corrected reference page differs from the last instrument build.'
                 }
             }
             $designHtml = Get-CdpValue $browser @'
@@ -12675,7 +12674,7 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
         }
     }
     $designHashRecord = Join-Path $EvidenceDirectory 'generated-reference-hash.clixml'
-    $designPath = Join-Path $PSScriptRoot 'reference\notepad.html'
+    $designPath = Join-Path $PSScriptRoot 'reference\notepad.design.html'
     if ((Test-Path $designHashRecord) -and
         (Get-FileHash $designPath -Algorithm SHA256).Hash -eq (Import-Clixml $designHashRecord).SHA256) {
         $designBrowser = Connect-EdgePage $designPath
