@@ -7,128 +7,384 @@ param(
     [ValidateSet('editor','settings','comparison')][string]$StartPage='editor',
     [ValidateSet('mica','acrylic','reverseMica')][string]$Backdrop,
     [ValidateSet('curved','straight')][string]$CornerStyle,[switch]$NoAnimation,
-    [switch]$VerifyModel,[switch]$VerifyGraphics
+    [switch]$VerifyModel,[switch]$VerifyGraphics,[switch]$VerifyWindow
 )
 
 # Folded from src\Model.ps1
+# The editor model. A document's text, selection and history; the find state; the open documents.
+class NotepadSnapshot {
+    [string]$Text
+    [int]$Anchor
+    [int]$Focus
+}
+
+class NotepadTab {
+    [int]$Id
+    [string]$Title
+    [string]$Text
+    [string]$Path
+    [bool]$Markdown
+    [string]$LineEnding
+    [string]$Encoding = 'UTF-8'
+    [bool]$Bom
+    [bool]$Modified
+    [int]$Revision
+    [int]$Anchor
+    [int]$Focus
+    [double]$ScrollX
+    [double]$ScrollY
+    [Collections.Generic.Stack[NotepadSnapshot]]$Undo = [Collections.Generic.Stack[NotepadSnapshot]]::new()
+    [Collections.Generic.Stack[NotepadSnapshot]]$Redo = [Collections.Generic.Stack[NotepadSnapshot]]::new()
+    [datetime]$LastEdit = [datetime]::MinValue
+}
+
+class NotepadMatch {
+    [int]$Start
+    [int]$End
+}
+
+class NotepadFind {
+    [string]$Query = ''
+    [string]$Replacement = ''
+    [bool]$MatchCase = $false
+    [bool]$Wrap = $true
+    [NotepadMatch[]]$Matches = [NotepadMatch[]]::new(0)
+    [int]$Index = -1
+}
+
+class NotepadModelState {
+    [hashtable]$Settings
+    [Collections.Generic.List[NotepadTab]]$Tabs = [Collections.Generic.List[NotepadTab]]::new()
+    [int]$ActiveId = 0
+    [int]$NextId = 1
+    [NotepadFind]$Find = [NotepadFind]::new()
+}
+
+class NotepadStatus {
+    [int]$Line
+    [int]$Column
+    [int]$Characters
+    [int]$Selected
+}
+
+class NotepadSaved {
+    [string]$Outcome
+    [int]$Id
+    [string]$Path
+}
+
+class NotepadModel {
+    hidden [NotepadModelState]$modelState
+
+    NotepadModel([hashtable]$Settings) { $this.modelState = [NotepadModelState]::new(); $this.modelState.Settings = $Settings }
+
+    [NotepadModelState] State() { return $this.modelState }
+
+    [NotepadTab] Active() {
+        foreach ($tab in $this.modelState.Tabs) { if ($tab.Id -eq $this.modelState.ActiveId) { return $tab } }
+        return $null
+    }
+
+    [NotepadTab] NewTab() { return $this.NewTab('Untitled', '', '', $false) }
+    [NotepadTab] NewTab([string]$Title) { return $this.NewTab($Title, '', '', $false) }
+    [NotepadTab] NewTab([string]$Title, [string]$Text) { return $this.NewTab($Title, $Text, '', $false) }
+    [NotepadTab] NewTab([string]$Title, [string]$Text, [string]$Path) { return $this.NewTab($Title, $Text, $Path, $false) }
+    [NotepadTab] NewTab([string]$Title, [string]$Text, [string]$Path, [bool]$Markdown) {
+        # New documents use Windows line endings. Only an opened LF file selects LF mode.
+        $lineEnding = 'Windows (CRLF)'
+        if ($Path -and $Text.Contains("`n") -and -not $Text.Contains("`r`n")) { $lineEnding = 'Unix (LF)' }
+        $tab = [NotepadTab]::new()
+        $tab.Id = $this.modelState.NextId
+        $this.modelState.NextId = $this.modelState.NextId + 1
+        $tab.Title = $Title
+        $tab.Text = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+        $tab.Path = $Path
+        $tab.Markdown = $Markdown
+        $tab.LineEnding = $lineEnding
+        $this.modelState.Tabs.Add($tab)
+        $this.modelState.ActiveId = $tab.Id
+        return $tab
+    }
+
+    hidden [NotepadTab] Tab([int]$Id) {
+        foreach ($tab in $this.modelState.Tabs) { if ($tab.Id -eq $Id) { return $tab } }
+        return $null
+    }
+
+    [void] SwitchTab([int]$Id) {
+        if ($null -ne $this.Tab($Id)) { $this.modelState.ActiveId = $Id; $this.Find() }
+    }
+
+    [void] CloseTab([int]$Id) {
+        for ($i = 0; $i -lt $this.modelState.Tabs.Count; $i++) {
+            if ($this.modelState.Tabs[$i].Id -eq $Id) {
+                $this.modelState.Tabs.RemoveAt($i)
+                if ($this.modelState.ActiveId -eq $Id -and $this.modelState.Tabs.Count) { $this.modelState.ActiveId = $this.modelState.Tabs[[Math]::Max(0, $i - 1)].Id }
+                break
+            }
+        }
+        if (-not $this.modelState.Tabs.Count) { $null = $this.NewTab() }
+        $this.Find()
+    }
+
+    hidden [NotepadSnapshot] Snapshot([NotepadTab]$Tab) {
+        $snapshot = [NotepadSnapshot]::new()
+        $snapshot.Text = $Tab.Text
+        $snapshot.Anchor = $Tab.Anchor
+        $snapshot.Focus = $Tab.Focus
+        return $snapshot
+    }
+
+    [void] Select([int]$Anchor, [int]$Focus) {
+        $tab = $this.Active()
+        $tab.Anchor = [Math]::Clamp($Anchor, 0, $tab.Text.Length)
+        $tab.Focus = [Math]::Clamp($Focus, 0, $tab.Text.Length)
+    }
+
+    [void] Insert([string]$Text) { $this.Insert($Text, $false) }
+    [void] Insert([string]$Text, [bool]$Coalesce) {
+        $tab = $this.Active()
+        $start = [Math]::Min($tab.Anchor, $tab.Focus)
+        $end = [Math]::Max($tab.Anchor, $tab.Focus)
+        if (-not $Coalesce -or ([DateTime]::UtcNow - $tab.LastEdit).TotalMilliseconds -gt 700 -or $start -ne $end) { $tab.Undo.Push($this.Snapshot($tab)) }
+        $tab.Redo.Clear()
+        $Text = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+        $tab.Text = $tab.Text.Substring(0, $start) + $Text + $tab.Text.Substring($end)
+        $tab.Focus = $start + $Text.Length
+        $tab.Anchor = $tab.Focus
+        $tab.Modified = $true
+        $tab.Revision = $tab.Revision + 1
+        $tab.LastEdit = [DateTime]::UtcNow
+        $this.Find()
+    }
+
+    hidden [int] Boundary([string]$Text, [int]$Position, [int]$Direction) {
+        $offsets = [Globalization.StringInfo]::ParseCombiningCharacters($Text)
+        if ($Direction -lt 0) {
+            for ($i = $offsets.Length - 1; $i -ge 0; $i--) { if ($offsets[$i] -lt $Position) { return $offsets[$i] } }
+            return 0
+        }
+        foreach ($offset in $offsets) { if ($offset -gt $Position) { return $offset } }
+        return $Text.Length
+    }
+
+    [void] Delete([bool]$Backspace) {
+        $tab = $this.Active()
+        if ($tab.Anchor -eq $tab.Focus) {
+            $direction = 1
+            if ($Backspace) { $direction = -1 }
+            $other = $this.Boundary($tab.Text, $tab.Focus, $direction)
+            if ($other -eq $tab.Focus) { return }
+            $tab.Anchor = $other
+        }
+        $this.Insert('')
+    }
+
+    [void] Undo() { $this.Undo($false) }
+    [void] Undo([bool]$Redo) {
+        $tab = $this.Active()
+        $from = $tab.Undo
+        $to = $tab.Redo
+        if ($Redo) { $from = $tab.Redo; $to = $tab.Undo }
+        if (-not $from.Count) { return }
+        $to.Push($this.Snapshot($tab))
+        $saved = $from.Pop()
+        $tab.Text = $saved.Text
+        $tab.Anchor = $saved.Anchor
+        $tab.Focus = $saved.Focus
+        $tab.Modified = $true
+        $tab.Revision = $tab.Revision + 1
+        $tab.LastEdit = [DateTime]::MinValue
+        $this.Find()
+    }
+
+    [void] Move([string]$Direction) { $this.Move($Direction, $false, $false) }
+    [void] Move([string]$Direction, [bool]$Extend) { $this.Move($Direction, $Extend, $false) }
+    [void] Move([string]$Direction, [bool]$Extend, [bool]$Word) {
+        $tab = $this.Active()
+        $pos = $tab.Focus
+        if ($Direction -eq 'left' -and -not $Extend -and $tab.Anchor -ne $pos) { $pos = [Math]::Min($tab.Anchor, $pos) }
+        elseif ($Direction -eq 'right' -and -not $Extend -and $tab.Anchor -ne $pos) { $pos = [Math]::Max($tab.Anchor, $pos) }
+        else {
+            switch ($Direction) {
+                'left' {
+                    $pos = $this.Boundary($tab.Text, $pos, -1)
+                    if ($Word) {
+                        while ($pos -gt 0 -and [char]::IsWhiteSpace($tab.Text[$pos])) { $pos = $this.Boundary($tab.Text, $pos, -1) }
+                        while ($pos -gt 0 -and -not [char]::IsWhiteSpace($tab.Text[$pos - 1])) { $pos = $this.Boundary($tab.Text, $pos, -1) }
+                    }
+                }
+                'right' {
+                    $pos = $this.Boundary($tab.Text, $pos, 1)
+                    if ($Word) {
+                        while ($pos -lt $tab.Text.Length -and -not [char]::IsWhiteSpace($tab.Text[$pos])) { $pos = $this.Boundary($tab.Text, $pos, 1) }
+                        while ($pos -lt $tab.Text.Length -and [char]::IsWhiteSpace($tab.Text[$pos])) { $pos = $this.Boundary($tab.Text, $pos, 1) }
+                    }
+                }
+                'home' {
+                    if ($Word) { $pos = 0 } else { $pos = $tab.Text.LastIndexOf("`n", [Math]::Max(0, $pos - 1)) + 1 }
+                    if ($tab.Focus -eq 0) { $pos = 0 }
+                }
+                'end' {
+                    if ($Word) { $pos = $tab.Text.Length }
+                    else {
+                        $p = $tab.Text.IndexOf("`n", $pos)
+                        if ($p -lt 0) { $pos = $tab.Text.Length } else { $pos = $p }
+                    }
+                }
+            }
+        }
+        $tab.Focus = $pos
+        if (-not $Extend) { $tab.Anchor = $pos }
+        $tab.LastEdit = [DateTime]::MinValue
+    }
+
+    [NotepadStatus] Status() {
+        $tab = $this.Active()
+        $start = [Math]::Min($tab.Anchor, $tab.Focus)
+        $before = $tab.Text.Substring(0, $start)
+        $lines = $before.Split("`n")
+        $status = [NotepadStatus]::new()
+        $status.Line = $lines.Length
+        $status.Column = $lines[$lines.Length - 1].Length + 1
+        $status.Characters = $tab.Text.Length
+        $status.Selected = [Math]::Abs($tab.Focus - $tab.Anchor)
+        return $status
+    }
+
+    [void] Find() {
+        $tab = $this.Active()
+        if ($null -eq $tab) { return }
+        $find = $this.modelState.Find
+        $find.Matches = [NotepadMatch[]]::new(0)
+        $find.Index = -1
+        if (-not $find.Query) { return }
+        $comparison = [StringComparison]::OrdinalIgnoreCase
+        if ($find.MatchCase) { $comparison = [StringComparison]::Ordinal }
+        $positions = [Collections.Generic.List[NotepadMatch]]::new()
+        $offset = 0
+        while ($offset -le $tab.Text.Length - $find.Query.Length) {
+            $index = $tab.Text.IndexOf($find.Query, $offset, $comparison)
+            if ($index -lt 0) { break }
+            $match = [NotepadMatch]::new()
+            $match.Start = $index
+            $match.End = $index + $find.Query.Length
+            $positions.Add($match)
+            $offset = $index + $find.Query.Length
+        }
+        $find.Matches = $positions.ToArray()
+        if ($positions.Count) {
+            $find.Index = 0
+            for ($i = 0; $i -lt $positions.Count; $i++) { if ($positions[$i].Start -ge [Math]::Min($tab.Anchor, $tab.Focus)) { $find.Index = $i; break } }
+        }
+    }
+
+    [void] SelectMatch() { $this.SelectMatch(0) }
+    [void] SelectMatch([int]$Step) {
+        $find = $this.modelState.Find
+        if (-not $find.Matches.Count) { $this.Find() }
+        if (-not $find.Matches.Count) { return }
+        $next = $find.Index + $Step
+        if ($find.Wrap) { $next = ($next + $find.Matches.Count) % $find.Matches.Count }
+        elseif ($next -lt 0 -or $next -ge $find.Matches.Count) { return }
+        $find.Index = $next
+        $match = $find.Matches[$next]
+        $this.Select($match.Start, $match.End)
+    }
+
+    [void] Replace() { $this.Replace($false) }
+    [void] Replace([bool]$All) {
+        $find = $this.modelState.Find
+        if (-not $find.Query) { return }
+        if ($All) {
+            $this.Find()
+            $tab = $this.Active()
+            $text = $tab.Text
+            for ($i = $find.Matches.Count - 1; $i -ge 0; $i--) {
+                $m = $find.Matches[$i]
+                $text = $text.Substring(0, $m.Start) + $find.Replacement + $text.Substring($m.End)
+            }
+            if ($find.Matches.Count) { $this.Select(0, $tab.Text.Length); $this.Insert($text) }
+        }
+        elseif ($find.Matches.Count) {
+            $m = $find.Matches[$find.Index]
+            $this.Select($m.Start, $m.End)
+            $this.Insert($find.Replacement)
+            $this.SelectMatch()
+        }
+    }
+
+    [NotepadSaved] Save([int]$Id, [string]$Path) {
+        $tab = $this.Tab($Id)
+        if ($null -eq $tab) { throw ('Unknown document ' + $Id) }
+        $text = $tab.Text
+        if ($tab.LineEnding -eq 'Windows (CRLF)') { $text = $text.Replace("`n", "`r`n") }
+        $fullPath = [IO.Path]::GetFullPath($Path)
+        # Write a sibling temporary file first, then replace the destination. A
+        # failed write cannot mark a document clean or truncate the old contents.
+        $temporary = [IO.Path]::Combine([IO.Path]::GetDirectoryName($fullPath), '.notepad-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        try { [IO.File]::WriteAllText($temporary, $text, [Text.UTF8Encoding]::new($tab.Bom)); [IO.File]::Move($temporary, $fullPath, $true) }
+        finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+        $tab.Path = $fullPath
+        $tab.Title = [IO.Path]::GetFileName($fullPath)
+        $tab.Modified = $false
+        $saved = [NotepadSaved]::new()
+        $saved.Outcome = 'Saved'
+        $saved.Id = $tab.Id
+        $saved.Path = $fullPath
+        return $saved
+    }
+
+    [NotepadTab] Open([string]$Path) {
+        $bytes = [IO.File]::ReadAllBytes($Path)
+        $bom = $bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191
+        $utf8 = [Text.UTF8Encoding]::new($false, $true)
+        $text = $utf8.GetString($bytes).TrimStart([char]0xFEFF)
+        $tab = $this.NewTab([IO.Path]::GetFileName($Path), $text, [IO.Path]::GetFullPath($Path), $Path.EndsWith('.md', [StringComparison]::OrdinalIgnoreCase))
+        $tab.Bom = $bom
+        return $tab
+    }
+
+    [hashtable] ExportSession() {
+        $tabs = [Collections.Generic.List[object]]::new()
+        foreach ($tab in $this.modelState.Tabs) {
+            $tabs.Add(@{Id=$tab.Id;Title=$tab.Title;Text=$tab.Text;Path=$tab.Path;Markdown=$tab.Markdown;LineEnding=$tab.LineEnding;Encoding=$tab.Encoding;Bom=$tab.Bom;Modified=$tab.Modified;Anchor=$tab.Anchor;Focus=$tab.Focus;ScrollX=$tab.ScrollX;ScrollY=$tab.ScrollY})
+        }
+        return @{NextId=$this.modelState.NextId;ActiveId=$this.modelState.ActiveId;Tabs=$tabs.ToArray()}
+    }
+
+    [void] ImportSession([hashtable]$Session) {
+        if (-not $Session.Tabs.Count) { return }
+        $this.modelState.Tabs.Clear()
+        $ids = [Collections.Generic.HashSet[int]]::new()
+        foreach ($saved in $Session.Tabs) {
+            if (-not ($saved.Text -is [string]) -or -not $ids.Add([int]$saved.Id)) { throw 'Invalid session document' }
+            $tab = $this.NewTab($saved.Title, $saved.Text, $saved.Path, $saved.Markdown)
+            if ($saved.ContainsKey('Id')) { $tab.Id = $saved.Id }
+            if ($saved.ContainsKey('LineEnding')) { $tab.LineEnding = $saved.LineEnding }
+            if ($saved.ContainsKey('Encoding')) { $tab.Encoding = $saved.Encoding }
+            if ($saved.ContainsKey('Bom')) { $tab.Bom = $saved.Bom }
+            if ($saved.ContainsKey('Modified')) { $tab.Modified = $saved.Modified }
+            if ($saved.ContainsKey('Anchor')) { $tab.Anchor = $saved.Anchor }
+            if ($saved.ContainsKey('Focus')) { $tab.Focus = $saved.Focus }
+            if ($saved.ContainsKey('ScrollX')) { $tab.ScrollX = $saved.ScrollX }
+            if ($saved.ContainsKey('ScrollY')) { $tab.ScrollY = $saved.ScrollY }
+            $tab.Focus = [Math]::Clamp($tab.Focus, 0, $tab.Text.Length)
+            $tab.Anchor = [Math]::Clamp($tab.Anchor, 0, $tab.Text.Length)
+        }
+        $highest = 0
+        foreach ($tab in $this.modelState.Tabs) { $highest = [Math]::Max($highest, $tab.Id) }
+        $this.modelState.NextId = [Math]::Max([int]$Session.NextId, $highest + 1)
+        $this.modelState.ActiveId = $this.modelState.Tabs[0].Id
+        if ($ids.Contains([int]$Session.ActiveId)) { $this.modelState.ActiveId = [int]$Session.ActiveId }
+    }
+}
+
 function Invoke-Model {
 [CmdletBinding()]
 param([hashtable]$Settings=@{})
 if($MyInvocation.InvocationName -eq '.'){throw 'Invoke Model.ps1 with &.'}
-New-Module -AsCustomObject -ArgumentList $Settings -ScriptBlock {
-    param($Settings)
-    $script:state=@{Settings=$Settings;Tabs=[Collections.Generic.List[object]]::new();ActiveId=0;NextId=1;Find=@{Query='';Replacement='';MatchCase=$false;Wrap=$true;Matches=@();Index=-1}}
-    function State {$state}
-    function Active {foreach($tab in $state.Tabs){if($tab.Id -eq $state.ActiveId){return $tab}}}
-    function NewTab([string]$Title='Untitled',[string]$Text='',[string]$Path=$null,[bool]$Markdown=$false){
-        # New documents use Windows line endings. Only an opened LF file selects LF mode.
-        $lineEnding=if($Path -and $Text.Contains("`n") -and -not $Text.Contains("`r`n")){'Unix (LF)'}else{'Windows (CRLF)'}
-        $tab=@{Id=$state.NextId++;Title=$Title;Text=$Text.Replace("`r`n","`n").Replace("`r","`n");Path=$Path;Markdown=$Markdown;LineEnding=$lineEnding;Encoding='UTF-8';Bom=$false;Modified=$false;Revision=0;Anchor=0;Focus=0;ScrollX=0.0;ScrollY=0.0;Undo=[Collections.Generic.Stack[object]]::new();Redo=[Collections.Generic.Stack[object]]::new();LastEdit=[datetime]::MinValue}
-        $state.Tabs.Add($tab);$state.ActiveId=$tab.Id
-        $tab
-    }
-    function SwitchTab([int]$Id){if(@($state.Tabs|Where-Object Id -eq $Id).Count){$state.ActiveId=$Id;Find}}
-    function CloseTab([int]$Id){
-        for($i=0;$i -lt $state.Tabs.Count;$i++){if($state.Tabs[$i].Id -eq $Id){$state.Tabs.RemoveAt($i);if($state.ActiveId -eq $Id -and $state.Tabs.Count){$state.ActiveId=$state.Tabs[[Math]::Max(0,$i-1)].Id};break}}
-        if(-not $state.Tabs.Count){$null=NewTab};Find
-    }
-    function Snapshot($Tab){@{Text=$Tab.Text;Anchor=$Tab.Anchor;Focus=$Tab.Focus}}
-    function Select-Range([int]$Anchor,[int]$Focus){$tab=Active;$tab.Anchor=[Math]::Clamp($Anchor,0,$tab.Text.Length);$tab.Focus=[Math]::Clamp($Focus,0,$tab.Text.Length)}
-    function Select([int]$Anchor,[int]$Focus){Select-Range $Anchor $Focus}
-    function Insert([string]$Text,[bool]$Coalesce=$false){
-        $tab=Active;$start=[Math]::Min($tab.Anchor,$tab.Focus);$end=[Math]::Max($tab.Anchor,$tab.Focus)
-        if(-not $Coalesce -or ([DateTime]::UtcNow-$tab.LastEdit).TotalMilliseconds -gt 700 -or $start -ne $end){$tab.Undo.Push((Snapshot $tab))}
-        $tab.Redo.Clear();$Text=$Text.Replace("`r`n","`n").Replace("`r","`n")
-        $tab.Text=$tab.Text.Substring(0,$start)+$Text+$tab.Text.Substring($end)
-        $tab.Focus=$start+$Text.Length;$tab.Anchor=$tab.Focus;$tab.Modified=$true;$tab.Revision++;$tab.LastEdit=[DateTime]::UtcNow
-        Find
-    }
-    function Boundary([string]$Text,[int]$Position,[int]$Direction){
-        $offsets=[Globalization.StringInfo]::ParseCombiningCharacters($Text)
-        if($Direction -lt 0){for($i=$offsets.Length-1;$i -ge 0;$i--){if($offsets[$i] -lt $Position){return $offsets[$i]}};return 0}
-        foreach($offset in $offsets){if($offset -gt $Position){return $offset}};$Text.Length
-    }
-    function Delete([bool]$Backspace){
-        $tab=Active
-        if($tab.Anchor -eq $tab.Focus){$other=Boundary $tab.Text $tab.Focus $(if($Backspace){-1}else{1});if($other -eq $tab.Focus){return};$tab.Anchor=$other}
-        Insert ''
-    }
-    function Undo([bool]$Redo=$false){
-        $tab=Active;$from=$tab.Undo;$to=$tab.Redo;if($Redo){$from=$tab.Redo;$to=$tab.Undo}
-        if(-not $from.Count){return};$to.Push((Snapshot $tab));$saved=$from.Pop();$tab.Text=$saved.Text;$tab.Anchor=$saved.Anchor;$tab.Focus=$saved.Focus;$tab.Modified=$true;$tab.Revision++;$tab.LastEdit=[DateTime]::MinValue;Find
-    }
-    function Move([string]$Direction,[bool]$Extend=$false,[bool]$Word=$false){
-        $tab=Active;$pos=$tab.Focus
-        if($Direction -eq 'left' -and -not $Extend -and $tab.Anchor -ne $pos){$pos=[Math]::Min($tab.Anchor,$pos)}
-        elseif($Direction -eq 'right' -and -not $Extend -and $tab.Anchor -ne $pos){$pos=[Math]::Max($tab.Anchor,$pos)}
-        else{switch($Direction){
-            'left'{$pos=Boundary $tab.Text $pos -1;if($Word){while($pos -gt 0 -and [char]::IsWhiteSpace($tab.Text[$pos])){$pos=Boundary $tab.Text $pos -1};while($pos -gt 0 -and -not [char]::IsWhiteSpace($tab.Text[$pos-1])){$pos=Boundary $tab.Text $pos -1}}}
-            'right'{$pos=Boundary $tab.Text $pos 1;if($Word){while($pos -lt $tab.Text.Length -and -not [char]::IsWhiteSpace($tab.Text[$pos])){$pos=Boundary $tab.Text $pos 1};while($pos -lt $tab.Text.Length -and [char]::IsWhiteSpace($tab.Text[$pos])){$pos=Boundary $tab.Text $pos 1}}}
-            'home'{$pos=if($Word){0}else{$tab.Text.LastIndexOf("`n",[Math]::Max(0,$pos-1))+1};if($tab.Focus -eq 0){$pos=0}}
-            'end'{$pos=if($Word){$tab.Text.Length}else{$p=$tab.Text.IndexOf("`n",$pos);if($p -lt 0){$tab.Text.Length}else{$p}}}
-        }}
-        $tab.Focus=$pos;if(-not $Extend){$tab.Anchor=$pos};$tab.LastEdit=[DateTime]::MinValue
-    }
-    function Status {
-        $tab=Active;$start=[Math]::Min($tab.Anchor,$tab.Focus);$before=$tab.Text.Substring(0,$start);$lines=$before.Split("`n")
-        @{Line=$lines.Length;Column=$lines[-1].Length+1;Characters=$tab.Text.Length;Selected=[Math]::Abs($tab.Focus-$tab.Anchor)}
-    }
-    function Find {
-        $tab=Active;if(-not $tab){return};$find=$state.Find;$find.Matches=@();$find.Index=-1
-        if(-not $find.Query){return}
-        $comparison=if($find.MatchCase){[StringComparison]::Ordinal}else{[StringComparison]::OrdinalIgnoreCase}
-        $positions=[Collections.Generic.List[object]]::new();$offset=0
-        while($offset -le $tab.Text.Length-$find.Query.Length){$index=$tab.Text.IndexOf($find.Query,$offset,$comparison);if($index -lt 0){break};$positions.Add(@{Start=$index;End=$index+$find.Query.Length});$offset=$index+$find.Query.Length}
-        $find.Matches=$positions.ToArray()
-        if($positions.Count){$find.Index=0;for($i=0;$i -lt $positions.Count;$i++){if($positions[$i].Start -ge [Math]::Min($tab.Anchor,$tab.Focus)){$find.Index=$i;break}}}
-    }
-    function SelectMatch([int]$Step=0){
-        $find=$state.Find;if(-not $find.Matches.Count){Find};if(-not $find.Matches.Count){return}
-        $next=$find.Index+$Step
-        if($find.Wrap){$next=($next+$find.Matches.Count)%$find.Matches.Count}elseif($next -lt 0 -or $next -ge $find.Matches.Count){return}
-        $find.Index=$next;$match=$find.Matches[$next];Select-Range $match.Start $match.End
-    }
-    function Replace([bool]$All=$false){
-        $find=$state.Find;if(-not $find.Query){return}
-        if($All){Find;$tab=Active;$text=$tab.Text;for($i=$find.Matches.Count-1;$i -ge 0;$i--){$m=$find.Matches[$i];$text=$text.Substring(0,$m.Start)+$find.Replacement+$text.Substring($m.End)};if($find.Matches.Count){Select-Range 0 $tab.Text.Length;Insert $text}}
-        elseif($find.Matches.Count){$m=$find.Matches[$find.Index];Select-Range $m.Start $m.End;Insert $find.Replacement;SelectMatch}
-    }
-    function Save([int]$Id,[string]$Path){
-        $tab=$state.Tabs|Where-Object Id -eq $Id|Select-Object -First 1
-        if(-not $tab){throw "Unknown document $Id"}
-        $text=$tab.Text;if($tab.LineEnding -eq 'Windows (CRLF)'){$text=$text.Replace("`n","`r`n")}
-        $fullPath=[IO.Path]::GetFullPath($Path)
-        # Write a sibling temporary file first, then replace the destination. A
-        # failed write cannot mark a document clean or truncate the old contents.
-        $temporary=Join-Path ([IO.Path]::GetDirectoryName($fullPath)) ('.notepad-'+[Guid]::NewGuid().ToString('N')+'.tmp')
-        try{[IO.File]::WriteAllText($temporary,$text,[Text.UTF8Encoding]::new([bool]$tab.Bom));[IO.File]::Move($temporary,$fullPath,$true)}
-        finally{if([IO.File]::Exists($temporary)){[IO.File]::Delete($temporary)}}
-        $tab.Path=$fullPath;$tab.Title=[IO.Path]::GetFileName($fullPath);$tab.Modified=$false
-        @{Outcome='Saved';Id=$tab.Id;Path=$fullPath}
-    }
-    function Open([string]$Path){
-        $bytes=[IO.File]::ReadAllBytes($Path)
-        $bom=$bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191
-        $utf8=[Text.UTF8Encoding]::new($false,$true);$text=$utf8.GetString($bytes).TrimStart([char]0xFEFF)
-        $tab=NewTab ([IO.Path]::GetFileName($Path)) $text ([IO.Path]::GetFullPath($Path)) ($Path -match '\.md$');$tab.Bom=$bom
-        $tab
-    }
-    function ExportSession {
-        @{NextId=$state.NextId;ActiveId=$state.ActiveId;Tabs=@(foreach($tab in $state.Tabs){@{Id=$tab.Id;Title=$tab.Title;Text=$tab.Text;Path=$tab.Path;Markdown=$tab.Markdown;LineEnding=$tab.LineEnding;Encoding=$tab.Encoding;Bom=$tab.Bom;Modified=$tab.Modified;Anchor=$tab.Anchor;Focus=$tab.Focus;ScrollX=$tab.ScrollX;ScrollY=$tab.ScrollY}})}
-    }
-    function ImportSession([hashtable]$Session){
-        if(-not $Session.Tabs.Count){return};$state.Tabs.Clear();$ids=[Collections.Generic.HashSet[int]]::new()
-        foreach($saved in $Session.Tabs){
-            if(-not ($saved.Text -is [string]) -or -not $ids.Add([int]$saved.Id)){throw 'Invalid session document'}
-            $tab=NewTab $saved.Title $saved.Text $saved.Path $saved.Markdown
-            foreach($key in @('Id','LineEnding','Encoding','Bom','Modified','Anchor','Focus','ScrollX','ScrollY')){if($saved.ContainsKey($key)){$tab[$key]=$saved[$key]}}
-            $tab.Focus=[Math]::Clamp([int]$tab.Focus,0,$tab.Text.Length);$tab.Anchor=[Math]::Clamp([int]$tab.Anchor,0,$tab.Text.Length)
-        }
-        $state.NextId=[Math]::Max([int]$Session.NextId,([int]($state.Tabs.Id|Measure-Object -Maximum).Maximum+1))
-        $state.ActiveId=$state.Tabs[0].Id;if($ids.Contains([int]$Session.ActiveId)){$state.ActiveId=[int]$Session.ActiveId}
-    }
-    Export-ModuleMember -Function State,Active,NewTab,SwitchTab,CloseTab,Select,Insert,Delete,Undo,Move,Status,Find,SelectMatch,Replace,Save,Open,ExportSession,ImportSession
-}
+[NotepadModel]::new($Settings)
 }
 
 # Folded from tests\Model.Verify.ps1
@@ -10757,6 +11013,130 @@ try{
 }finally{if($graphics){$graphics.Dispose()};if($window){$window.Dispose()};$native.Dispose()}
 }
 
+# Window behaviour Windows 11 provides to every top-level window, observed on Notepad running as its own process and
+# driven from outside as Windows and a person drive it: each backdrop as DWM reports it; the title bar and caption
+# buttons following the edge during a live resize; the minimum size under a drag; the maximize button as Snap Layouts
+# finds it; maximize filling the work area; restore and minimize returning the window; Win+Left, Win+Up and Win+Down.
+# The mouse is moved and pressed during the resize. Keys are sent only while Notepad is the foreground window.
+function Invoke-Window.Verify {
+[CmdletBinding()]
+param()
+$ErrorActionPreference='Stop'
+$root=Split-Path $(Join-Path $PSScriptRoot 'tests')
+$native=Invoke-Native
+$records=[Collections.Generic.List[object]]::new()
+function Bind([string]$Name,[Type]$Return,[Type[]]$Types,[string]$Library='user32.dll'){$native.GetExportCall($Library,$Name,$Return,$Types)}
+function Record([string]$Check,[object]$Expected,[object]$Observed,[object]$Holds){$records.Add([pscustomobject]@{Check=$Check;Expected=$Expected;Observed=$Observed;Holds=$Holds})}
+$dpiContext=Bind 'SetThreadDpiAwarenessContext' ([IntPtr]) @([IntPtr]);$previousDpi=$dpiContext.DynamicInvoke([IntPtr](-4))
+$getRect=Bind 'GetWindowRect' ([bool]) @([IntPtr],[IntPtr])
+$getDpi=Bind 'GetDpiForWindow' ([uint32]) @([IntPtr])
+$show=Bind 'ShowWindow' ([bool]) @([IntPtr],[int])
+$isZoomed=Bind 'IsZoomed' ([bool]) @([IntPtr])
+$isIconic=Bind 'IsIconic' ([bool]) @([IntPtr])
+$send=Bind 'SendMessageW' ([IntPtr]) @([IntPtr],[uint32],[IntPtr],[IntPtr])
+$post=Bind 'PostMessageW' ([bool]) @([IntPtr],[uint32],[IntPtr],[IntPtr])
+$foreground=Bind 'GetForegroundWindow' ([IntPtr]) @()
+$setCursor=Bind 'SetCursorPos' ([bool]) @([int],[int])
+$mouse=Bind 'mouse_event' ([void]) @([uint32],[int],[int],[uint32],[IntPtr])
+$key=Bind 'keybd_event' ([void]) @([byte],[byte],[uint32],[IntPtr])
+$monitorFrom=Bind 'MonitorFromWindow' ([IntPtr]) @([IntPtr],[uint32])
+$monitorInfo=Bind 'GetMonitorInfoW' ([bool]) @([IntPtr],[IntPtr])
+$dwmGet=Bind 'DwmGetWindowAttribute' ([int]) @([IntPtr],[uint32],[IntPtr],[uint32]) 'dwmapi.dll'
+$getDC=Bind 'GetDC' ([IntPtr]) @([IntPtr]);$releaseDC=Bind 'ReleaseDC' ([int]) @([IntPtr],[IntPtr])
+$compatibleDC=Bind 'CreateCompatibleDC' ([IntPtr]) @([IntPtr]) 'gdi32.dll';$deleteDC=Bind 'DeleteDC' ([bool]) @([IntPtr]) 'gdi32.dll'
+$compatibleBitmap=Bind 'CreateCompatibleBitmap' ([IntPtr]) @([IntPtr],[int],[int]) 'gdi32.dll';$select=Bind 'SelectObject' ([IntPtr]) @([IntPtr],[IntPtr]) 'gdi32.dll'
+$deleteObject=Bind 'DeleteObject' ([bool]) @([IntPtr]) 'gdi32.dll';$bitBlt=Bind 'BitBlt' ([bool]) @([IntPtr],[int],[int],[int],[int],[IntPtr],[int],[int],[uint32]) 'gdi32.dll'
+$getBits=Bind 'GetDIBits' ([int]) @([IntPtr],[IntPtr],[uint32],[uint32],[IntPtr],[IntPtr],[uint32]) 'gdi32.dll'
+$scratch=$native.Allocate(256)
+function Rect([IntPtr]$Hwnd){$null=$getRect.DynamicInvoke($Hwnd,$scratch);[int[]]@(0,4,8,12|ForEach-Object{[Runtime.InteropServices.Marshal]::ReadInt32($scratch,$_)})}
+function Frame([IntPtr]$Hwnd){$null=$dwmGet.DynamicInvoke($Hwnd,[uint32]9,$scratch,[uint32]16);[int[]]@(0,4,8,12|ForEach-Object{[Runtime.InteropServices.Marshal]::ReadInt32($scratch,$_)})}
+function WorkArea([IntPtr]$Hwnd){[Runtime.InteropServices.Marshal]::WriteInt32($scratch,40,40);$null=$monitorInfo.DynamicInvoke($monitorFrom.DynamicInvoke($Hwnd,[uint32]2),[IntPtr]::Add($scratch,40));[int[]]@(60,64,68,72|ForEach-Object{[Runtime.InteropServices.Marshal]::ReadInt32($scratch,$_)})}
+function Near([int[]]$A,[int[]]$B,[int]$Tolerance=2){if($A.Length -ne $B.Length){return $false};for($i=0;$i -lt $A.Length;$i++){if([Math]::Abs($A[$i]-$B[$i]) -gt $Tolerance){return $false}};$true}
+function Pixels([int]$X,[int]$Y,[int]$W,[int]$H){
+    $screen=$getDC.DynamicInvoke([IntPtr]::Zero);$memory=$compatibleDC.DynamicInvoke($screen);$bitmap=$compatibleBitmap.DynamicInvoke($screen,$W,$H);$old=$select.DynamicInvoke($memory,$bitmap)
+    $info=$native.Allocate(44);$buffer=$native.Allocate($W*$H*4)
+    try{
+        $null=$bitBlt.DynamicInvoke($memory,0,0,$W,$H,$screen,$X,$Y,[uint32]0x40CC0020)
+        [Runtime.InteropServices.Marshal]::WriteInt32($info,0,40);[Runtime.InteropServices.Marshal]::WriteInt32($info,4,$W);[Runtime.InteropServices.Marshal]::WriteInt32($info,8,-$H)
+        [Runtime.InteropServices.Marshal]::WriteInt16($info,12,1);[Runtime.InteropServices.Marshal]::WriteInt16($info,14,32)
+        $null=$select.DynamicInvoke($memory,$old)
+        $null=$getBits.DynamicInvoke($memory,$bitmap,[uint32]0,[uint32]$H,$buffer,$info,[uint32]0)
+        $bytes=[byte[]]::new($W*$H*4);[Runtime.InteropServices.Marshal]::Copy($buffer,$bytes,0,$bytes.Length);,$bytes
+    }finally{$native.Free($buffer);$native.Free($info);$null=$deleteObject.DynamicInvoke($bitmap);$null=$deleteDC.DynamicInvoke($memory);$null=$releaseDC.DynamicInvoke([IntPtr]::Zero,$screen)}
+}
+function Difference([byte[]]$A,[byte[]]$B){$sum=0L;for($i=0;$i -lt $A.Length;$i++){$sum+=[Math]::Abs([int]$A[$i]-[int]$B[$i])};[Math]::Round($sum/$A.Length,2)}
+function Chord([byte[]]$Keys){foreach($k in $Keys){$key.DynamicInvoke($k,[byte]0,[uint32]0,[IntPtr]::Zero)};[array]::Reverse($Keys);foreach($k in $Keys){$key.DynamicInvoke($k,[byte]0,[uint32]2,[IntPtr]::Zero)};Start-Sleep -Milliseconds 700}
+$expectedBackdrop=@{mica=2;acrylic=3;reverseMica=4}
+try{
+    foreach($material in 'mica','acrylic','reverseMica'){
+        $process=Start-Process -FilePath ([Environment]::ProcessPath) -ArgumentList @('-NoProfile','-STA','-File',$PSCommandPath,'-NoSession','-NoAnimation','-RunSeconds','90','-Backdrop',$material) -PassThru
+        try{
+            $until=[DateTime]::UtcNow.AddSeconds(90)
+            while($process.MainWindowHandle -eq [IntPtr]::Zero -and -not $process.HasExited -and [DateTime]::UtcNow -lt $until){Start-Sleep -Milliseconds 250;$process.Refresh()}
+            if($process.MainWindowHandle -eq [IntPtr]::Zero){Record "$material window" 'a window' 'none' $false;continue}
+            $hwnd=$process.MainWindowHandle;Start-Sleep -Milliseconds 1500
+            $null=$dwmGet.DynamicInvoke($hwnd,[uint32]38,$scratch,[uint32]4);$observed=[Runtime.InteropServices.Marshal]::ReadInt32($scratch)
+            Record "backdrop $material" $expectedBackdrop[$material] $observed ($observed -eq $expectedBackdrop[$material])
+            if($material -ne 'mica'){continue}
+            $scale=$getDpi.DynamicInvoke($hwnd)/96.0
+            $minimum=[int[]]@([int][Math]::Ceiling(768*$scale),[int][Math]::Ceiling(478*$scale))
+            # Live resize: the close button stays at the top-right corner while the right edge is dragged.
+            $start=Rect $hwnd;$button=[int[]]@([int](46*$scale),[int](40*$scale))
+            $reference=Pixels ($start[2]-$button[0]) $start[1] $button[0] $button[1]
+            $y=[int](($start[1]+$start[3])/2);$null=$setCursor.DynamicInvoke($start[2]-2,$y);Start-Sleep -Milliseconds 150
+            $mouse.DynamicInvoke([uint32]2,0,0,[uint32]0,[IntPtr]::Zero);Start-Sleep -Milliseconds 150
+            $differences=[Collections.Generic.List[double]]::new()
+            foreach($step in 1..8){
+                $null=$setCursor.DynamicInvoke($start[2]-2-40*$step,$y);Start-Sleep -Milliseconds 120
+                $now=Rect $hwnd;$differences.Add((Difference $reference (Pixels ($now[2]-$button[0]) $now[1] $button[0] $button[1])))
+            }
+            $null=$setCursor.DynamicInvoke($start[2]-4000,$y);Start-Sleep -Milliseconds 300
+            $smallest=Rect $hwnd
+            $mouse.DynamicInvoke([uint32]4,0,0,[uint32]0,[IntPtr]::Zero);Start-Sleep -Milliseconds 400
+            $worst=($differences|Measure-Object -Maximum).Maximum
+            Record 'caption buttons follow the edge during a live resize (mean byte difference per step)' '< 12 at every step' ($differences -join ', ') ($worst -lt 12)
+            Record 'minimum width under a drag' $minimum[0] ($smallest[2]-$smallest[0]) (($smallest[2]-$smallest[0]) -eq $minimum[0])
+            $null=$show.DynamicInvoke($hwnd,9);Start-Sleep -Milliseconds 400
+            # Snap Layouts appears over the maximize button only when the window reports it there.
+            $rect=Rect $hwnd;$x=$rect[2]-[int](69*$scale);$top=$rect[1]+[int](20*$scale)
+            $hit=$send.DynamicInvoke($hwnd,[uint32]0x84,[IntPtr]::Zero,[IntPtr](($top -shl 16) -bor ($x -band 0xffff))).ToInt64()
+            Record 'maximize button hit test (Snap Layouts)' 9 $hit ($hit -eq 9)
+            # Maximize fills the work area; restore returns the window.
+            $before=Rect $hwnd
+            $null=$show.DynamicInvoke($hwnd,3);Start-Sleep -Milliseconds 600
+            $work=WorkArea $hwnd;$frame=Frame $hwnd
+            Record 'maximized' $true $isZoomed.DynamicInvoke($hwnd) ($isZoomed.DynamicInvoke($hwnd) -eq $true)
+            Record 'maximized frame equals the work area' ($work -join ',') ($frame -join ',') (Near $frame $work)
+            $null=$show.DynamicInvoke($hwnd,9);Start-Sleep -Milliseconds 600
+            $after=Rect $hwnd;Record 'restore after maximize returns the window' ($before -join ',') ($after -join ',') (Near $after $before)
+            $null=$show.DynamicInvoke($hwnd,6);Start-Sleep -Milliseconds 600
+            Record 'minimized' $true $isIconic.DynamicInvoke($hwnd) ($isIconic.DynamicInvoke($hwnd) -eq $true)
+            $null=$show.DynamicInvoke($hwnd,9);Start-Sleep -Milliseconds 600
+            $after=Rect $hwnd;Record 'restore after minimize returns the window' ($before -join ',') ($after -join ',') ((-not $isIconic.DynamicInvoke($hwnd)) -and (Near $after $before))
+            # Snap with the keyboard, only while Notepad is the foreground window.
+            if($foreground.DynamicInvoke() -ne $hwnd){Record 'Win+Left, Win+Up, Win+Down' 'Notepad in the foreground' 'another window was in the foreground; no keys sent' $null}
+            else{
+                $before=Rect $hwnd
+                Chord @(0x5B,0x25)
+                $work=WorkArea $hwnd;$frame=Frame $hwnd;$half=[int[]]@($work[0],$work[1],[int]($work[0]+($work[2]-$work[0])/2),$work[3])
+                Record 'Win+Left snaps to the left half of the work area' ($half -join ',') ($frame -join ',') (Near $frame $half 3)
+                # Snap Assist offers other windows for the other half and takes the foreground; Escape dismisses it.
+                if($foreground.DynamicInvoke() -ne $hwnd){Chord @(0x1B)}
+                if($foreground.DynamicInvoke() -eq $hwnd){
+                    Chord @(0x5B,0x26);Record 'Win+Up maximizes the snapped window' $true $isZoomed.DynamicInvoke($hwnd) ($isZoomed.DynamicInvoke($hwnd) -eq $true)
+                    Chord @(0x5B,0x28);Chord @(0x5B,0x28)
+                    $after=Rect $hwnd;Record 'Win+Down twice returns the window from snap' ($before -join ',') ($after -join ',') (Near $after $before)
+                }else{Record 'Win+Up, Win+Down' 'Notepad in the foreground' 'another window was in the foreground after Snap Assist; no keys sent' $null}
+            }
+        }finally{
+            if(-not $process.HasExited){$null=$post.DynamicInvoke($process.MainWindowHandle,[uint32]0x10,[IntPtr]::Zero,[IntPtr]::Zero);if(-not $process.WaitForExit(10000)){$process.Kill()}}
+        }
+    }
+    $records|ConvertTo-Json -Depth 4|Set-Content "$root\artifacts\window-checks.json"
+    $records
+}finally{$native.Free($scratch);$null=$dpiContext.DynamicInvoke($previousDpi);$native.Dispose()}
+}
+
 # Folded from src\Services.Windows.ps1
 function Invoke-Services.Windows {
 [CmdletBinding()]
@@ -10847,6 +11227,7 @@ $ErrorActionPreference='Stop'
 if(-not $IsWindows){throw 'This direct Windows implementation requires PowerShell 7 on Windows.'}
 # Notepad's own conformance checks: the document model, and the native window, Direct2D and DirectWrite.
 if($VerifyModel){Invoke-Model.Verify;return}
+if($VerifyWindow){Invoke-Window.Verify;return}
 if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Launch with pwsh -STA -File Notepad.ps1.'}
 if($VerifyGraphics){if($RunSeconds -gt 0){Invoke-Graphics.Smoke -Seconds $RunSeconds}else{Invoke-Graphics.Smoke};return}
 
@@ -13217,7 +13598,7 @@ function Paint-Editor {
     if($ui.EnsureCaret){
         if($caret.Y -lt $tab.ScrollY){$tab.ScrollY=$caret.Y}
         if($caret.Y+$caret.Height -gt $tab.ScrollY+$h-28){$tab.ScrollY=$caret.Y+$caret.Height-$h+28}
-        if(-not $settings.wordWrap){if($caret.X -lt $tab.ScrollX){$tab.ScrollX=$caret.X};if($caret.X -gt $tab.ScrollX+$available-2){$tab.ScrollX=$caret.X-$available+2}}else{$tab.ScrollX=0}
+        if(-not $settings.wordWrap){if($caret.X -lt $tab.ScrollX){$tab.ScrollX=$caret.X};if($caret.X -gt $tab.ScrollX+$available-2){$tab.ScrollX=$caret.X-$available+2}}else{$tab.ScrollX=0.0}
         $ui.EnsureCaret=$false
     }
     $tab.ScrollY=[Math]::Clamp([double]$tab.ScrollY,0,[Math]::Max(0,$ui.EditorMetrics.Height-$h+28))
