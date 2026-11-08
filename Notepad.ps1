@@ -608,217 +608,393 @@ $Native
 }
 
 # Folded from src\Window.Windows.ps1
-function Invoke-Window.Windows {
-[CmdletBinding()]
-param([Parameter(Mandatory)][object]$Native,[int]$Width=1280,[int]$Height=720,[string]$Title='Notepad — PowerShell')
-if($MyInvocation.InvocationName -eq '.'){throw 'Invoke Window.Windows.ps1 with &.'}
-New-Module -AsCustomObject -ArgumentList $Native,$Width,$Height,$Title -ScriptBlock {
-    param($Native,$Width,$Height,$Title)
-    $script:n=$Native
-    $script:events=[Collections.Generic.Queue[object]]::new()
-    $script:callbackError=$null
-    $script:hwnd=[IntPtr]::Zero
-    $script:alive=$true
-    $script:focused=$true
-    $script:minimized=$false
-    $script:windowIcon=[IntPtr]::Zero;$script:ownsWindowIcon=$false
-    function Bind([string]$Name,[Type]$Return,[Type[]]$Types,[string]$Library='user32.dll'){$n.GetExportCall($Library,$Name,$Return,$Types)}
-    $script:def=Bind 'DefWindowProcW' ([IntPtr]) @([IntPtr],[uint32],[IntPtr],[IntPtr])
-    $script:keyState=Bind 'GetKeyState' ([int16]) @([int])
-    $script:validate=Bind 'ValidateRect' ([bool]) @([IntPtr],[IntPtr])
-    $script:getClient=Bind 'GetClientRect' ([bool]) @([IntPtr],[IntPtr])
-    $script:getDpi=Bind 'GetDpiForWindow' ([uint32]) @([IntPtr])
-    $script:getRect=Bind 'GetWindowRect' ([bool]) @([IntPtr],[IntPtr])
-    $script:show=Bind 'ShowWindow' ([bool]) @([IntPtr],[int])
-    $script:setPosition=Bind 'SetWindowPos' ([bool]) @([IntPtr],[IntPtr],[int],[int],[int],[int],[uint32])
-    $script:send=Bind 'SendMessageW' ([IntPtr]) @([IntPtr],[uint32],[IntPtr],[IntPtr])
-    $script:setCapture=Bind 'SetCapture' ([IntPtr]) @([IntPtr])
-    $script:releaseCapture=Bind 'ReleaseCapture' ([bool]) @()
-    $script:loadCursor=Bind 'LoadCursorW' ([IntPtr]) @([IntPtr],[IntPtr])
-    $script:setCursor=Bind 'SetCursor' ([IntPtr]) @([IntPtr])
-    $script:arrow=$loadCursor.DynamicInvoke([IntPtr]::Zero,[IntPtr]32512)
-    $script:ibeam=$loadCursor.DynamicInvoke([IntPtr]::Zero,[IntPtr]32513)
-    $script:hand=$loadCursor.DynamicInvoke([IntPtr]::Zero,[IntPtr]32649)
-    $script:cursor=$arrow
-    $script:scratch=$n.Allocate(128)
-    # A non-generic emitted delegate provides a rooted, stdcall WNDPROC. Windows
-    # invokes it synchronously on this script's STA/message-pumping thread.
-    $callbackType=$def.GetType()
-    $callbackBlock={
-        param([IntPtr]$Handle,[uint32]$Message,[IntPtr]$WParam,[IntPtr]$LParam)
-        try{
-            switch($Message){
-                0x0083 {return [IntPtr]::Zero} # WM_NCCALCSIZE: full client chrome.
-                0x0014 {return [IntPtr]1} # suppress GDI background erase.
-                0x0024 { # WM_GETMINMAXINFO: keep the native toolbar and settings usable.
-                    $scale=[Math]::Max(96,$getDpi.DynamicInvoke($Handle))/96.0
-                    [Runtime.InteropServices.Marshal]::WriteInt32($LParam,24,[int][Math]::Ceiling(768*$scale))
-                    [Runtime.InteropServices.Marshal]::WriteInt32($LParam,28,[int][Math]::Ceiling(478*$scale))
-                    return [IntPtr]::Zero
-                }
-                0x000F {$null=$validate.DynamicInvoke($Handle,[IntPtr]::Zero);$events.Enqueue(@{Kind='paint'});return [IntPtr]::Zero}
-                0x0010 {$events.Enqueue(@{Kind='close'});return [IntPtr]::Zero}
-                0x0002 {$script:alive=$false;return [IntPtr]::Zero}
-                0x0005 {
-                    $script:minimized=$WParam.ToInt64() -eq 1
-                    $events.Enqueue(@{Kind=$(if($minimized){'minimized'}else{'resize'})})
-                    return [IntPtr]::Zero
-                }
-                0x0007 {$script:focused=$true;$events.Enqueue(@{Kind='focus'});return [IntPtr]::Zero}
-                0x0008 {$script:focused=$false;$events.Enqueue(@{Kind='blur'});return [IntPtr]::Zero}
-                0x0020 {if(($LParam.ToInt64() -band 0xffff) -eq 1){$null=$setCursor.DynamicInvoke($cursor);return [IntPtr]1}}
-                0x0084 {
-                    $null=$getRect.DynamicInvoke($Handle,$scratch)
-                    $screenX=[int]($LParam.ToInt64() -band 0xffff);if($screenX -ge 32768){$screenX-=65536}
-                    $screenY=[int](($LParam.ToInt64() -shr 16) -band 0xffff);if($screenY -ge 32768){$screenY-=65536}
-                    $left=[Runtime.InteropServices.Marshal]::ReadInt32($scratch);$top=[Runtime.InteropServices.Marshal]::ReadInt32($scratch,4)
-                    $right=[Runtime.InteropServices.Marshal]::ReadInt32($scratch,8);$bottom=[Runtime.InteropServices.Marshal]::ReadInt32($scratch,12)
-                    $border=[Math]::Max(4,6*$getDpi.DynamicInvoke($Handle)/96)
-                    $l=$screenX -lt $left+$border;$r=$screenX -ge $right-$border;$t=$screenY -lt $top+$border;$b=$screenY -ge $bottom-$border
-                    if($t -and $l){return [IntPtr]13};if($t -and $r){return [IntPtr]14};if($b -and $l){return [IntPtr]16};if($b -and $r){return [IntPtr]17}
-                    if($l){return [IntPtr]10};if($r){return [IntPtr]11};if($t){return [IntPtr]12};if($b){return [IntPtr]15}
-                    return [IntPtr]1
-                }
-                0x02E0 {
-                    # WM_DPICHANGED lParam points to an ephemeral suggested RECT.
-                    $x=[Runtime.InteropServices.Marshal]::ReadInt32($LParam);$y=[Runtime.InteropServices.Marshal]::ReadInt32($LParam,4)
-                    $w=[Runtime.InteropServices.Marshal]::ReadInt32($LParam,8)-$x;$h=[Runtime.InteropServices.Marshal]::ReadInt32($LParam,12)-$y
-                    $null=$setPosition.DynamicInvoke($Handle,[IntPtr]::Zero,$x,$y,$w,$h,[uint32]0x14)
-                    $events.Enqueue(@{Kind='resize'});return [IntPtr]::Zero
-                }
-            }
-            if($Message -in @(0x0200,0x0201,0x0202,0x0203,0x020A,0x0100,0x0102,0x0104)){
-                $ctrl=($keyState.DynamicInvoke(0x11) -band 0x8000) -ne 0
-                $shift=($keyState.DynamicInvoke(0x10) -band 0x8000) -ne 0
-                $alt=($keyState.DynamicInvoke(0x12) -band 0x8000) -ne 0
-                $events.Enqueue(@{Kind='input';Message=$Message;W=$WParam.ToInt64();L=$LParam.ToInt64();Ctrl=$ctrl;Shift=$shift;Alt=$alt})
+class NotepadWindowEvent {
+    [string]$Kind
+    [uint]$Message
+    [long]$W
+    [long]$L
+    [bool]$Ctrl
+    [bool]$Shift
+    [bool]$Alt
+}
+
+class NotepadWindowInfo {
+    [IntPtr]$Hwnd
+    [int]$Width
+    [int]$Height
+    [single]$Dpi
+    [bool]$Alive
+    [bool]$Focused
+    [bool]$Minimized
+}
+
+class NotepadAppearance {
+    [string]$Material
+    [int]$Requested
+    [int]$Observed
+    [bool]$Curved
+    [bool]$Dark
+    [int]$BorderColor
+}
+
+class NotepadEntrance {
+    [int]$FromX
+    [int]$ToX
+    [int]$Y
+    [int]$DurationMs
+    [double[]]$Curve
+}
+
+class NotepadEntranceSample {
+    [double]$Progress
+    [int]$X
+    [int]$Alpha
+    [double]$ElapsedMs
+    [double]$TimeProgress
+}
+
+class NotepadEntranceRestore {
+    [long]$OriginalStyle
+    [long]$ObservedStyle
+}
+
+# A top-level window with Notepad's own caption: its window procedure, its message queue as events, its backdrop and
+# its entrance. Win32 BOOL results are [int].
+class NotepadWindow {
+    # The window the window procedure serves; Windows calls it on this thread from DispatchMessage.
+    static [NotepadWindow]$Current
+    hidden [Collections.Generic.Queue[NotepadWindowEvent]]$events = [Collections.Generic.Queue[NotepadWindowEvent]]::new()
+    hidden [Exception]$callbackError
+    hidden [IntPtr]$hwnd
+    hidden [bool]$alive = $true
+    hidden [bool]$focused = $true
+    hidden [bool]$minimized = $false
+    hidden [IntPtr]$windowIcon
+    hidden [bool]$ownsWindowIcon = $false
+    hidden [IntPtr]$arrow
+    hidden [IntPtr]$ibeam
+    hidden [IntPtr]$hand
+    hidden [IntPtr]$currentCursor
+    hidden [IntPtr]$scratch
+    hidden [IntPtr]$previousDpi
+    hidden [IntPtr]$hmodule
+    hidden [IntPtr]$classPtr
+    hidden [int]$entranceX
+    hidden [int]$entranceY
+    hidden [int]$entranceFrom
+    hidden [IntPtr]$entranceStyle
+
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] DefWindowProcW([IntPtr]$hwnd, [uint]$message, [IntPtr]$w, [IntPtr]$l) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [short] GetKeyState([int]$key) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] ValidateRect([IntPtr]$hwnd, [IntPtr]$rect) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] GetClientRect([IntPtr]$hwnd, [IntPtr]$rect) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [uint] GetDpiForWindow([IntPtr]$hwnd) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] GetWindowRect([IntPtr]$hwnd, [IntPtr]$rect) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] ShowWindow([IntPtr]$hwnd, [int]$command) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] SetWindowPos([IntPtr]$hwnd, [IntPtr]$after, [int]$x, [int]$y, [int]$width, [int]$height, [uint]$flags) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] SendMessageW([IntPtr]$hwnd, [uint]$message, [IntPtr]$w, [IntPtr]$l) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] SetCapture([IntPtr]$hwnd) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] ReleaseCapture() { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] LoadCursorW([IntPtr]$instance, [IntPtr]$name) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] SetCursor([IntPtr]$cursor) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] SetThreadDpiAwarenessContext([IntPtr]$context) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('shell32.dll')]
+    static [int] SetCurrentProcessExplicitAppUserModelID([IntPtr]$id) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('kernel32.dll')]
+    static [IntPtr] GetModuleHandleW([IntPtr]$name) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [ushort] RegisterClassExW([IntPtr]$class) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] CreateWindowExW([uint]$exStyle, [IntPtr]$class, [IntPtr]$title, [uint]$style, [int]$x, [int]$y, [int]$width, [int]$height, [IntPtr]$parent, [IntPtr]$menu, [IntPtr]$instance, [IntPtr]$parameter) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('dwmapi.dll')]
+    static [int] DwmSetWindowAttribute([IntPtr]$hwnd, [uint]$attribute, [IntPtr]$value, [uint]$size) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('dwmapi.dll')]
+    static [int] DwmGetWindowAttribute([IntPtr]$hwnd, [uint]$attribute, [IntPtr]$value, [uint]$size) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('dwmapi.dll')]
+    static [int] DwmExtendFrameIntoClientArea([IntPtr]$hwnd, [IntPtr]$margins) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] GetWindowLongPtrW([IntPtr]$hwnd, [int]$index) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] SetWindowLongPtrW([IntPtr]$hwnd, [int]$index, [IntPtr]$value) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] SetLayeredWindowAttributes([IntPtr]$hwnd, [uint]$key, [byte]$alpha, [uint]$flags) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] GetLayeredWindowAttributes([IntPtr]$hwnd, [IntPtr]$key, [IntPtr]$alpha, [IntPtr]$flags) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] GetSystemMetrics([int]$index) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] SetForegroundWindow([IntPtr]$hwnd) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('shell32.dll')]
+    static [int] SHGetStockIconInfo([int]$id, [uint]$flags, [IntPtr]$info) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] LoadIconW([IntPtr]$instance, [IntPtr]$name) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] DestroyIcon([IntPtr]$icon) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] PeekMessageW([IntPtr]$message, [IntPtr]$hwnd, [uint]$first, [uint]$last, [uint]$remove) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] TranslateMessage([IntPtr]$message) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] DispatchMessageW([IntPtr]$message) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] IsZoomed([IntPtr]$hwnd) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] DestroyWindow([IntPtr]$hwnd) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] UnregisterClassW([IntPtr]$class, [IntPtr]$instance) { throw 'native' }
+
+    [System.Runtime.InteropServices.UnmanagedCallersOnly(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [IntPtr] WndProc([IntPtr]$Handle, [uint]$Message, [IntPtr]$WParam, [IntPtr]$LParam) {
+        return [NotepadWindow]::Current.Procedure($Handle, $Message, $WParam, $LParam)
+    }
+
+    hidden [void] Enqueue([string]$Kind) {
+        $event = [NotepadWindowEvent]::new()
+        $event.Kind = $Kind
+        $this.events.Enqueue($event)
+    }
+
+    hidden [IntPtr] Procedure([IntPtr]$Handle, [uint]$Message, [IntPtr]$WParam, [IntPtr]$LParam) {
+        try {
+            if ($Message -eq 0x0083) { return [IntPtr]::Zero } # WM_NCCALCSIZE: full client chrome.
+            if ($Message -eq 0x0014) { return [IntPtr]1 } # suppress GDI background erase.
+            if ($Message -eq 0x0024) { # WM_GETMINMAXINFO: keep the native toolbar and settings usable.
+                $scale = [Math]::Max(96, [NotepadWindow]::GetDpiForWindow($Handle)) / 96.0
+                [Runtime.InteropServices.Marshal]::WriteInt32($LParam, 24, [int][Math]::Ceiling(768 * $scale))
+                [Runtime.InteropServices.Marshal]::WriteInt32($LParam, 28, [int][Math]::Ceiling(478 * $scale))
                 return [IntPtr]::Zero
             }
-        }catch{$script:callbackError=$_}
-        return [IntPtr]($def.DynamicInvoke($Handle,$Message,$WParam,$LParam))
-    }
-    $script:callback=[Management.Automation.LanguagePrimitives]::ConvertTo($callbackBlock,$callbackType)
-    $proc=[Runtime.InteropServices.Marshal]::GetFunctionPointerForDelegate($callback)
-    $dpiContext=Bind 'SetThreadDpiAwarenessContext' ([IntPtr]) @([IntPtr])
-    $script:previousDpi=$dpiContext.DynamicInvoke([IntPtr](-4))
-    $appId=[Runtime.InteropServices.Marshal]::StringToHGlobalUni('MansfieldPlumbing.NotepadPS1')
-    try{$setAppId=Bind 'SetCurrentProcessExplicitAppUserModelID' ([int]) @([IntPtr]) 'shell32.dll';$null=$setAppId.DynamicInvoke($appId)}finally{[Runtime.InteropServices.Marshal]::FreeHGlobal($appId)}
-    $getModule=Bind 'GetModuleHandleW' ([IntPtr]) @([IntPtr]) 'kernel32.dll'
-    $script:hmodule=$getModule.DynamicInvoke([IntPtr]::Zero)
-    $script:className='NotepadPS_'+[Guid]::NewGuid().ToString('N')
-    $script:classPtr=[Runtime.InteropServices.Marshal]::StringToHGlobalUni($className)
-    $titlePtr=[Runtime.InteropServices.Marshal]::StringToHGlobalUni($Title)
-    [Runtime.InteropServices.Marshal]::WriteInt32($scratch,0,80)
-    [Runtime.InteropServices.Marshal]::WriteInt32($scratch,4,0xB) # redraw + double clicks
-    [Runtime.InteropServices.Marshal]::WriteIntPtr($scratch,8,$proc)
-    [Runtime.InteropServices.Marshal]::WriteIntPtr($scratch,24,$hmodule)
-    [Runtime.InteropServices.Marshal]::WriteIntPtr($scratch,40,$arrow)
-    [Runtime.InteropServices.Marshal]::WriteIntPtr($scratch,64,$classPtr)
-    $register=Bind 'RegisterClassExW' ([uint16]) @([IntPtr])
-    if($register.DynamicInvoke($scratch) -eq 0){throw 'RegisterClassExW failed'}
-    $create=Bind 'CreateWindowExW' ([IntPtr]) @([uint32],[IntPtr],[IntPtr],[uint32],[int],[int],[int],[int],[IntPtr],[IntPtr],[IntPtr],[IntPtr])
-    # A normal top-level app window with our own caption controls, rather than a popup or duplicate native caption.
-    try{$script:hwnd=$create.DynamicInvoke([uint32]0x40000,$classPtr,$titlePtr,[uint32]0x000F0000L,100,80,[Math]::Max(768,$Width),[Math]::Max(478,$Height),[IntPtr]::Zero,[IntPtr]::Zero,$hmodule,[IntPtr]::Zero)}
-    finally{[Runtime.InteropServices.Marshal]::FreeHGlobal($titlePtr)}
-    if($hwnd -eq [IntPtr]::Zero){throw 'CreateWindowExW failed'}
-    function Handle {$hwnd}
-    function Info {
-        $null=$getClient.DynamicInvoke($hwnd,$scratch)
-        @{Hwnd=$hwnd;Width=[Runtime.InteropServices.Marshal]::ReadInt32($scratch,8);Height=[Runtime.InteropServices.Marshal]::ReadInt32($scratch,12);Dpi=[single]$getDpi.DynamicInvoke($hwnd);Alive=$alive;Focused=$focused;Minimized=$minimized}
-    }
-    function Show {$null=$show.DynamicInvoke($hwnd,5)}
-    function Appearance([string]$Material,[bool]$Dark,[bool]$Curved){
-        # MansfieldPlumbing feature addition; same DWM mechanism as QuickPS Backdrop.ps1.
-        $set=Bind 'DwmSetWindowAttribute' ([int]) @([IntPtr],[uint32],[IntPtr],[uint32]) 'dwmapi.dll'
-        $get=Bind 'DwmGetWindowAttribute' ([int]) @([IntPtr],[uint32],[IntPtr],[uint32]) 'dwmapi.dll'
-        $extend=Bind 'DwmExtendFrameIntoClientArea' ([int]) @([IntPtr],[IntPtr]) 'dwmapi.dll'
-        $value=$n.Allocate(16)
-        try{
-            $materialValue=switch($Material){'mica'{2};'acrylic'{3};'reverseMica'{4};default{1}}
-            [Runtime.InteropServices.Marshal]::WriteInt32($value,$materialValue)
-            $hr=$set.DynamicInvoke($hwnd,[uint32]38,$value,[uint32]4)
-            if($hr -lt 0){throw "DWM backdrop failed: $hr"}
-            $null=$get.DynamicInvoke($hwnd,[uint32]38,$value,[uint32]4)
-            $observed=[Runtime.InteropServices.Marshal]::ReadInt32($value)
-            if($observed -ne $materialValue){throw 'DWM did not retain the requested backdrop.'}
-            [Runtime.InteropServices.Marshal]::WriteInt32($value,[int]$Dark);$null=$set.DynamicInvoke($hwnd,[uint32]20,$value,[uint32]4)
-            [Runtime.InteropServices.Marshal]::WriteInt32($value,-2);$null=$set.DynamicInvoke($hwnd,[uint32]34,$value,[uint32]4) # DWMWA_COLOR_NONE: no white outline
-            $null=$get.DynamicInvoke($hwnd,[uint32]34,$value,[uint32]4);$borderColor=[Runtime.InteropServices.Marshal]::ReadInt32($value)
-            [Runtime.InteropServices.Marshal]::WriteInt32($value,$(if($Curved){2}else{1}));$null=$set.DynamicInvoke($hwnd,[uint32]33,$value,[uint32]4)
-            foreach($offset in @(0,4,8,12)){[Runtime.InteropServices.Marshal]::WriteInt32($value,$offset,-1)}
-            $hr=$extend.DynamicInvoke($hwnd,$value);if($hr -lt 0){throw "DWM frame extension failed: $hr"}
-            @{Material=$Material;Requested=$materialValue;Observed=$observed;Curved=$Curved;Dark=$Dark;BorderColor=$borderColor}
-        }finally{$n.Free($value)}
-    }
-    function BeginEntrance {
-        $script:getStyle=Bind 'GetWindowLongPtrW' ([IntPtr]) @([IntPtr],[int])
-        $script:setStyle=Bind 'SetWindowLongPtrW' ([IntPtr]) @([IntPtr],[int],[IntPtr])
-        $script:setAlpha=Bind 'SetLayeredWindowAttributes' ([bool]) @([IntPtr],[uint32],[byte],[uint32])
-        $script:getAlpha=Bind 'GetLayeredWindowAttributes' ([bool]) @([IntPtr],[IntPtr],[IntPtr],[IntPtr])
-        $metrics=Bind 'GetSystemMetrics' ([int]) @([int])
-        $null=$getRect.DynamicInvoke($hwnd,$scratch)
-        $script:entranceX=[Runtime.InteropServices.Marshal]::ReadInt32($scratch,0)
-        $script:entranceY=[Runtime.InteropServices.Marshal]::ReadInt32($scratch,4)
-        $script:entranceFrom=$metrics.DynamicInvoke(76)+$metrics.DynamicInvoke(78)+24
-        $script:entranceStyle=$getStyle.DynamicInvoke($hwnd,-20)
-        $null=$setStyle.DynamicInvoke($hwnd,-20,[IntPtr]($entranceStyle.ToInt64() -bor 0x80000))
-        if(-not $setAlpha.DynamicInvoke($hwnd,[uint32]0,[byte]0,[uint32]2)){throw 'Could not initialize the window fade.'}
-        $null=$setPosition.DynamicInvoke($hwnd,[IntPtr]::Zero,$entranceFrom,$entranceY,0,0,[uint32]0x15)
-        @{FromX=$entranceFrom;ToX=$entranceX;Y=$entranceY;DurationMs=320;Curve=@(0.2,0.0,0.0,1.0)}
-    }
-    function Entrance([double]$Progress){
-        $p=[Math]::Clamp($Progress,0.0,1.0);$x=[int][Math]::Round($entranceFrom+($entranceX-$entranceFrom)*$p)
-        $null=$setPosition.DynamicInvoke($hwnd,[IntPtr]::Zero,$x,$entranceY,0,0,[uint32]0x15)
-        $null=$setAlpha.DynamicInvoke($hwnd,[uint32]0,[byte][Math]::Round(255*$p),[uint32]2)
-        $null=$getAlpha.DynamicInvoke($hwnd,[IntPtr]::Add($scratch,32),[IntPtr]::Add($scratch,36),[IntPtr]::Add($scratch,40))
-        $alpha=[Runtime.InteropServices.Marshal]::ReadByte($scratch,36)
-        $null=$getRect.DynamicInvoke($hwnd,$scratch)
-        @{Progress=$p;X=[Runtime.InteropServices.Marshal]::ReadInt32($scratch,0);Alpha=[int]$alpha}
-    }
-    function EndEntrance {
-        $null=Entrance 1
-        $null=$setStyle.DynamicInvoke($hwnd,-20,$entranceStyle)
-        $foreground=Bind 'SetForegroundWindow' ([bool]) @([IntPtr]);$null=$foreground.DynamicInvoke($hwnd)
-        @{OriginalStyle=$entranceStyle.ToInt64();ObservedStyle=$getStyle.DynamicInvoke($hwnd,-20).ToInt64()}
-    }
-    function SelectIcon([string]$Kind,[int]$Id){
-        $owned=$false
-        if($Kind -eq 'stock'){
-            $info=$n.Allocate(544)
-            try{
-                [Runtime.InteropServices.Marshal]::WriteInt32($info,544)
-                $get=Bind 'SHGetStockIconInfo' ([int]) @([int],[uint32],[IntPtr]) 'shell32.dll'
-                $hr=$get.DynamicInvoke($Id,[uint32]0x100,$info);if($hr -lt 0){throw "Stock icon $Id is unavailable."}
-                $icon=[Runtime.InteropServices.Marshal]::ReadIntPtr($info,8);$owned=$true
-            }finally{$n.Free($info)}
-        }else{$load=Bind 'LoadIconW' ([IntPtr]) @([IntPtr],[IntPtr]);$icon=$load.DynamicInvoke([IntPtr]::Zero,[IntPtr]$Id)}
-        if($icon -eq [IntPtr]::Zero){throw 'Windows did not supply the selected icon.'}
-        $null=$send.DynamicInvoke($hwnd,[uint32]0x80,[IntPtr]0,$icon);$null=$send.DynamicInvoke($hwnd,[uint32]0x80,[IntPtr]1,$icon)
-        if($ownsWindowIcon -and $windowIcon -ne [IntPtr]::Zero){$destroy=Bind 'DestroyIcon' ([bool]) @([IntPtr]);$null=$destroy.DynamicInvoke($windowIcon)}
-        $script:windowIcon=$icon;$script:ownsWindowIcon=$owned
-        $icon
-    }
-    function Drain {
-        $peek=Bind 'PeekMessageW' ([bool]) @([IntPtr],[IntPtr],[uint32],[uint32],[uint32])
-        $translate=Bind 'TranslateMessage' ([bool]) @([IntPtr]);$dispatch=Bind 'DispatchMessageW' ([IntPtr]) @([IntPtr])
-        while($peek.DynamicInvoke($scratch,[IntPtr]::Zero,[uint32]0,[uint32]0,[uint32]1)){
-            $null=$translate.DynamicInvoke($scratch);$null=$dispatch.DynamicInvoke($scratch)
+            if ($Message -eq 0x000F) { $null = [NotepadWindow]::ValidateRect($Handle, [IntPtr]::Zero); $this.Enqueue('paint'); return [IntPtr]::Zero }
+            if ($Message -eq 0x0010) { $this.Enqueue('close'); return [IntPtr]::Zero }
+            if ($Message -eq 0x0002) { $this.alive = $false; return [IntPtr]::Zero }
+            if ($Message -eq 0x0005) {
+                $this.minimized = $WParam.ToInt64() -eq 1
+                if ($this.minimized) { $this.Enqueue('minimized') } else { $this.Enqueue('resize') }
+                return [IntPtr]::Zero
+            }
+            if ($Message -eq 0x0007) { $this.focused = $true; $this.Enqueue('focus'); return [IntPtr]::Zero }
+            if ($Message -eq 0x0008) { $this.focused = $false; $this.Enqueue('blur'); return [IntPtr]::Zero }
+            if ($Message -eq 0x0020 -and ($LParam.ToInt64() -band 0xffff) -eq 1) { $null = [NotepadWindow]::SetCursor($this.currentCursor); return [IntPtr]1 }
+            if ($Message -eq 0x0084) {
+                $null = [NotepadWindow]::GetWindowRect($Handle, $this.scratch)
+                [int] $screenX = [int]($LParam.ToInt64() -band 0xffff)
+                if ($screenX -ge 32768) { $screenX -= 65536 }
+                [int] $screenY = [int](($LParam.ToInt64() -shr 16) -band 0xffff)
+                if ($screenY -ge 32768) { $screenY -= 65536 }
+                $left = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch); $top = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 4)
+                $right = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 8); $bottom = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 12)
+                $border = [Math]::Max(4, 6 * [NotepadWindow]::GetDpiForWindow($Handle) / 96)
+                $l = $screenX -lt $left + $border; $r = $screenX -ge $right - $border; $t = $screenY -lt $top + $border; $b = $screenY -ge $bottom - $border
+                if ($t -and $l) { return [IntPtr]13 }
+                if ($t -and $r) { return [IntPtr]14 }
+                if ($b -and $l) { return [IntPtr]16 }
+                if ($b -and $r) { return [IntPtr]17 }
+                if ($l) { return [IntPtr]10 }
+                if ($r) { return [IntPtr]11 }
+                if ($t) { return [IntPtr]12 }
+                if ($b) { return [IntPtr]15 }
+                return [IntPtr]1
+            }
+            if ($Message -eq 0x02E0) {
+                # WM_DPICHANGED lParam points to an ephemeral suggested RECT.
+                $x = [Runtime.InteropServices.Marshal]::ReadInt32($LParam); $y = [Runtime.InteropServices.Marshal]::ReadInt32($LParam, 4)
+                $w = [Runtime.InteropServices.Marshal]::ReadInt32($LParam, 8) - $x; $h = [Runtime.InteropServices.Marshal]::ReadInt32($LParam, 12) - $y
+                $null = [NotepadWindow]::SetWindowPos($Handle, [IntPtr]::Zero, $x, $y, $w, $h, [uint]0x14)
+                $this.Enqueue('resize'); return [IntPtr]::Zero
+            }
+            if ($Message -eq 0x0200 -or $Message -eq 0x0201 -or $Message -eq 0x0202 -or $Message -eq 0x0203 -or $Message -eq 0x020A -or $Message -eq 0x0100 -or $Message -eq 0x0102 -or $Message -eq 0x0104) {
+                $event = [NotepadWindowEvent]::new()
+                $event.Kind = 'input'; $event.Message = $Message; $event.W = $WParam.ToInt64(); $event.L = $LParam.ToInt64()
+                $event.Ctrl = ([NotepadWindow]::GetKeyState(0x11) -band 0x8000) -ne 0
+                $event.Shift = ([NotepadWindow]::GetKeyState(0x10) -band 0x8000) -ne 0
+                $event.Alt = ([NotepadWindow]::GetKeyState(0x12) -band 0x8000) -ne 0
+                $this.events.Enqueue($event)
+                return [IntPtr]::Zero
+            }
         }
-        if($callbackError){throw $callbackError}
-        while($events.Count){$events.Dequeue()}
+        catch { $this.callbackError = $_.Exception }
+        return [NotepadWindow]::DefWindowProcW($Handle, $Message, $WParam, $LParam)
     }
-    function Capture([bool]$Value){if($Value){$null=$setCapture.DynamicInvoke($hwnd)}else{$null=$releaseCapture.DynamicInvoke()}}
-    function Cursor([string]$Kind){$script:cursor=switch($Kind){'text'{$ibeam};'pointer'{$hand};default{$arrow}};$null=$setCursor.DynamicInvoke($cursor)}
-    function Caption([string]$Action){switch($Action){'minimize'{$null=$show.DynamicInvoke($hwnd,6)};'maximize'{$isZoomed=Bind 'IsZoomed' ([bool]) @([IntPtr]);$null=$show.DynamicInvoke($hwnd,$(if($isZoomed.DynamicInvoke($hwnd)){9}else{3}))};'drag'{$null=$releaseCapture.DynamicInvoke();$null=$send.DynamicInvoke($hwnd,[uint32]0xA1,[IntPtr]2,[IntPtr]::Zero)}}}
-    function Dispose {
-        $destroy=Bind 'DestroyWindow' ([bool]) @([IntPtr]);$null=$destroy.DynamicInvoke($hwnd)
-        if($ownsWindowIcon -and $windowIcon -ne [IntPtr]::Zero){$destroyIcon=Bind 'DestroyIcon' ([bool]) @([IntPtr]);$null=$destroyIcon.DynamicInvoke($windowIcon)}
-        $unregister=Bind 'UnregisterClassW' ([bool]) @([IntPtr],[IntPtr]);$null=$unregister.DynamicInvoke($classPtr,$hmodule)
-        [Runtime.InteropServices.Marshal]::FreeHGlobal($classPtr)
-        $n.Free($scratch);$null=$dpiContext.DynamicInvoke($previousDpi)
+
+    NotepadWindow([int]$Width, [int]$Height, [string]$Title) {
+        [NotepadWindow]::Current = $this
+        $this.arrow = [NotepadWindow]::LoadCursorW([IntPtr]::Zero, [IntPtr]32512)
+        $this.ibeam = [NotepadWindow]::LoadCursorW([IntPtr]::Zero, [IntPtr]32513)
+        $this.hand = [NotepadWindow]::LoadCursorW([IntPtr]::Zero, [IntPtr]32649)
+        $this.currentCursor = $this.arrow
+        $this.scratch = [Runtime.InteropServices.Marshal]::AllocHGlobal(128)
+        for ($i = 0; $i -lt 128; $i++) { [Runtime.InteropServices.Marshal]::WriteByte($this.scratch, $i, 0) }
+        $proc = [NotepadWindow].GetMethod('WndProc').MethodHandle.GetFunctionPointer()
+        $this.previousDpi = [NotepadWindow]::SetThreadDpiAwarenessContext([IntPtr](-4))
+        $appId = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('MansfieldPlumbing.NotepadPS1')
+        try { $null = [NotepadWindow]::SetCurrentProcessExplicitAppUserModelID($appId) } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($appId) }
+        $this.hmodule = [NotepadWindow]::GetModuleHandleW([IntPtr]::Zero)
+        $this.classPtr = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('NotepadPS_' + [Guid]::NewGuid().ToString('N'))
+        $titlePtr = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($Title)
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 0, 80)
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 4, 0xB) # redraw + double clicks
+        [Runtime.InteropServices.Marshal]::WriteIntPtr($this.scratch, 8, $proc)
+        [Runtime.InteropServices.Marshal]::WriteIntPtr($this.scratch, 24, $this.hmodule)
+        [Runtime.InteropServices.Marshal]::WriteIntPtr($this.scratch, 40, $this.arrow)
+        [Runtime.InteropServices.Marshal]::WriteIntPtr($this.scratch, 64, $this.classPtr)
+        if ([NotepadWindow]::RegisterClassExW($this.scratch) -eq 0) { throw 'RegisterClassExW failed' }
+        # A normal top-level app window with our own caption controls, rather than a popup or duplicate native caption.
+        try { $this.hwnd = [NotepadWindow]::CreateWindowExW([uint]0x40000, $this.classPtr, $titlePtr, [uint]0x000F0000L, 100, 80, [Math]::Max(768, $Width), [Math]::Max(478, $Height), [IntPtr]::Zero, [IntPtr]::Zero, $this.hmodule, [IntPtr]::Zero) }
+        finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($titlePtr) }
+        if ($this.hwnd -eq [IntPtr]::Zero) { throw 'CreateWindowExW failed' }
     }
-    Export-ModuleMember -Function Handle,Info,Show,Appearance,BeginEntrance,Entrance,EndEntrance,SelectIcon,Drain,Capture,Cursor,Caption,Dispose
+
+    [IntPtr] Handle() { return $this.hwnd }
+    [NotepadWindowInfo] Info() {
+        $null = [NotepadWindow]::GetClientRect($this.hwnd, $this.scratch)
+        $info = [NotepadWindowInfo]::new()
+        $info.Hwnd = $this.hwnd
+        $info.Width = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 8)
+        $info.Height = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 12)
+        $info.Dpi = [single][NotepadWindow]::GetDpiForWindow($this.hwnd)
+        $info.Alive = $this.alive; $info.Focused = $this.focused; $info.Minimized = $this.minimized
+        return $info
+    }
+    [void] Show() { $null = [NotepadWindow]::ShowWindow($this.hwnd, 5) }
+    [NotepadAppearance] Appearance([string]$Material, [bool]$Dark, [bool]$Curved) {
+        # MansfieldPlumbing feature addition; same DWM mechanism as QuickPS Backdrop.ps1.
+        $value = [Runtime.InteropServices.Marshal]::AllocHGlobal(16)
+        for ($i = 0; $i -lt 16; $i++) { [Runtime.InteropServices.Marshal]::WriteByte($value, $i, 0) }
+        try {
+            $materialValue = 1
+            switch ($Material) { 'mica' { $materialValue = 2 } 'acrylic' { $materialValue = 3 } 'reverseMica' { $materialValue = 4 } }
+            [Runtime.InteropServices.Marshal]::WriteInt32($value, $materialValue)
+            $hr = [NotepadWindow]::DwmSetWindowAttribute($this.hwnd, [uint]38, $value, [uint]4)
+            if ($hr -lt 0) { throw ('DWM backdrop failed: ' + $hr) }
+            $null = [NotepadWindow]::DwmGetWindowAttribute($this.hwnd, [uint]38, $value, [uint]4)
+            $observed = [Runtime.InteropServices.Marshal]::ReadInt32($value)
+            if ($observed -ne $materialValue) { throw 'DWM did not retain the requested backdrop.' }
+            [Runtime.InteropServices.Marshal]::WriteInt32($value, [int]$Dark); $null = [NotepadWindow]::DwmSetWindowAttribute($this.hwnd, [uint]20, $value, [uint]4)
+            [Runtime.InteropServices.Marshal]::WriteInt32($value, -2); $null = [NotepadWindow]::DwmSetWindowAttribute($this.hwnd, [uint]34, $value, [uint]4) # DWMWA_COLOR_NONE: no white outline
+            $null = [NotepadWindow]::DwmGetWindowAttribute($this.hwnd, [uint]34, $value, [uint]4); $borderColor = [Runtime.InteropServices.Marshal]::ReadInt32($value)
+            $corner = 1
+            if ($Curved) { $corner = 2 }
+            [Runtime.InteropServices.Marshal]::WriteInt32($value, $corner); $null = [NotepadWindow]::DwmSetWindowAttribute($this.hwnd, [uint]33, $value, [uint]4)
+            foreach ($offset in [int[]]@(0, 4, 8, 12)) { [Runtime.InteropServices.Marshal]::WriteInt32($value, $offset, -1) }
+            $hr = [NotepadWindow]::DwmExtendFrameIntoClientArea($this.hwnd, $value)
+            if ($hr -lt 0) { throw ('DWM frame extension failed: ' + $hr) }
+            $appearance = [NotepadAppearance]::new()
+            $appearance.Material = $Material; $appearance.Requested = $materialValue; $appearance.Observed = $observed
+            $appearance.Curved = $Curved; $appearance.Dark = $Dark; $appearance.BorderColor = $borderColor
+            return $appearance
+        }
+        finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($value) }
+    }
+    [NotepadEntrance] BeginEntrance() {
+        $null = [NotepadWindow]::GetWindowRect($this.hwnd, $this.scratch)
+        $this.entranceX = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 0)
+        $this.entranceY = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 4)
+        $this.entranceFrom = [NotepadWindow]::GetSystemMetrics(76) + [NotepadWindow]::GetSystemMetrics(78) + 24
+        $this.entranceStyle = [NotepadWindow]::GetWindowLongPtrW($this.hwnd, -20)
+        $null = [NotepadWindow]::SetWindowLongPtrW($this.hwnd, -20, [IntPtr]($this.entranceStyle.ToInt64() -bor 0x80000))
+        if ([NotepadWindow]::SetLayeredWindowAttributes($this.hwnd, [uint]0, [byte]0, [uint]2) -eq 0) { throw 'Could not initialize the window fade.' }
+        $null = [NotepadWindow]::SetWindowPos($this.hwnd, [IntPtr]::Zero, $this.entranceFrom, $this.entranceY, 0, 0, [uint]0x15)
+        $entrance = [NotepadEntrance]::new()
+        $entrance.FromX = $this.entranceFrom; $entrance.ToX = $this.entranceX; $entrance.Y = $this.entranceY; $entrance.DurationMs = 320
+        $entrance.Curve = [double[]]@(0.2, 0.0, 0.0, 1.0)
+        return $entrance
+    }
+    [NotepadEntranceSample] Entrance([double]$Progress) {
+        $p = [Math]::Clamp($Progress, 0.0, 1.0)
+        $x = [int][Math]::Round($this.entranceFrom + ($this.entranceX - $this.entranceFrom) * $p)
+        $null = [NotepadWindow]::SetWindowPos($this.hwnd, [IntPtr]::Zero, $x, $this.entranceY, 0, 0, [uint]0x15)
+        $null = [NotepadWindow]::SetLayeredWindowAttributes($this.hwnd, [uint]0, [byte][Math]::Round(255 * $p), [uint]2)
+        $null = [NotepadWindow]::GetLayeredWindowAttributes($this.hwnd, [IntPtr]::Add($this.scratch, 32), [IntPtr]::Add($this.scratch, 36), [IntPtr]::Add($this.scratch, 40))
+        $alpha = [Runtime.InteropServices.Marshal]::ReadByte($this.scratch, 36)
+        $null = [NotepadWindow]::GetWindowRect($this.hwnd, $this.scratch)
+        $sample = [NotepadEntranceSample]::new()
+        $sample.Progress = $p; $sample.X = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 0); $sample.Alpha = [int]$alpha
+        return $sample
+    }
+    [NotepadEntranceRestore] EndEntrance() {
+        $null = $this.Entrance(1)
+        $null = [NotepadWindow]::SetWindowLongPtrW($this.hwnd, -20, $this.entranceStyle)
+        $null = [NotepadWindow]::SetForegroundWindow($this.hwnd)
+        $restore = [NotepadEntranceRestore]::new()
+        $restore.OriginalStyle = $this.entranceStyle.ToInt64(); $restore.ObservedStyle = [NotepadWindow]::GetWindowLongPtrW($this.hwnd, -20).ToInt64()
+        return $restore
+    }
+    [IntPtr] SelectIcon([string]$Kind, [int]$Id) {
+        $owned = $false
+        $icon = [IntPtr]::Zero
+        if ($Kind -eq 'stock') {
+            $info = [Runtime.InteropServices.Marshal]::AllocHGlobal(544)
+            for ($i = 0; $i -lt 544; $i++) { [Runtime.InteropServices.Marshal]::WriteByte($info, $i, 0) }
+            try {
+                [Runtime.InteropServices.Marshal]::WriteInt32($info, 544)
+                $hr = [NotepadWindow]::SHGetStockIconInfo($Id, [uint]0x100, $info)
+                if ($hr -lt 0) { throw ('Stock icon ' + $Id + ' is unavailable.') }
+                $icon = [Runtime.InteropServices.Marshal]::ReadIntPtr($info, 8); $owned = $true
+            }
+            finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($info) }
+        }
+        else { $icon = [NotepadWindow]::LoadIconW([IntPtr]::Zero, [IntPtr]$Id) }
+        if ($icon -eq [IntPtr]::Zero) { throw 'Windows did not supply the selected icon.' }
+        $null = [NotepadWindow]::SendMessageW($this.hwnd, [uint]0x80, [IntPtr]0, $icon); $null = [NotepadWindow]::SendMessageW($this.hwnd, [uint]0x80, [IntPtr]1, $icon)
+        if ($this.ownsWindowIcon -and $this.windowIcon -ne [IntPtr]::Zero) { $null = [NotepadWindow]::DestroyIcon($this.windowIcon) }
+        $this.windowIcon = $icon; $this.ownsWindowIcon = $owned
+        return $icon
+    }
+    [NotepadWindowEvent[]] Drain() {
+        while ([NotepadWindow]::PeekMessageW($this.scratch, [IntPtr]::Zero, [uint]0, [uint]0, [uint]1) -ne 0) {
+            $null = [NotepadWindow]::TranslateMessage($this.scratch); $null = [NotepadWindow]::DispatchMessageW($this.scratch)
+        }
+        if ($null -ne $this.callbackError) { throw $this.callbackError }
+        $drained = $this.events.ToArray()
+        $this.events.Clear()
+        return $drained
+    }
+    [void] Capture([bool]$Value) {
+        if ($Value) { $null = [NotepadWindow]::SetCapture($this.hwnd) } else { $null = [NotepadWindow]::ReleaseCapture() }
+    }
+    [void] Cursor([string]$Kind) {
+        $this.currentCursor = $this.arrow
+        if ($Kind -eq 'text') { $this.currentCursor = $this.ibeam } elseif ($Kind -eq 'pointer') { $this.currentCursor = $this.hand }
+        $null = [NotepadWindow]::SetCursor($this.currentCursor)
+    }
+    [void] Caption([string]$Action) {
+        if ($Action -eq 'minimize') { $null = [NotepadWindow]::ShowWindow($this.hwnd, 6) }
+        elseif ($Action -eq 'maximize') {
+            $show = 3
+            if ([NotepadWindow]::IsZoomed($this.hwnd) -ne 0) { $show = 9 }
+            $null = [NotepadWindow]::ShowWindow($this.hwnd, $show)
+        }
+        elseif ($Action -eq 'drag') { $null = [NotepadWindow]::ReleaseCapture(); $null = [NotepadWindow]::SendMessageW($this.hwnd, [uint]0xA1, [IntPtr]2, [IntPtr]::Zero) }
+    }
+    [void] Dispose() {
+        $null = [NotepadWindow]::DestroyWindow($this.hwnd)
+        if ($this.ownsWindowIcon -and $this.windowIcon -ne [IntPtr]::Zero) { $null = [NotepadWindow]::DestroyIcon($this.windowIcon) }
+        $null = [NotepadWindow]::UnregisterClassW($this.classPtr, $this.hmodule)
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($this.classPtr)
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($this.scratch)
+        $null = [NotepadWindow]::SetThreadDpiAwarenessContext($this.previousDpi)
+    }
 }
+
+function Invoke-Window.Windows {
+[CmdletBinding()]
+param([int]$Width=1280,[int]$Height=720,[string]$Title='Notepad — PowerShell')
+if($MyInvocation.InvocationName -eq '.'){throw 'Invoke Window.Windows.ps1 with &.'}
+[NotepadWindow]::new($Width, $Height, $Title)
 }
 
 # Folded from src\Graphics.Windows.ps1
@@ -11225,7 +11401,7 @@ $root=Split-Path $(Join-Path $PSScriptRoot 'tests')
 $native=Invoke-Native
 $window=$null;$graphics=$null
 try{
-    $window=Invoke-Window.Windows -Native $native -Width 960 -Height 540 -Title 'Notepad PS graphics smoke'
+    $window=Invoke-Window.Windows -Width 960 -Height 540 -Title 'Notepad PS graphics smoke'
     $info=$window.Info()
     $graphics=Invoke-Graphics.Windows -Hwnd $window.Handle() -Width $info.Width -Height $info.Height -Dpi $info.Dpi
     $design=Invoke-Design
@@ -14349,7 +14525,7 @@ function Handle-Event($Event){
 Resolve-Theme
 if($ui.ComparisonView){Load-ComparisonResults}
 try{
-    $window=Invoke-Window.Windows -Native $native -Width $Width -Height $Height
+    $window=Invoke-Window.Windows -Width $Width -Height $Height
     $info=$window.Info();$ui.Dpi=$info.Dpi;$ui.Width=$info.Width*96/$info.Dpi;$ui.Height=$info.Height*96/$info.Dpi
     $graphics=Invoke-Graphics.Windows -Hwnd $window.Handle() -Width $info.Width -Height $info.Height -Dpi $info.Dpi
     $services=Invoke-Services.Windows -Native $native -Hwnd $window.Handle()
