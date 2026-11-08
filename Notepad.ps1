@@ -13644,15 +13644,15 @@ if(-not $NoSession -and (Test-Path "$store\settings.json")){
     try{$saved=Get-Content "$store\settings.json" -Raw|ConvertFrom-Json -AsHashtable;foreach($key in $settings.Keys.Clone()){if($saved.ContainsKey($key)){$settings[$key]=$saved[$key]}}}catch{Write-Warning 'Saved settings could not be loaded; using defaults.'}
 }
 if($Backdrop){$settings.backdrop=$Backdrop};if($CornerStyle){$settings.cornerStyle=$CornerStyle}
-$model=Invoke-Model -Settings $settings
-$state=$model.State()
+[NotepadModel]$model=Invoke-Model -Settings $settings
+[NotepadModelState]$state=$model.State()
 if(-not $NoSession -and $settings.startupOption -eq 'continueSession' -and (Test-Path "$store\session.json")){
     try{$model.ImportSession((Get-Content "$store\session.json" -Raw|ConvertFrom-Json -AsHashtable))}catch{Write-Warning 'Saved session could not be restored.'}
 }
 if(-not $state.Tabs.Count){$null=$model.NewTab()}
 if($Path){$null=$model.Open($Path);if($state.Tabs[0].Text -eq '' -and $state.Tabs.Count -eq 2){$model.CloseTab($state.Tabs[0].Id)}}
 $native=Invoke-Native
-$window=$null;$graphics=$null;$services=$null
+[NotepadWindow]$window=$null;[NotepadGraphics]$graphics=$null;$services=$null
 $ui=@{Dirty=$true;Running=$true;Hover='';Pressed='';Focus='editor-area';Menu='';Submenu='';Settings=$false;Expanded=@{};SettingsScroll=0.0;Find=$false;Replace=$false;Modal=$null;Dropdown=$null;Drag=$false;Blink=$true;LastBlink=[DateTime]::UtcNow;LastSession=[DateTime]::UtcNow;Width=0.0;Height=0.0;Dpi=96.0;Generation=0;Nodes=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal);Hits=[Collections.Generic.List[object]]::new();NextHits=$null;TextCache=@{};EditorLayout=[IntPtr]::Zero;EditorKey='';EditorOrigin=@(16.0,92.0);EditorRect=@(0,78,1280,614);EditorMetrics=@{};EnsureCaret=$true;InputAnchor=0;InputFocus=0;InputBuffers=@{};PendingHigh='';Focused=$true}
 $palette=@{}
 $ui.ComparisonView=$false;$ui.ComparisonScroll=0.0;$ui.ComparisonProcess=$null
