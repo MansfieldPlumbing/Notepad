@@ -819,324 +819,559 @@ New-Module -AsCustomObject -ArgumentList $Native,$Width,$Height,$Title -ScriptBl
 }
 
 # Folded from src\Graphics.Windows.ps1
-function Invoke-Graphics.Windows {
-[CmdletBinding()]
-param([Parameter(Mandatory)][object]$Native, [Parameter(Mandatory)][IntPtr]$Hwnd, [int]$Width, [int]$Height, [single]$Dpi = 96)
-if ($MyInvocation.InvocationName -eq '.') { throw 'Invoke Graphics.Windows.ps1 with &.' }
+class NotepadTextMetrics {
+    [single]$Width
+    [single]$TrailingWidth
+    [single]$Height
+    [int]$Lines
+}
 
-# Direct2D and DirectWrite ABI: slots checked against Windows SDK 10.0.26100.0.
-# Every COM object and temporary allocation has an explicit owner. This module
-# returns ordinary PowerShell methods; no compiled bridge or UI framework.
-New-Module -AsCustomObject -ArgumentList $Native,$Hwnd,$Width,$Height,$Dpi -ScriptBlock {
-    param($Native,$Hwnd,$Width,$Height,$Dpi)
-    $script:n = $Native
-    $script:scratch = $n.Allocate(4096)
-    $script:brushes = @{}
-    $script:formats = @{}
-    $script:geometries = @{}
-    $script:bitmaps = @{}
-    $script:gradientBrushes = @{}
-    $script:layouts = [Collections.Generic.HashSet[IntPtr]]::new()
-    $script:factory = [IntPtr]::Zero
-    $script:writeFactory = [IntPtr]::Zero
-    $script:target = [IntPtr]::Zero
-    $script:wicFactory=[IntPtr]::Zero
-    $script:curved = $true
-    function Com($Object,[int]$Slot,[Type]$Return,[Type[]]$Types,[object[]]$Values) {
-        if($env:NOTEPAD_TRACE){[IO.File]::AppendAllText($env:NOTEPAD_TRACE,"COM $Object slot $Slot`n")}
-        if($Return -eq [void]){$null=$n.InvokeCom($Object,$Slot,$Return,$Types,$Values)}
-        else{$n.InvokeCom($Object,$Slot,$Return,$Types,$Values)}
-    }
-    function Check([int]$Result) { if ($Result -lt 0) { throw ('Native graphics HRESULT 0x{0:X8}' -f ($Result -band 0xffffffffL)) } }
-    function Floats([single[]]$Values,[int]$Offset=0) { [Runtime.InteropServices.Marshal]::Copy($Values,0,[IntPtr]::Add($scratch,$Offset),$Values.Length) }
-    function Read-Float([int]$Offset) { [BitConverter]::Int32BitsToSingle([Runtime.InteropServices.Marshal]::ReadInt32($scratch,$Offset)) }
-    function Point([single]$X,[single]$Y) { [BitConverter]::ToUInt64(([BitConverter]::GetBytes($X)+[BitConverter]::GetBytes($Y)),0) }
-    function New-Factory([string]$Dll,[string]$Export,[string]$Iid) {
-        [Runtime.InteropServices.Marshal]::Copy(([Guid]$Iid).ToByteArray(),0,$scratch,16)
-        $outPointer = [IntPtr]::Add($scratch,32)
-        if ($Export -eq 'D2D1CreateFactory') {
-            $call = $n.GetExportCall($Dll,$Export,[int],[Type[]]@([int],[IntPtr],[IntPtr],[IntPtr]))
-            Check ($call.DynamicInvoke(0,$scratch,[IntPtr]::Zero,$outPointer))
-        } else {
-            $call = $n.GetExportCall($Dll,$Export,[int],[Type[]]@([int],[IntPtr],[IntPtr]))
-            Check ($call.DynamicInvoke(0,$scratch,$outPointer))
-        }
-        [Runtime.InteropServices.Marshal]::ReadIntPtr($outPointer)
-    }
-    $script:factory = New-Factory 'd2d1.dll' 'D2D1CreateFactory' '06152247-6f50-465a-9245-118bfd3b6007'
-    $script:writeFactory = New-Factory 'dwrite.dll' 'DWriteCreateFactory' 'b859ee5a-d838-4b5b-a2e8-1adc7d93db48'
-    # D2D1_RENDER_TARGET_PROPERTIES is 28 bytes. D2D1_HWND_RENDER_TARGET_PROPERTIES
-    # is 24 bytes on x64: HWND, SIZE_U, present options, alignment padding.
-    for ($i=0;$i -lt 128;$i++) { [Runtime.InteropServices.Marshal]::WriteByte($scratch,$i,0) }
-    [Runtime.InteropServices.Marshal]::WriteInt32($scratch,0,1)
-    [Runtime.InteropServices.Marshal]::WriteInt32($scratch,4,87) # BGRA8
-    [Runtime.InteropServices.Marshal]::WriteInt32($scratch,8,1) # premultiplied alpha exposes the DWM material
-    Floats @($Dpi,$Dpi) 12
-    [Runtime.InteropServices.Marshal]::WriteIntPtr($scratch,32,$Hwnd)
-    [Runtime.InteropServices.Marshal]::WriteInt32($scratch,40,$Width)
-    [Runtime.InteropServices.Marshal]::WriteInt32($scratch,44,$Height)
-    Check (Com $factory 14 ([int]) @([IntPtr],[IntPtr],[IntPtr]) @($scratch,[IntPtr]::Add($scratch,32),[IntPtr]::Add($scratch,64)))
-    $script:target = [Runtime.InteropServices.Marshal]::ReadIntPtr($scratch,64)
-    # Grayscale text AA matches CSS antialiased more closely than ClearType.
-    Com $target 34 ([void]) @([int]) @(2)
+class NotepadCaret {
+    [single]$X
+    [single]$Y
+    [single]$Width
+    [single]$Height
+}
 
-    function Brush([string]$Color) {
-        if ($brushes.ContainsKey($Color)) { return $brushes[$Color] }
-        $rgba = [single[]]@(0,0,0,1)
+class NotepadHit {
+    [int]$Position
+    [bool]$Trailing
+    [int]$ClusterStart
+}
+
+class NotepadRect {
+    [single]$X
+    [single]$Y
+    [single]$Width
+    [single]$Height
+}
+
+# Direct2D and DirectWrite through their COM interfaces: slots checked against Windows SDK 10.0.26100.0. Each COM
+# method is a pointer stub called with the slot's address and the object; each export is a library import. Every COM
+# object and temporary allocation has an explicit owner.
+class NotepadGraphics {
+    hidden [IntPtr]$scratch
+    hidden [Collections.Generic.Dictionary[string,IntPtr]]$brushes = [Collections.Generic.Dictionary[string,IntPtr]]::new([StringComparer]::OrdinalIgnoreCase)
+    hidden [Collections.Generic.Dictionary[string,IntPtr]]$formats = [Collections.Generic.Dictionary[string,IntPtr]]::new([StringComparer]::OrdinalIgnoreCase)
+    hidden [Collections.Generic.Dictionary[string,IntPtr]]$geometries = [Collections.Generic.Dictionary[string,IntPtr]]::new([StringComparer]::OrdinalIgnoreCase)
+    hidden [Collections.Generic.Dictionary[string,IntPtr]]$bitmaps = [Collections.Generic.Dictionary[string,IntPtr]]::new([StringComparer]::OrdinalIgnoreCase)
+    hidden [Collections.Generic.Dictionary[string,IntPtr]]$gradientBrushes = [Collections.Generic.Dictionary[string,IntPtr]]::new([StringComparer]::OrdinalIgnoreCase)
+    hidden [Collections.Generic.HashSet[IntPtr]]$layouts = [Collections.Generic.HashSet[IntPtr]]::new()
+    hidden [IntPtr]$factory
+    hidden [IntPtr]$writeFactory
+    hidden [IntPtr]$target
+    hidden [IntPtr]$wicFactory
+    hidden [bool]$curved = $true
+
+    [System.Runtime.InteropServices.LibraryImport('d2d1.dll')]
+    static [int] D2D1CreateFactory([int]$type, [IntPtr]$iid, [IntPtr]$options, [IntPtr]$factory) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('dwrite.dll')]
+    static [int] DWriteCreateFactory([int]$type, [IntPtr]$iid, [IntPtr]$factory) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('ole32.dll')]
+    static [int] CoCreateInstance([IntPtr]$clsid, [IntPtr]$outer, [uint]$context, [IntPtr]$iid, [IntPtr]$instance) { throw 'native' }
+
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [uint] Release([IntPtr]$method, [IntPtr]$object) { throw 'native' }
+    # ID2D1Factory
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] CreatePathGeometry([IntPtr]$method, [IntPtr]$object, [IntPtr]$geometry) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] CreateHwndRenderTarget([IntPtr]$method, [IntPtr]$object, [IntPtr]$properties, [IntPtr]$hwndProperties, [IntPtr]$target) { throw 'native' }
+    # ID2D1RenderTarget
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] CreateBitmap([IntPtr]$method, [IntPtr]$object, [ulong]$size, [IntPtr]$source, [uint]$pitch, [IntPtr]$properties, [IntPtr]$bitmap) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] CreateBitmapFromWicBitmap([IntPtr]$method, [IntPtr]$object, [IntPtr]$source, [IntPtr]$properties, [IntPtr]$bitmap) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] CreateSolidColorBrush([IntPtr]$method, [IntPtr]$object, [IntPtr]$color, [IntPtr]$properties, [IntPtr]$brush) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] CreateGradientStopCollection([IntPtr]$method, [IntPtr]$object, [IntPtr]$stops, [uint]$count, [int]$gamma, [int]$extend, [IntPtr]$collection) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] CreateLinearGradientBrush([IntPtr]$method, [IntPtr]$object, [IntPtr]$gradient, [IntPtr]$properties, [IntPtr]$collection, [IntPtr]$brush) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] DrawRectangle([IntPtr]$method, [IntPtr]$object, [IntPtr]$rect, [IntPtr]$brush, [single]$width, [IntPtr]$style) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] FillRectangle([IntPtr]$method, [IntPtr]$object, [IntPtr]$rect, [IntPtr]$brush) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] DrawRoundedRectangle([IntPtr]$method, [IntPtr]$object, [IntPtr]$rect, [IntPtr]$brush, [single]$width, [IntPtr]$style) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] FillRoundedRectangle([IntPtr]$method, [IntPtr]$object, [IntPtr]$rect, [IntPtr]$brush) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] DrawEllipse([IntPtr]$method, [IntPtr]$object, [IntPtr]$ellipse, [IntPtr]$brush, [single]$width, [IntPtr]$style) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] FillEllipse([IntPtr]$method, [IntPtr]$object, [IntPtr]$ellipse, [IntPtr]$brush) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] FillGeometry([IntPtr]$method, [IntPtr]$object, [IntPtr]$geometry, [IntPtr]$brush, [IntPtr]$opacityBrush) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] DrawBitmap([IntPtr]$method, [IntPtr]$object, [IntPtr]$bitmap, [IntPtr]$destination, [single]$opacity, [int]$interpolation, [IntPtr]$source) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] DrawTextLayout([IntPtr]$method, [IntPtr]$object, [ulong]$origin, [IntPtr]$layout, [IntPtr]$brush, [int]$options) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] SetTransform([IntPtr]$method, [IntPtr]$object, [IntPtr]$transform) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] SetTextAntialiasMode([IntPtr]$method, [IntPtr]$object, [int]$mode) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] PushAxisAlignedClip([IntPtr]$method, [IntPtr]$object, [IntPtr]$rect, [int]$mode) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] PopAxisAlignedClip([IntPtr]$method, [IntPtr]$object) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] Clear([IntPtr]$method, [IntPtr]$object, [IntPtr]$color) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] BeginDraw([IntPtr]$method, [IntPtr]$object) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] EndDraw([IntPtr]$method, [IntPtr]$object, [IntPtr]$tag1, [IntPtr]$tag2) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] SetDpi([IntPtr]$method, [IntPtr]$object, [single]$x, [single]$y) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] ResizeTarget([IntPtr]$method, [IntPtr]$object, [IntPtr]$size) { throw 'native' }
+    # ID2D1Brush, ID2D1LinearGradientBrush
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] SetOpacity([IntPtr]$method, [IntPtr]$object, [single]$opacity) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] SetPoint([IntPtr]$method, [IntPtr]$object, [ulong]$point) { throw 'native' }
+    # ID2D1PathGeometry, ID2D1GeometrySink
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] OpenSink([IntPtr]$method, [IntPtr]$object, [IntPtr]$sink) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] SetFillMode([IntPtr]$method, [IntPtr]$object, [int]$mode) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] BeginFigure([IntPtr]$method, [IntPtr]$object, [ulong]$start, [int]$begin) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] EndFigure([IntPtr]$method, [IntPtr]$object, [int]$end) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] CloseSink([IntPtr]$method, [IntPtr]$object) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] AddLine([IntPtr]$method, [IntPtr]$object, [ulong]$point) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [void] AddSegment([IntPtr]$method, [IntPtr]$object, [IntPtr]$segment) { throw 'native' }
+    # IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] CreateTextFormat([IntPtr]$method, [IntPtr]$object, [IntPtr]$family, [IntPtr]$collection, [int]$weight, [int]$style, [int]$stretch, [single]$size, [IntPtr]$locale, [IntPtr]$format) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] CreateTextLayout([IntPtr]$method, [IntPtr]$object, [IntPtr]$text, [uint]$length, [IntPtr]$format, [single]$width, [single]$height, [IntPtr]$layout) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] SetFormatInteger([IntPtr]$method, [IntPtr]$object, [int]$value) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] SetFormatSingle([IntPtr]$method, [IntPtr]$object, [single]$value) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] SetLineSpacing([IntPtr]$method, [IntPtr]$object, [int]$spacing, [single]$lineSpacing, [single]$baseline) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] GetMetrics([IntPtr]$method, [IntPtr]$object, [IntPtr]$metrics) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] HitTestPoint([IntPtr]$method, [IntPtr]$object, [single]$x, [single]$y, [IntPtr]$trailing, [IntPtr]$inside, [IntPtr]$metrics) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] HitTestTextPosition([IntPtr]$method, [IntPtr]$object, [uint]$position, [int]$trailing, [IntPtr]$x, [IntPtr]$y, [IntPtr]$metrics) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] HitTestTextRange([IntPtr]$method, [IntPtr]$object, [uint]$start, [uint]$length, [single]$x, [single]$y, [IntPtr]$metrics, [uint]$capacity, [IntPtr]$count) { throw 'native' }
+    # IWICImagingFactory, IWICFormatConverter
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] CreateFormatConverter([IntPtr]$method, [IntPtr]$object, [IntPtr]$converter) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] CreateBitmapFromHICON([IntPtr]$method, [IntPtr]$object, [IntPtr]$icon, [IntPtr]$bitmap) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] InitializeConverter([IntPtr]$method, [IntPtr]$object, [IntPtr]$source, [IntPtr]$format, [int]$dither, [IntPtr]$palette, [double]$alpha, [int]$paletteType) { throw 'native' }
+
+    # The address of a COM method: the slot of the object's vtable.
+    hidden static [IntPtr] Slot([IntPtr]$object, [int]$slot) {
+        return [Runtime.InteropServices.Marshal]::ReadIntPtr([Runtime.InteropServices.Marshal]::ReadIntPtr($object), $slot * [IntPtr]::Size)
+    }
+    hidden static [void] ReleaseCom([IntPtr]$object) {
+        if ($object -ne [IntPtr]::Zero) { $null = [NotepadGraphics]::Release([NotepadGraphics]::Slot($object, 2), $object) }
+    }
+    hidden static [void] Check([int]$Result) {
+        if ($Result -lt 0) { throw ('Native graphics HRESULT 0x{0:X8}' -f ($Result -band 0xffffffffL)) }
+    }
+    hidden [void] Floats([single[]]$Values) { $this.Floats($Values, 0) }
+    hidden [void] Floats([single[]]$Values, [int]$Offset) { [Runtime.InteropServices.Marshal]::Copy($Values, 0, [IntPtr]::Add($this.scratch, $Offset), $Values.Length) }
+    hidden [single] ReadFloat([int]$Offset) { return [BitConverter]::Int32BitsToSingle([Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, $Offset)) }
+    # A D2D1_POINT_2F passed by value: X in the low 32 bits, Y in the high.
+    hidden static [ulong] Point([single]$X, [single]$Y) {
+        return ([ulong][BitConverter]::SingleToUInt32Bits($Y) -shl 32) -bor [ulong][BitConverter]::SingleToUInt32Bits($X)
+    }
+    hidden [void] Guid([string]$Value, [int]$Offset) {
+        [Runtime.InteropServices.Marshal]::Copy(([Guid]$Value).ToByteArray(), 0, [IntPtr]::Add($this.scratch, $Offset), 16)
+    }
+
+    NotepadGraphics([IntPtr]$Hwnd, [int]$Width, [int]$Height, [single]$Dpi) {
+        $this.scratch = [Runtime.InteropServices.Marshal]::AllocHGlobal(4096)
+        for ($i = 0; $i -lt 4096; $i++) { [Runtime.InteropServices.Marshal]::WriteByte($this.scratch, $i, 0) }
+        $out = [IntPtr]::Add($this.scratch, 32)
+        $this.Guid('06152247-6f50-465a-9245-118bfd3b6007', 0)
+        [NotepadGraphics]::Check([NotepadGraphics]::D2D1CreateFactory(0, $this.scratch, [IntPtr]::Zero, $out))
+        $this.factory = [Runtime.InteropServices.Marshal]::ReadIntPtr($out)
+        $this.Guid('b859ee5a-d838-4b5b-a2e8-1adc7d93db48', 0)
+        [NotepadGraphics]::Check([NotepadGraphics]::DWriteCreateFactory(0, $this.scratch, $out))
+        $this.writeFactory = [Runtime.InteropServices.Marshal]::ReadIntPtr($out)
+        # D2D1_RENDER_TARGET_PROPERTIES is 28 bytes. D2D1_HWND_RENDER_TARGET_PROPERTIES
+        # is 24 bytes on x64: HWND, SIZE_U, present options, alignment padding.
+        for ($i = 0; $i -lt 128; $i++) { [Runtime.InteropServices.Marshal]::WriteByte($this.scratch, $i, 0) }
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 0, 1)
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 4, 87) # BGRA8
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 8, 1) # premultiplied alpha exposes the DWM material
+        $this.Floats([single[]]@($Dpi, $Dpi), 12)
+        [Runtime.InteropServices.Marshal]::WriteIntPtr($this.scratch, 32, $Hwnd)
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 40, $Width)
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 44, $Height)
+        [NotepadGraphics]::Check([NotepadGraphics]::CreateHwndRenderTarget([NotepadGraphics]::Slot($this.factory, 14), $this.factory, $this.scratch, [IntPtr]::Add($this.scratch, 32), [IntPtr]::Add($this.scratch, 64)))
+        $this.target = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch, 64)
+        # Grayscale text AA matches CSS antialiased more closely than ClearType.
+        [NotepadGraphics]::SetTextAntialiasMode([NotepadGraphics]::Slot($this.target, 34), $this.target, 2)
+    }
+
+    hidden [IntPtr] Brush([string]$Color) {
+        $cached = [IntPtr]::Zero
+        if ($this.brushes.TryGetValue($Color, [ref]$cached)) { return $cached }
+        $rgba = [single[]]@(0, 0, 0, 1)
+        $rgb = [regex]::Match($Color, '^rgba?\((.+)\)$')
         if ($Color.StartsWith('#')) {
             $hex = $Color.Substring(1)
-            if ($hex.Length -eq 3) { $hex = -join ($hex.ToCharArray() | ForEach-Object {"$_$_"}) }
-            $rgba[0] = [Convert]::ToInt32($hex.Substring(0,2),16)/255.0
-            $rgba[1] = [Convert]::ToInt32($hex.Substring(2,2),16)/255.0
-            $rgba[2] = [Convert]::ToInt32($hex.Substring(4,2),16)/255.0
-        } elseif ($Color -match '^rgba?\((.+)\)$') {
-            $parts=$Matches[1].Split(','); for($i=0;$i -lt 3;$i++){$rgba[$i]=[single]::Parse($parts[$i],[Globalization.CultureInfo]::InvariantCulture)/255}
-            if($parts.Count -eq 4){$rgba[3]=[single]::Parse($parts[3],[Globalization.CultureInfo]::InvariantCulture)}
-        } elseif ($Color -eq 'transparent') { $rgba[3]=0 }
-        Floats $rgba
-        Check (Com $target 8 ([int]) @([IntPtr],[IntPtr],[IntPtr]) @($scratch,[IntPtr]::Zero,[IntPtr]::Add($scratch,32)))
-        $brush = [Runtime.InteropServices.Marshal]::ReadIntPtr($scratch,32)
-        $brushes[$Color]=$brush
-        $brush
-    }
-    function Begin([string]$Color,[single]$Opacity=1) {
-        Com $target 48 ([void]) @() @()
-        # Clear requires a color pointer; brushes are not interchangeable.
-        $null=Brush $Color
-        $hex=$Color.TrimStart('#')
-        Floats @(([Convert]::ToInt32($hex.Substring(0,2),16)/255.0),([Convert]::ToInt32($hex.Substring(2,2),16)/255.0),([Convert]::ToInt32($hex.Substring(4,2),16)/255.0),$Opacity)
-        Com $target 47 ([void]) @([IntPtr]) @($scratch)
-    }
-    function End {
-        $result=Com $target 49 ([int]) @([IntPtr],[IntPtr]) @([IntPtr]::Zero,[IntPtr]::Zero)
-        Check $result
-    }
-    function Resize([int]$Width,[int]$Height,[single]$Dpi) {
-        [Runtime.InteropServices.Marshal]::WriteInt32($scratch,0,[Math]::Max(1,$Width))
-        [Runtime.InteropServices.Marshal]::WriteInt32($scratch,4,[Math]::Max(1,$Height))
-        Check (Com $target 58 ([int]) @([IntPtr]) @($scratch))
-        Com $target 51 ([void]) @([single],[single]) @($Dpi,$Dpi)
-    }
-    function Fill([single]$X,[single]$Y,[single]$W,[single]$H,[string]$Color,[single]$Radius=0) {
-        if($W -le 0 -or $H -le 0){return}
-        if(-not $curved -and $Radius -lt 9){$Radius=0}
-        $brush=Brush $Color
-        Floats @($X,$Y,($X+$W),($Y+$H),$Radius,$Radius)
-        if($Radius -gt 0){Com $target 19 ([void]) @([IntPtr],[IntPtr]) @($scratch,$brush)}
-        else{Com $target 17 ([void]) @([IntPtr],[IntPtr]) @($scratch,$brush)}
-    }
-    function Stroke([single]$X,[single]$Y,[single]$W,[single]$H,[string]$Color,[single]$Radius=0,[single]$Thickness=1) {
-        if(-not $curved -and $Radius -lt 9){$Radius=0}
-        $brush=Brush $Color
-        Floats @(($X+$Thickness/2),($Y+$Thickness/2),($X+$W-$Thickness/2),($Y+$H-$Thickness/2),$Radius,$Radius)
-        $slot=if($Radius -gt 0){18}else{16}
-        Com $target $slot ([void]) @([IntPtr],[IntPtr],[single],[IntPtr]) @($scratch,$brush,$Thickness,[IntPtr]::Zero)
-    }
-    function Clip([single]$X,[single]$Y,[single]$W,[single]$H) {
-        Floats @($X,$Y,($X+$W),($Y+$H)); Com $target 45 ([void]) @([IntPtr],[int]) @($scratch,0)
-    }
-    function Unclip { Com $target 46 ([void]) @() @() }
-    function FourCorner([single]$X,[single]$Y,[single]$W,[single]$H,[string[]]$Colors,[single]$Opacity=1){
-        if($W -le 0 -or $H -le 0){return}
-        $key=($Colors -join '|')+'|'+$Opacity.ToString([Globalization.CultureInfo]::InvariantCulture)
-        if(-not $bitmaps.ContainsKey($key)){
-            # Four texel centers are the four corners. Linear sampling performs bilinear interpolation.
-            $bytes=[byte[]]::new(16)
-            for($i=0;$i -lt 4;$i++){$hex=$Colors[$i].TrimStart('#');$offset=$i*4
-                $bytes[$offset]=[byte][Math]::Round([Convert]::ToInt32($hex.Substring(4,2),16)*$Opacity)
-                $bytes[$offset+1]=[byte][Math]::Round([Convert]::ToInt32($hex.Substring(2,2),16)*$Opacity)
-                $bytes[$offset+2]=[byte][Math]::Round([Convert]::ToInt32($hex.Substring(0,2),16)*$Opacity)
-                $bytes[$offset+3]=[byte][Math]::Round(255*$Opacity)
-            }
-            [Runtime.InteropServices.Marshal]::Copy($bytes,0,$scratch,16)
-            [Runtime.InteropServices.Marshal]::WriteInt32($scratch,32,87);[Runtime.InteropServices.Marshal]::WriteInt32($scratch,36,1);Floats @(96,96) 40
-            Check (Com $target 4 ([int]) @([uint64],[IntPtr],[uint32],[IntPtr],[IntPtr]) @([uint64]8589934594,$scratch,[uint32]8,[IntPtr]::Add($scratch,32),[IntPtr]::Add($scratch,56)))
-            $bitmaps[$key]=[Runtime.InteropServices.Marshal]::ReadIntPtr($scratch,56)
+            if ($hex.Length -eq 3) { $hex = [string]::new([char[]]@($hex[0], $hex[0], $hex[1], $hex[1], $hex[2], $hex[2])) }
+            $rgba[0] = [Convert]::ToInt32($hex.Substring(0, 2), 16) / 255.0
+            $rgba[1] = [Convert]::ToInt32($hex.Substring(2, 2), 16) / 255.0
+            $rgba[2] = [Convert]::ToInt32($hex.Substring(4, 2), 16) / 255.0
         }
-        Floats @($X,$Y,($X+$W),($Y+$H)) 64;Floats @(0.5,0.5,1.5,1.5) 80
-        Com $target 26 ([void]) @([IntPtr],[IntPtr],[single],[int],[IntPtr]) @($bitmaps[$key],[IntPtr]::Add($scratch,64),[single]1,1,[IntPtr]::Add($scratch,80))
-    }
-    function NativeIcon([IntPtr]$Handle,[string]$Key,[single]$X,[single]$Y,[single]$Size){
-        $cacheKey='icon:'+$Key
-        if(-not $bitmaps.ContainsKey($cacheKey)){
-            if($wicFactory -eq [IntPtr]::Zero){
-                [Runtime.InteropServices.Marshal]::Copy(([guid]'cacaf262-9370-4615-a13b-9f5539da4c0a').ToByteArray(),0,$scratch,16)
-                [Runtime.InteropServices.Marshal]::Copy(([guid]'ec5ec8a9-c395-4314-9c77-54d7a935ff70').ToByteArray(),0,[IntPtr]::Add($scratch,16),16)
-                $create=$n.GetExportCall('ole32.dll','CoCreateInstance',[int],[type[]]@([IntPtr],[IntPtr],[uint32],[IntPtr],[IntPtr]))
-                Check ($create.DynamicInvoke($scratch,[IntPtr]::Zero,[uint32]1,[IntPtr]::Add($scratch,16),[IntPtr]::Add($scratch,40)))
-                $script:wicFactory=[Runtime.InteropServices.Marshal]::ReadIntPtr($scratch,40)
-            }
-            Check (Com $wicFactory 22 ([int]) @([IntPtr],[IntPtr]) @($Handle,$scratch))
-            $source=[Runtime.InteropServices.Marshal]::ReadIntPtr($scratch)
-            $converter=[IntPtr]::Zero
-            try{
-                Check (Com $wicFactory 10 ([int]) @([IntPtr]) @($scratch));$converter=[Runtime.InteropServices.Marshal]::ReadIntPtr($scratch)
-                [Runtime.InteropServices.Marshal]::Copy(([guid]'6fddc324-4e03-4bfe-b185-3d77768dc910').ToByteArray(),0,$scratch,16)
-                Check (Com $converter 8 ([int]) @([IntPtr],[IntPtr],[int],[IntPtr],[double],[int]) @($source,$scratch,0,[IntPtr]::Zero,[double]0,0))
-                Check (Com $target 5 ([int]) @([IntPtr],[IntPtr],[IntPtr]) @($converter,[IntPtr]::Zero,[IntPtr]::Add($scratch,32)))
-                $bitmaps[$cacheKey]=[Runtime.InteropServices.Marshal]::ReadIntPtr($scratch,32)
-            }finally{if($converter -ne [IntPtr]::Zero){$null=$n.ReleaseCom($converter)};$null=$n.ReleaseCom($source)}
+        elseif ($rgb.Success) {
+            $parts = $rgb.Groups[1].Value.Split(',')
+            for ($i = 0; $i -lt 3; $i++) { $rgba[$i] = [single]::Parse($parts[$i], [Globalization.CultureInfo]::InvariantCulture) / 255 }
+            if ($parts.Count -eq 4) { $rgba[3] = [single]::Parse($parts[3], [Globalization.CultureInfo]::InvariantCulture) }
         }
-        Floats @($X,$Y,($X+$Size),($Y+$Size))
-        Com $target 26 ([void]) @([IntPtr],[IntPtr],[single],[int],[IntPtr]) @($bitmaps[$cacheKey],$scratch,[single]1,1,[IntPtr]::Zero)
-    }
-    function Gradient-Brush([string]$Key,[single[]]$Stops){
-        if($gradientBrushes.ContainsKey($Key)){return $gradientBrushes[$Key]}
-        Floats $Stops
-        Check (Com $target 9 ([int]) @([IntPtr],[uint32],[int],[int],[IntPtr]) @($scratch,[uint32]($Stops.Length/5),0,0,[IntPtr]::Add($scratch,2048)))
-        $collection=[Runtime.InteropServices.Marshal]::ReadIntPtr($scratch,2048)
-        try{Floats @(0,0,1,1);Check (Com $target 10 ([int]) @([IntPtr],[IntPtr],[IntPtr],[IntPtr]) @($scratch,[IntPtr]::Zero,$collection,[IntPtr]::Add($scratch,2048)));$gradientBrushes[$Key]=[Runtime.InteropServices.Marshal]::ReadIntPtr($scratch,2048)}finally{$null=$n.ReleaseCom($collection)}
-        $gradientBrushes[$Key]
-    }
-    function ColorSpectrum([single]$X,[single]$Y,[single]$Size){
-        $hue=Gradient-Brush 'picker-hue' ([single[]]@(0,1,0,0,1,(1/6),1,1,0,1,(2/6),0,1,0,1,0.5,0,1,1,1,(4/6),0,0,1,1,(5/6),1,0,1,1,1,1,0,0,1))
-        $white=Gradient-Brush 'picker-saturation' ([single[]]@(0,1,1,1,0,1,1,1,1,1))
-        Com $hue 8 ([void]) @([uint64]) @((Point $X $Y));Com $hue 9 ([void]) @([uint64]) @((Point ($X+$Size) $Y))
-        Com $white 8 ([void]) @([uint64]) @((Point $X $Y));Com $white 9 ([void]) @([uint64]) @((Point $X ($Y+$Size)))
-        Floats @($X,$Y,($X+$Size),($Y+$Size),4,4);Com $target 19 ([void]) @([IntPtr],[IntPtr]) @($scratch,$hue);Com $target 19 ([void]) @([IntPtr],[IntPtr]) @($scratch,$white)
-    }
-    function Circle([single]$X,[single]$Y,[single]$Radius,[string]$Color,[single]$Thickness=0){
-        $brush=Brush $Color;Floats @($X,$Y,$Radius,$Radius)
-        if($Thickness -gt 0){Com $target 20 ([void]) @([IntPtr],[IntPtr],[single],[IntPtr]) @($scratch,$brush,$Thickness,[IntPtr]::Zero)}else{Com $target 21 ([void]) @([IntPtr],[IntPtr]) @($scratch,$brush)}
+        elseif ($Color -eq 'transparent') { $rgba[3] = 0 }
+        $this.Floats($rgba)
+        [NotepadGraphics]::Check([NotepadGraphics]::CreateSolidColorBrush([NotepadGraphics]::Slot($this.target, 8), $this.target, $this.scratch, [IntPtr]::Zero, [IntPtr]::Add($this.scratch, 32)))
+        $brush = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch, 32)
+        $this.brushes[$Color] = $brush
+        return $brush
     }
 
-    function Layout([string]$Text,[string]$Family,[single]$Size,[single]$Width,[bool]$Wrap=$false,[int]$Weight=400,[bool]$Italic=$false,[single]$LineHeight=0) {
-        $key="$Family|$Size|$Wrap|$Weight|$Italic|$LineHeight"
-        if(-not $formats.ContainsKey($key)) {
-            $familyPtr=[Runtime.InteropServices.Marshal]::StringToHGlobalUni($Family)
-            $localePtr=[Runtime.InteropServices.Marshal]::StringToHGlobalUni('en-us')
-            try {
-                Check (Com $writeFactory 15 ([int]) @([IntPtr],[IntPtr],[int],[int],[int],[single],[IntPtr],[IntPtr]) @($familyPtr,[IntPtr]::Zero,$Weight,([int]$Italic*2),5,$Size,$localePtr,$scratch))
-                $format=[Runtime.InteropServices.Marshal]::ReadIntPtr($scratch)
-                Check (Com $format 5 ([int]) @([int]) @($(if($Wrap){0}else{1})))
-                if($LineHeight -gt 0){Check (Com $format 10 ([int]) @([int],[single],[single]) @(1,$LineHeight,($Size*0.95)))}
-                Check (Com $format 8 ([int]) @([single]) @(($Size*0.55*4)))
-                $formats[$key]=$format
-            }finally{[Runtime.InteropServices.Marshal]::FreeHGlobal($familyPtr);[Runtime.InteropServices.Marshal]::FreeHGlobal($localePtr)}
+    [void] Begin([string]$Color) { $this.Begin($Color, 1) }
+    [void] Begin([string]$Color, [single]$Opacity) {
+        [NotepadGraphics]::BeginDraw([NotepadGraphics]::Slot($this.target, 48), $this.target)
+        # Clear requires a color pointer; brushes are not interchangeable.
+        $null = $this.Brush($Color)
+        $hex = $Color.TrimStart('#')
+        $this.Floats([single[]]@(([Convert]::ToInt32($hex.Substring(0, 2), 16) / 255.0), ([Convert]::ToInt32($hex.Substring(2, 2), 16) / 255.0), ([Convert]::ToInt32($hex.Substring(4, 2), 16) / 255.0), $Opacity))
+        [NotepadGraphics]::Clear([NotepadGraphics]::Slot($this.target, 47), $this.target, $this.scratch)
+    }
+    [void] End() {
+        [NotepadGraphics]::Check([NotepadGraphics]::EndDraw([NotepadGraphics]::Slot($this.target, 49), $this.target, [IntPtr]::Zero, [IntPtr]::Zero))
+    }
+    [void] Resize([int]$Width, [int]$Height, [single]$Dpi) {
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 0, [Math]::Max(1, $Width))
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 4, [Math]::Max(1, $Height))
+        [NotepadGraphics]::Check([NotepadGraphics]::ResizeTarget([NotepadGraphics]::Slot($this.target, 58), $this.target, $this.scratch))
+        [NotepadGraphics]::SetDpi([NotepadGraphics]::Slot($this.target, 51), $this.target, $Dpi, $Dpi)
+    }
+    [void] Fill([single]$X, [single]$Y, [single]$W, [single]$H, [string]$Color) { $this.Fill($X, $Y, $W, $H, $Color, 0) }
+    [void] Fill([single]$X, [single]$Y, [single]$W, [single]$H, [string]$Color, [single]$Radius) {
+        if ($W -le 0 -or $H -le 0) { return }
+        if (-not $this.curved -and $Radius -lt 9) { $Radius = 0 }
+        $brush = $this.Brush($Color)
+        $this.Floats([single[]]@($X, $Y, ($X + $W), ($Y + $H), $Radius, $Radius))
+        if ($Radius -gt 0) { [NotepadGraphics]::FillRoundedRectangle([NotepadGraphics]::Slot($this.target, 19), $this.target, $this.scratch, $brush) }
+        else { [NotepadGraphics]::FillRectangle([NotepadGraphics]::Slot($this.target, 17), $this.target, $this.scratch, $brush) }
+    }
+    [void] Stroke([single]$X, [single]$Y, [single]$W, [single]$H, [string]$Color) { $this.Stroke($X, $Y, $W, $H, $Color, 0, 1) }
+    [void] Stroke([single]$X, [single]$Y, [single]$W, [single]$H, [string]$Color, [single]$Radius) { $this.Stroke($X, $Y, $W, $H, $Color, $Radius, 1) }
+    [void] Stroke([single]$X, [single]$Y, [single]$W, [single]$H, [string]$Color, [single]$Radius, [single]$Thickness) {
+        if (-not $this.curved -and $Radius -lt 9) { $Radius = 0 }
+        $brush = $this.Brush($Color)
+        $this.Floats([single[]]@(($X + $Thickness / 2), ($Y + $Thickness / 2), ($X + $W - $Thickness / 2), ($Y + $H - $Thickness / 2), $Radius, $Radius))
+        if ($Radius -gt 0) { [NotepadGraphics]::DrawRoundedRectangle([NotepadGraphics]::Slot($this.target, 18), $this.target, $this.scratch, $brush, $Thickness, [IntPtr]::Zero) }
+        else { [NotepadGraphics]::DrawRectangle([NotepadGraphics]::Slot($this.target, 16), $this.target, $this.scratch, $brush, $Thickness, [IntPtr]::Zero) }
+    }
+    [void] Clip([single]$X, [single]$Y, [single]$W, [single]$H) {
+        $this.Floats([single[]]@($X, $Y, ($X + $W), ($Y + $H)))
+        [NotepadGraphics]::PushAxisAlignedClip([NotepadGraphics]::Slot($this.target, 45), $this.target, $this.scratch, 0)
+    }
+    [void] Unclip() { [NotepadGraphics]::PopAxisAlignedClip([NotepadGraphics]::Slot($this.target, 46), $this.target) }
+    [void] FourCorner([single]$X, [single]$Y, [single]$W, [single]$H, [string[]]$Colors) { $this.FourCorner($X, $Y, $W, $H, $Colors, 1) }
+    [void] FourCorner([single]$X, [single]$Y, [single]$W, [single]$H, [string[]]$Colors, [single]$Opacity) {
+        if ($W -le 0 -or $H -le 0) { return }
+        $key = [string]::Join('|', $Colors) + '|' + $Opacity.ToString([Globalization.CultureInfo]::InvariantCulture)
+        if (-not $this.bitmaps.ContainsKey($key)) {
+            # Four texel centers are the four corners. Linear sampling performs bilinear interpolation.
+            $bytes = [byte[]]::new(16)
+            for ($i = 0; $i -lt 4; $i++) {
+                $hex = $Colors[$i].TrimStart('#'); $offset = $i * 4
+                $bytes[$offset] = [byte][Math]::Round([Convert]::ToInt32($hex.Substring(4, 2), 16) * $Opacity)
+                $bytes[$offset + 1] = [byte][Math]::Round([Convert]::ToInt32($hex.Substring(2, 2), 16) * $Opacity)
+                $bytes[$offset + 2] = [byte][Math]::Round([Convert]::ToInt32($hex.Substring(0, 2), 16) * $Opacity)
+                $bytes[$offset + 3] = [byte][Math]::Round(255 * $Opacity)
+            }
+            [Runtime.InteropServices.Marshal]::Copy($bytes, 0, $this.scratch, 16)
+            [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 32, 87); [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 36, 1); $this.Floats([single[]]@(96, 96), 40)
+            [NotepadGraphics]::Check([NotepadGraphics]::CreateBitmap([NotepadGraphics]::Slot($this.target, 4), $this.target, [ulong]8589934594, $this.scratch, [uint]8, [IntPtr]::Add($this.scratch, 32), [IntPtr]::Add($this.scratch, 56)))
+            $this.bitmaps[$key] = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch, 56)
         }
-        $textPtr=[Runtime.InteropServices.Marshal]::StringToHGlobalUni($Text)
-        try {
-            Check (Com $writeFactory 18 ([int]) @([IntPtr],[uint32],[IntPtr],[single],[single],[IntPtr]) @($textPtr,[uint32]$Text.Length,$formats[$key],[single][Math]::Max(1,$Width),[single]1000000,$scratch))
-            $layout=[Runtime.InteropServices.Marshal]::ReadIntPtr($scratch)
-            $null=$layouts.Add($layout)
-            $layout
-        }finally{[Runtime.InteropServices.Marshal]::FreeHGlobal($textPtr)}
+        $this.Floats([single[]]@($X, $Y, ($X + $W), ($Y + $H)), 64); $this.Floats([single[]]@(0.5, 0.5, 1.5, 1.5), 80)
+        [NotepadGraphics]::DrawBitmap([NotepadGraphics]::Slot($this.target, 26), $this.target, $this.bitmaps[$key], [IntPtr]::Add($this.scratch, 64), [single]1, 1, [IntPtr]::Add($this.scratch, 80))
     }
-    function ReleaseLayout([IntPtr]$Layout) { if($layouts.Remove($Layout)){$null=$n.ReleaseCom($Layout)} }
-    function DrawLayout([IntPtr]$Layout,[single]$X,[single]$Y,[string]$Color) {
-        $brush=Brush $Color
-        Com $target 28 ([void]) @([uint64],[IntPtr],[IntPtr],[int]) @((Point $X $Y),$Layout,$brush,4)
-    }
-    function Metrics([IntPtr]$Layout) {
-        Check (Com $Layout 60 ([int]) @([IntPtr]) @($scratch))
-        @{Width=(Read-Float 8);TrailingWidth=(Read-Float 12);Height=(Read-Float 16);Lines=[Runtime.InteropServices.Marshal]::ReadInt32($scratch,32)}
-    }
-    function Caret([IntPtr]$Layout,[uint32]$Position,[bool]$Trailing=$false) {
-        Check (Com $Layout 65 ([int]) @([uint32],[int],[IntPtr],[IntPtr],[IntPtr]) @($Position,[int]$Trailing,$scratch,[IntPtr]::Add($scratch,4),[IntPtr]::Add($scratch,16)))
-        @{X=(Read-Float 0);Y=(Read-Float 4);Width=(Read-Float 32);Height=(Read-Float 36)}
-    }
-    function HitText([IntPtr]$Layout,[single]$X,[single]$Y) {
-        Check (Com $Layout 64 ([int]) @([single],[single],[IntPtr],[IntPtr],[IntPtr]) @($X,$Y,$scratch,[IntPtr]::Add($scratch,4),[IntPtr]::Add($scratch,16)))
-        $start=[Runtime.InteropServices.Marshal]::ReadInt32($scratch,16)
-        $length=[Runtime.InteropServices.Marshal]::ReadInt32($scratch,20)
-        $trailing=[Runtime.InteropServices.Marshal]::ReadInt32($scratch) -ne 0
-        @{Position=($start+$(if($trailing){$length}else{0}));Trailing=$trailing;ClusterStart=$start}
-    }
-    function Selection([IntPtr]$Layout,[int]$Start,[int]$Length) {
-        if($Length -le 0){return @()}
-        $countPtr=$n.Allocate(4)
-        try {
-            $result=Com $Layout 66 ([int]) @([uint32],[uint32],[single],[single],[IntPtr],[uint32],[IntPtr]) @([uint32]$Start,[uint32]$Length,[single]0,[single]0,[IntPtr]::Zero,[uint32]0,$countPtr)
-            $count=[Runtime.InteropServices.Marshal]::ReadInt32($countPtr)
-            if($count -eq 0){Check $result;return @()}
-            $memory=$n.Allocate($count*36)
+    [void] NativeIcon([IntPtr]$Handle, [string]$Key, [single]$X, [single]$Y, [single]$Size) {
+        $cacheKey = 'icon:' + $Key
+        if (-not $this.bitmaps.ContainsKey($cacheKey)) {
+            if ($this.wicFactory -eq [IntPtr]::Zero) {
+                $this.Guid('cacaf262-9370-4615-a13b-9f5539da4c0a', 0)
+                $this.Guid('ec5ec8a9-c395-4314-9c77-54d7a935ff70', 16)
+                [NotepadGraphics]::Check([NotepadGraphics]::CoCreateInstance($this.scratch, [IntPtr]::Zero, [uint]1, [IntPtr]::Add($this.scratch, 16), [IntPtr]::Add($this.scratch, 40)))
+                $this.wicFactory = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch, 40)
+            }
+            [NotepadGraphics]::Check([NotepadGraphics]::CreateBitmapFromHICON([NotepadGraphics]::Slot($this.wicFactory, 22), $this.wicFactory, $Handle, $this.scratch))
+            $source = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch)
+            $converter = [IntPtr]::Zero
             try {
-                Check (Com $Layout 66 ([int]) @([uint32],[uint32],[single],[single],[IntPtr],[uint32],[IntPtr]) @([uint32]$Start,[uint32]$Length,[single]0,[single]0,$memory,[uint32]$count,$countPtr))
-                for($i=0;$i -lt $count;$i++) {
-                    $values=[single[]]::new(4);[Runtime.InteropServices.Marshal]::Copy([IntPtr]::Add($memory,$i*36+8),$values,0,4)
-                    @{X=$values[0];Y=$values[1];Width=$values[2];Height=$values[3]}
-                }
-            }finally{$n.Free($memory)}
-        }finally{$n.Free($countPtr)}
+                [NotepadGraphics]::Check([NotepadGraphics]::CreateFormatConverter([NotepadGraphics]::Slot($this.wicFactory, 10), $this.wicFactory, $this.scratch)); $converter = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch)
+                $this.Guid('6fddc324-4e03-4bfe-b185-3d77768dc910', 0)
+                [NotepadGraphics]::Check([NotepadGraphics]::InitializeConverter([NotepadGraphics]::Slot($converter, 8), $converter, $source, $this.scratch, 0, [IntPtr]::Zero, [double]0, 0))
+                [NotepadGraphics]::Check([NotepadGraphics]::CreateBitmapFromWicBitmap([NotepadGraphics]::Slot($this.target, 5), $this.target, $converter, [IntPtr]::Zero, [IntPtr]::Add($this.scratch, 32)))
+                $this.bitmaps[$cacheKey] = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch, 32)
+            }
+            finally { [NotepadGraphics]::ReleaseCom($converter); [NotepadGraphics]::ReleaseCom($source) }
+        }
+        $this.Floats([single[]]@($X, $Y, ($X + $Size), ($Y + $Size)))
+        [NotepadGraphics]::DrawBitmap([NotepadGraphics]::Slot($this.target, 26), $this.target, $this.bitmaps[$cacheKey], $this.scratch, [single]1, 1, [IntPtr]::Zero)
     }
-    function Text([string]$Text,[single]$X,[single]$Y,[single]$W,[string]$Color,[single]$Size=13,[string]$Family='Segoe UI',[int]$Weight=400) {
-        $layout=Layout $Text $Family $Size $W $false $Weight
-        try{DrawLayout $layout $X $Y $Color}finally{ReleaseLayout $layout}
+    hidden [IntPtr] GradientBrush([string]$Key, [single[]]$Stops) {
+        $cached = [IntPtr]::Zero
+        if ($this.gradientBrushes.TryGetValue($Key, [ref]$cached)) { return $cached }
+        $this.Floats($Stops)
+        [NotepadGraphics]::Check([NotepadGraphics]::CreateGradientStopCollection([NotepadGraphics]::Slot($this.target, 9), $this.target, $this.scratch, [uint]($Stops.Length / 5), 0, 0, [IntPtr]::Add($this.scratch, 2048)))
+        $collection = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch, 2048)
+        try {
+            $this.Floats([single[]]@(0, 0, 1, 1))
+            [NotepadGraphics]::Check([NotepadGraphics]::CreateLinearGradientBrush([NotepadGraphics]::Slot($this.target, 10), $this.target, $this.scratch, [IntPtr]::Zero, $collection, [IntPtr]::Add($this.scratch, 2048)))
+            $this.gradientBrushes[$Key] = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch, 2048)
+        }
+        finally { [NotepadGraphics]::ReleaseCom($collection) }
+        return $this.gradientBrushes[$Key]
+    }
+    [void] ColorSpectrum([single]$X, [single]$Y, [single]$Size) {
+        $hue = $this.GradientBrush('picker-hue', [single[]]@(0, 1, 0, 0, 1, (1 / 6), 1, 1, 0, 1, (2 / 6), 0, 1, 0, 1, 0.5, 0, 1, 1, 1, (4 / 6), 0, 0, 1, 1, (5 / 6), 1, 0, 1, 1, 1, 1, 0, 0, 1))
+        $white = $this.GradientBrush('picker-saturation', [single[]]@(0, 1, 1, 1, 0, 1, 1, 1, 1, 1))
+        [NotepadGraphics]::SetPoint([NotepadGraphics]::Slot($hue, 8), $hue, [NotepadGraphics]::Point($X, $Y)); [NotepadGraphics]::SetPoint([NotepadGraphics]::Slot($hue, 9), $hue, [NotepadGraphics]::Point(($X + $Size), $Y))
+        [NotepadGraphics]::SetPoint([NotepadGraphics]::Slot($white, 8), $white, [NotepadGraphics]::Point($X, $Y)); [NotepadGraphics]::SetPoint([NotepadGraphics]::Slot($white, 9), $white, [NotepadGraphics]::Point($X, ($Y + $Size)))
+        $this.Floats([single[]]@($X, $Y, ($X + $Size), ($Y + $Size), 4, 4))
+        [NotepadGraphics]::FillRoundedRectangle([NotepadGraphics]::Slot($this.target, 19), $this.target, $this.scratch, $hue)
+        [NotepadGraphics]::FillRoundedRectangle([NotepadGraphics]::Slot($this.target, 19), $this.target, $this.scratch, $white)
+    }
+    [void] Circle([single]$X, [single]$Y, [single]$Radius, [string]$Color) { $this.Circle($X, $Y, $Radius, $Color, 0) }
+    [void] Circle([single]$X, [single]$Y, [single]$Radius, [string]$Color, [single]$Thickness) {
+        $brush = $this.Brush($Color); $this.Floats([single[]]@($X, $Y, $Radius, $Radius))
+        if ($Thickness -gt 0) { [NotepadGraphics]::DrawEllipse([NotepadGraphics]::Slot($this.target, 20), $this.target, $this.scratch, $brush, $Thickness, [IntPtr]::Zero) }
+        else { [NotepadGraphics]::FillEllipse([NotepadGraphics]::Slot($this.target, 21), $this.target, $this.scratch, $brush) }
+    }
+
+    [IntPtr] Layout([string]$Text, [string]$Family, [single]$Size, [single]$Width) { return $this.Layout($Text, $Family, $Size, $Width, $false, 400, $false, 0) }
+    [IntPtr] Layout([string]$Text, [string]$Family, [single]$Size, [single]$Width, [bool]$Wrap) { return $this.Layout($Text, $Family, $Size, $Width, $Wrap, 400, $false, 0) }
+    [IntPtr] Layout([string]$Text, [string]$Family, [single]$Size, [single]$Width, [bool]$Wrap, [int]$Weight) { return $this.Layout($Text, $Family, $Size, $Width, $Wrap, $Weight, $false, 0) }
+    [IntPtr] Layout([string]$Text, [string]$Family, [single]$Size, [single]$Width, [bool]$Wrap, [int]$Weight, [bool]$Italic) { return $this.Layout($Text, $Family, $Size, $Width, $Wrap, $Weight, $Italic, 0) }
+    [IntPtr] Layout([string]$Text, [string]$Family, [single]$Size, [single]$Width, [bool]$Wrap, [int]$Weight, [bool]$Italic, [single]$LineHeight) {
+        $key = $Family + '|' + $Size + '|' + $Wrap + '|' + $Weight + '|' + $Italic + '|' + $LineHeight
+        if (-not $this.formats.ContainsKey($key)) {
+            $familyPtr = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($Family)
+            $localePtr = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('en-us')
+            try {
+                [NotepadGraphics]::Check([NotepadGraphics]::CreateTextFormat([NotepadGraphics]::Slot($this.writeFactory, 15), $this.writeFactory, $familyPtr, [IntPtr]::Zero, $Weight, ([int]$Italic * 2), 5, $Size, $localePtr, $this.scratch))
+                $format = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch)
+                $wrapping = 1
+                if ($Wrap) { $wrapping = 0 }
+                [NotepadGraphics]::Check([NotepadGraphics]::SetFormatInteger([NotepadGraphics]::Slot($format, 5), $format, $wrapping))
+                if ($LineHeight -gt 0) { [NotepadGraphics]::Check([NotepadGraphics]::SetLineSpacing([NotepadGraphics]::Slot($format, 10), $format, 1, $LineHeight, ($Size * 0.95))) }
+                [NotepadGraphics]::Check([NotepadGraphics]::SetFormatSingle([NotepadGraphics]::Slot($format, 8), $format, ($Size * 0.55 * 4)))
+                $this.formats[$key] = $format
+            }
+            finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($familyPtr); [Runtime.InteropServices.Marshal]::FreeHGlobal($localePtr) }
+        }
+        $textPtr = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($Text)
+        try {
+            [NotepadGraphics]::Check([NotepadGraphics]::CreateTextLayout([NotepadGraphics]::Slot($this.writeFactory, 18), $this.writeFactory, $textPtr, [uint]$Text.Length, $this.formats[$key], [single][Math]::Max(1, $Width), [single]1000000, $this.scratch))
+            $layout = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch)
+            $null = $this.layouts.Add($layout)
+            return $layout
+        }
+        finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($textPtr) }
+    }
+    [void] ReleaseLayout([IntPtr]$Layout) { if ($this.layouts.Remove($Layout)) { [NotepadGraphics]::ReleaseCom($Layout) } }
+    [void] DrawLayout([IntPtr]$Layout, [single]$X, [single]$Y, [string]$Color) {
+        $brush = $this.Brush($Color)
+        [NotepadGraphics]::DrawTextLayout([NotepadGraphics]::Slot($this.target, 28), $this.target, [NotepadGraphics]::Point($X, $Y), $Layout, $brush, 4)
+    }
+    [NotepadTextMetrics] Metrics([IntPtr]$Layout) {
+        [NotepadGraphics]::Check([NotepadGraphics]::GetMetrics([NotepadGraphics]::Slot($Layout, 60), $Layout, $this.scratch))
+        $metrics = [NotepadTextMetrics]::new()
+        $metrics.Width = $this.ReadFloat(8); $metrics.TrailingWidth = $this.ReadFloat(12); $metrics.Height = $this.ReadFloat(16)
+        $metrics.Lines = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 32)
+        return $metrics
+    }
+    [NotepadCaret] Caret([IntPtr]$Layout, [uint]$Position) { return $this.Caret($Layout, $Position, $false) }
+    [NotepadCaret] Caret([IntPtr]$Layout, [uint]$Position, [bool]$Trailing) {
+        [NotepadGraphics]::Check([NotepadGraphics]::HitTestTextPosition([NotepadGraphics]::Slot($Layout, 65), $Layout, $Position, [int]$Trailing, $this.scratch, [IntPtr]::Add($this.scratch, 4), [IntPtr]::Add($this.scratch, 16)))
+        $caret = [NotepadCaret]::new()
+        $caret.X = $this.ReadFloat(0); $caret.Y = $this.ReadFloat(4); $caret.Width = $this.ReadFloat(32); $caret.Height = $this.ReadFloat(36)
+        return $caret
+    }
+    [NotepadHit] HitText([IntPtr]$Layout, [single]$X, [single]$Y) {
+        [NotepadGraphics]::Check([NotepadGraphics]::HitTestPoint([NotepadGraphics]::Slot($Layout, 64), $Layout, $X, $Y, $this.scratch, [IntPtr]::Add($this.scratch, 4), [IntPtr]::Add($this.scratch, 16)))
+        $start = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 16)
+        $length = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 20)
+        $hit = [NotepadHit]::new()
+        $hit.Trailing = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch) -ne 0
+        $hit.Position = $start
+        if ($hit.Trailing) { $hit.Position = $start + $length }
+        $hit.ClusterStart = $start
+        return $hit
+    }
+    [NotepadRect[]] Selection([IntPtr]$Layout, [int]$Start, [int]$Length) {
+        if ($Length -le 0) { return [NotepadRect[]]::new(0) }
+        $countPtr = [Runtime.InteropServices.Marshal]::AllocHGlobal(4)
+        [Runtime.InteropServices.Marshal]::WriteInt32($countPtr, 0)
+        try {
+            $result = [NotepadGraphics]::HitTestTextRange([NotepadGraphics]::Slot($Layout, 66), $Layout, [uint]$Start, [uint]$Length, [single]0, [single]0, [IntPtr]::Zero, [uint]0, $countPtr)
+            $count = [Runtime.InteropServices.Marshal]::ReadInt32($countPtr)
+            if ($count -eq 0) { [NotepadGraphics]::Check($result); return [NotepadRect[]]::new(0) }
+            $memory = [Runtime.InteropServices.Marshal]::AllocHGlobal($count * 36)
+            try {
+                [NotepadGraphics]::Check([NotepadGraphics]::HitTestTextRange([NotepadGraphics]::Slot($Layout, 66), $Layout, [uint]$Start, [uint]$Length, [single]0, [single]0, $memory, [uint]$count, $countPtr))
+                $rects = [NotepadRect[]]::new($count)
+                for ($i = 0; $i -lt $count; $i++) {
+                    $values = [single[]]::new(4); [Runtime.InteropServices.Marshal]::Copy([IntPtr]::Add($memory, $i * 36 + 8), $values, 0, 4)
+                    $rect = [NotepadRect]::new(); $rect.X = $values[0]; $rect.Y = $values[1]; $rect.Width = $values[2]; $rect.Height = $values[3]
+                    $rects[$i] = $rect
+                }
+                return $rects
+            }
+            finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($memory) }
+        }
+        finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($countPtr) }
+    }
+    [void] Text([string]$Text, [single]$X, [single]$Y, [single]$W, [string]$Color) { $this.Text($Text, $X, $Y, $W, $Color, 13, 'Segoe UI', 400) }
+    [void] Text([string]$Text, [single]$X, [single]$Y, [single]$W, [string]$Color, [single]$Size) { $this.Text($Text, $X, $Y, $W, $Color, $Size, 'Segoe UI', 400) }
+    [void] Text([string]$Text, [single]$X, [single]$Y, [single]$W, [string]$Color, [single]$Size, [string]$Family) { $this.Text($Text, $X, $Y, $W, $Color, $Size, $Family, 400) }
+    [void] Text([string]$Text, [single]$X, [single]$Y, [single]$W, [string]$Color, [single]$Size, [string]$Family, [int]$Weight) {
+        $layout = $this.Layout($Text, $Family, $Size, $W, $false, $Weight)
+        try { $this.DrawLayout($layout, $X, $Y, $Color) } finally { $this.ReleaseLayout($layout) }
     }
 
     # SVG endpoint arcs map directly to D2D1_ARC_SEGMENT; no raster fallback.
-    function Path([string]$Data) {
-        if($geometries.ContainsKey($Data)){return $geometries[$Data]}
-        Check (Com $factory 10 ([int]) @([IntPtr]) @($scratch))
-        $geometry=[Runtime.InteropServices.Marshal]::ReadIntPtr($scratch)
-        Check (Com $geometry 17 ([int]) @([IntPtr]) @($scratch))
-        $sink=[Runtime.InteropServices.Marshal]::ReadIntPtr($scratch)
-        $items=[regex]::Matches($Data,'[a-zA-Z]|[-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?')
-        $index=0;$command='';$x=0.0;$y=0.0;$sx=0.0;$sy=0.0;$cx=0.0;$cy=0.0;$previous='';$figure=$false
-        try{
+    hidden [IntPtr] Path([string]$Data) {
+        $cached = [IntPtr]::Zero
+        if ($this.geometries.TryGetValue($Data, [ref]$cached)) { return $cached }
+        [NotepadGraphics]::Check([NotepadGraphics]::CreatePathGeometry([NotepadGraphics]::Slot($this.factory, 10), $this.factory, $this.scratch))
+        $geometry = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch)
+        [NotepadGraphics]::Check([NotepadGraphics]::OpenSink([NotepadGraphics]::Slot($geometry, 17), $geometry, $this.scratch))
+        $sink = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch)
+        $items = [regex]::Matches($Data, '[a-zA-Z]|[-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?')
+        $index = 0; $command = ''; $x = 0.0; $y = 0.0; $sx = 0.0; $sy = 0.0; $cx = 0.0; $cy = 0.0; $previous = ''; $figure = $false
+        $line = [NotepadGraphics]::Slot($sink, 10)
+        try {
             # SVG nonzero is D2D1_FILL_MODE_WINDING.
-            Com $sink 3 ([void]) @([int]) @(1)
-            while($index -lt $items.Count){
-                if($items[$index].Value -cmatch '^[a-zA-Z]$'){$command=$items[$index++].Value}
-                $upper=$command.ToUpperInvariant();$relative=$command -cmatch '^[a-z]$'
-                if($upper -eq 'Z'){
-                    if($figure){Com $sink 8 ([void]) @([int]) @(1);$figure=$false};$x=$sx;$y=$sy;$previous='Z';continue
+            [NotepadGraphics]::SetFillMode([NotepadGraphics]::Slot($sink, 3), $sink, 1)
+            while ($index -lt $items.Count) {
+                if ($items[$index].Value -cmatch '^[a-zA-Z]$') { $command = $items[$index].Value; $index++ }
+                $upper = $command.ToUpperInvariant(); $relative = $command -cmatch '^[a-z]$'
+                if ($upper -eq 'Z') {
+                    if ($figure) { [NotepadGraphics]::EndFigure([NotepadGraphics]::Slot($sink, 8), $sink, 1); $figure = $false }
+                    $x = $sx; $y = $sy; $previous = 'Z'; continue
                 }
-                $arity=switch($upper){'M'{2};'L'{2};'H'{1};'V'{1};'C'{6};'S'{4};'Q'{4};'T'{2};'A'{7};default{throw "Unsupported SVG command $command"}}
-                if($index+$arity -gt $items.Count){throw 'Incomplete SVG path'}
-                $v=[double[]]::new($arity)
-                for($i=0;$i -lt $arity;$i++){$v[$i]=[double]::Parse($items[$index++].Value,[Globalization.CultureInfo]::InvariantCulture)}
-                $baseX=if($relative){$x}else{0};$baseY=if($relative){$y}else{0}
-                switch($upper){
-                    'M'{if($figure){Com $sink 8 ([void]) @([int]) @(0)};$x=$v[0]+$baseX;$y=$v[1]+$baseY;$sx=$x;$sy=$y;Com $sink 5 ([void]) @([uint64],[int]) @((Point $x $y),0);$figure=$true;$command=if($relative){'l'}else{'L'}}
-                    'L'{$x=$v[0]+$baseX;$y=$v[1]+$baseY;Com $sink 10 ([void]) @([uint64]) @((Point $x $y))}
-                    'H'{$x=$v[0]+$baseX;Com $sink 10 ([void]) @([uint64]) @((Point $x $y))}
-                    'V'{$y=$v[0]+$baseY;Com $sink 10 ([void]) @([uint64]) @((Point $x $y))}
-                    'C'{Floats @(($v[0]+$baseX),($v[1]+$baseY),($v[2]+$baseX),($v[3]+$baseY),($v[4]+$baseX),($v[5]+$baseY));Com $sink 11 ([void]) @([IntPtr]) @($scratch);$cx=$v[2]+$baseX;$cy=$v[3]+$baseY;$x=$v[4]+$baseX;$y=$v[5]+$baseY}
-                    'S'{$c1x=$x;$c1y=$y;if($previous -in @('C','S')){$c1x=2*$x-$cx;$c1y=2*$y-$cy};Floats @($c1x,$c1y,($v[0]+$baseX),($v[1]+$baseY),($v[2]+$baseX),($v[3]+$baseY));Com $sink 11 ([void]) @([IntPtr]) @($scratch);$cx=$v[0]+$baseX;$cy=$v[1]+$baseY;$x=$v[2]+$baseX;$y=$v[3]+$baseY}
-                    'Q'{$cx=$v[0]+$baseX;$cy=$v[1]+$baseY;$x=$v[2]+$baseX;$y=$v[3]+$baseY;Floats @($cx,$cy,$x,$y);Com $sink 12 ([void]) @([IntPtr]) @($scratch)}
-                    'T'{$qx=$x;$qy=$y;if($previous -in @('Q','T')){$qx=2*$x-$cx;$qy=2*$y-$cy};$x=$v[0]+$baseX;$y=$v[1]+$baseY;Floats @($qx,$qy,$x,$y);Com $sink 12 ([void]) @([IntPtr]) @($scratch);$cx=$qx;$cy=$qy}
-                    'A'{$x=$v[5]+$baseX;$y=$v[6]+$baseY;if($v[0] -eq 0 -or $v[1] -eq 0){Com $sink 10 ([void]) @([uint64]) @((Point $x $y))}else{Floats @($x,$y,[Math]::Abs($v[0]),[Math]::Abs($v[1]),$v[2]);[Runtime.InteropServices.Marshal]::WriteInt32($scratch,20,[int]$v[4]);[Runtime.InteropServices.Marshal]::WriteInt32($scratch,24,[int]$v[3]);Com $sink 14 ([void]) @([IntPtr]) @($scratch)}}
+                $arity = 0
+                switch ($upper) { 'M' { $arity = 2 } 'L' { $arity = 2 } 'H' { $arity = 1 } 'V' { $arity = 1 } 'C' { $arity = 6 } 'S' { $arity = 4 } 'Q' { $arity = 4 } 'T' { $arity = 2 } 'A' { $arity = 7 } default { throw ('Unsupported SVG command ' + $command) } }
+                if ($index + $arity -gt $items.Count) { throw 'Incomplete SVG path' }
+                $v = [double[]]::new($arity)
+                for ($i = 0; $i -lt $arity; $i++) { $v[$i] = [double]::Parse($items[$index].Value, [Globalization.CultureInfo]::InvariantCulture); $index++ }
+                $baseX = 0.0; $baseY = 0.0
+                if ($relative) { $baseX = $x; $baseY = $y }
+                switch ($upper) {
+                    'M' {
+                        if ($figure) { [NotepadGraphics]::EndFigure([NotepadGraphics]::Slot($sink, 8), $sink, 0) }
+                        $x = $v[0] + $baseX; $y = $v[1] + $baseY; $sx = $x; $sy = $y
+                        [NotepadGraphics]::BeginFigure([NotepadGraphics]::Slot($sink, 5), $sink, [NotepadGraphics]::Point($x, $y), 0); $figure = $true
+                        if ($relative) { $command = 'l' } else { $command = 'L' }
+                    }
+                    'L' { $x = $v[0] + $baseX; $y = $v[1] + $baseY; [NotepadGraphics]::AddLine($line, $sink, [NotepadGraphics]::Point($x, $y)) }
+                    'H' { $x = $v[0] + $baseX; [NotepadGraphics]::AddLine($line, $sink, [NotepadGraphics]::Point($x, $y)) }
+                    'V' { $y = $v[0] + $baseY; [NotepadGraphics]::AddLine($line, $sink, [NotepadGraphics]::Point($x, $y)) }
+                    'C' {
+                        $this.Floats([single[]]@(($v[0] + $baseX), ($v[1] + $baseY), ($v[2] + $baseX), ($v[3] + $baseY), ($v[4] + $baseX), ($v[5] + $baseY)))
+                        [NotepadGraphics]::AddSegment([NotepadGraphics]::Slot($sink, 11), $sink, $this.scratch)
+                        $cx = $v[2] + $baseX; $cy = $v[3] + $baseY; $x = $v[4] + $baseX; $y = $v[5] + $baseY
+                    }
+                    'S' {
+                        $c1x = $x; $c1y = $y
+                        if ($previous -eq 'C' -or $previous -eq 'S') { $c1x = 2 * $x - $cx; $c1y = 2 * $y - $cy }
+                        $this.Floats([single[]]@($c1x, $c1y, ($v[0] + $baseX), ($v[1] + $baseY), ($v[2] + $baseX), ($v[3] + $baseY)))
+                        [NotepadGraphics]::AddSegment([NotepadGraphics]::Slot($sink, 11), $sink, $this.scratch)
+                        $cx = $v[0] + $baseX; $cy = $v[1] + $baseY; $x = $v[2] + $baseX; $y = $v[3] + $baseY
+                    }
+                    'Q' {
+                        $cx = $v[0] + $baseX; $cy = $v[1] + $baseY; $x = $v[2] + $baseX; $y = $v[3] + $baseY
+                        $this.Floats([single[]]@($cx, $cy, $x, $y)); [NotepadGraphics]::AddSegment([NotepadGraphics]::Slot($sink, 12), $sink, $this.scratch)
+                    }
+                    'T' {
+                        $qx = $x; $qy = $y
+                        if ($previous -eq 'Q' -or $previous -eq 'T') { $qx = 2 * $x - $cx; $qy = 2 * $y - $cy }
+                        $x = $v[0] + $baseX; $y = $v[1] + $baseY
+                        $this.Floats([single[]]@($qx, $qy, $x, $y)); [NotepadGraphics]::AddSegment([NotepadGraphics]::Slot($sink, 12), $sink, $this.scratch); $cx = $qx; $cy = $qy
+                    }
+                    'A' {
+                        $x = $v[5] + $baseX; $y = $v[6] + $baseY
+                        if ($v[0] -eq 0 -or $v[1] -eq 0) { [NotepadGraphics]::AddLine($line, $sink, [NotepadGraphics]::Point($x, $y)) }
+                        else {
+                            $this.Floats([single[]]@($x, $y, [Math]::Abs($v[0]), [Math]::Abs($v[1]), $v[2]))
+                            [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 20, [int]$v[4]); [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 24, [int]$v[3])
+                            [NotepadGraphics]::AddSegment([NotepadGraphics]::Slot($sink, 14), $sink, $this.scratch)
+                        }
+                    }
                 }
-                $previous=$upper
+                $previous = $upper
             }
-            if($figure){Com $sink 8 ([void]) @([int]) @(0)}
-            Check (Com $sink 9 ([int]) @() @())
-            $geometries[$Data]=$geometry
-            $geometry
-        }catch{$null=$n.ReleaseCom($geometry);throw}finally{$null=$n.ReleaseCom($sink)}
-    }
-    function Icon([string]$Svg,[single]$X,[single]$Y,[single]$Size,[string]$Color,[double]$Rotation=0) {
-        [xml]$xml=$Svg
-        $view=[double[]]($xml.svg.viewBox.Split(' ',[StringSplitOptions]::RemoveEmptyEntries))
-        $scale=$Size/$view[2]
-        foreach($element in $xml.svg.path){
-            $geometry=Path $element.d
-            if($geometry -is [array]){throw "Path returned multiple values: $($geometry | ForEach-Object { $_.GetType().Name+':'+$_ })"}
-            $fill=$Color;if($element.HasAttribute('fill')){$fill=$element.GetAttribute('fill')}
-            $brush=Brush $fill
-            $opacity=1.0;if($element.HasAttribute('opacity')){$opacity=[double]::Parse($element.GetAttribute('opacity'),[Globalization.CultureInfo]::InvariantCulture)}
-            Com $brush 4 ([void]) @([single]) @([single]$opacity)
-            if($Rotation -eq 180){Floats @(-$scale,0,0,-$scale,($X+$Size),($Y+$Size))}else{Floats @($scale,0,0,$scale,$X,$Y)}
-            Com $target 30 ([void]) @([IntPtr]) @($scratch)
-            Com $target 23 ([void]) @([IntPtr],[IntPtr],[IntPtr]) @($geometry,$brush,[IntPtr]::Zero)
-            Com $brush 4 ([void]) @([single]) @([single]1)
+            if ($figure) { [NotepadGraphics]::EndFigure([NotepadGraphics]::Slot($sink, 8), $sink, 0) }
+            [NotepadGraphics]::Check([NotepadGraphics]::CloseSink([NotepadGraphics]::Slot($sink, 9), $sink))
+            $this.geometries[$Data] = $geometry
+            return $geometry
         }
-        Floats @(1,0,0,1,0,0);Com $target 30 ([void]) @([IntPtr]) @($scratch)
+        catch { [NotepadGraphics]::ReleaseCom($geometry); throw }
+        finally { [NotepadGraphics]::ReleaseCom($sink) }
     }
-    function Dispose {
-        foreach($layout in @($layouts)){$null=$n.ReleaseCom($layout)};$layouts.Clear()
-        foreach($item in $geometries.Values){$null=$n.ReleaseCom($item)}
-        foreach($item in $bitmaps.Values){$null=$n.ReleaseCom($item)}
-        foreach($item in $gradientBrushes.Values){$null=$n.ReleaseCom($item)}
-        foreach($item in $formats.Values){$null=$n.ReleaseCom($item)}
-        foreach($item in $brushes.Values){$null=$n.ReleaseCom($item)}
-        foreach($item in @($target,$writeFactory,$factory,$wicFactory)){if($item -ne [IntPtr]::Zero){$null=$n.ReleaseCom($item)}}
-        $n.Free($scratch)
+    [void] Icon([string]$Svg, [single]$X, [single]$Y, [single]$Size, [string]$Color) { $this.Icon($Svg, $X, $Y, $Size, $Color, 0) }
+    [void] Icon([string]$Svg, [single]$X, [single]$Y, [single]$Size, [string]$Color, [double]$Rotation) {
+        $document = [Xml.XmlDocument]::new()
+        $document.LoadXml($Svg)
+        $root = $document.DocumentElement
+        $view = [double[]]($root.GetAttribute('viewBox').Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
+        $scale = $Size / $view[2]
+        foreach ($element in $root.ChildNodes) {
+            if ($element -isnot [Xml.XmlElement] -or $element.LocalName -ne 'path') { continue }
+            $geometry = $this.Path($element.GetAttribute('d'))
+            $fill = $Color
+            if ($element.HasAttribute('fill')) { $fill = $element.GetAttribute('fill') }
+            $brush = $this.Brush($fill)
+            $opacity = 1.0
+            if ($element.HasAttribute('opacity')) { $opacity = [double]::Parse($element.GetAttribute('opacity'), [Globalization.CultureInfo]::InvariantCulture) }
+            [NotepadGraphics]::SetOpacity([NotepadGraphics]::Slot($brush, 4), $brush, [single]$opacity)
+            if ($Rotation -eq 180) { $this.Floats([single[]]@(-$scale, 0, 0, -$scale, ($X + $Size), ($Y + $Size))) } else { $this.Floats([single[]]@($scale, 0, 0, $scale, $X, $Y)) }
+            [NotepadGraphics]::SetTransform([NotepadGraphics]::Slot($this.target, 30), $this.target, $this.scratch)
+            [NotepadGraphics]::FillGeometry([NotepadGraphics]::Slot($this.target, 23), $this.target, $geometry, $brush, [IntPtr]::Zero)
+            [NotepadGraphics]::SetOpacity([NotepadGraphics]::Slot($brush, 4), $brush, [single]1)
+        }
+        $this.Floats([single[]]@(1, 0, 0, 1, 0, 0)); [NotepadGraphics]::SetTransform([NotepadGraphics]::Slot($this.target, 30), $this.target, $this.scratch)
     }
-    function CornerStyle([bool]$Curved){$script:curved=$Curved}
-    Export-ModuleMember -Function Begin,End,Resize,Fill,Stroke,Clip,Unclip,FourCorner,NativeIcon,ColorSpectrum,Circle,Layout,ReleaseLayout,DrawLayout,Metrics,Caret,HitText,Selection,Text,Icon,CornerStyle,Dispose
+    [void] CornerStyle([bool]$Curved) { $this.curved = $Curved }
+    [void] Dispose() {
+        foreach ($layout in [IntPtr[]]@($this.layouts)) { [NotepadGraphics]::ReleaseCom($layout) }; $this.layouts.Clear()
+        foreach ($item in $this.geometries.Values) { [NotepadGraphics]::ReleaseCom($item) }
+        foreach ($item in $this.bitmaps.Values) { [NotepadGraphics]::ReleaseCom($item) }
+        foreach ($item in $this.gradientBrushes.Values) { [NotepadGraphics]::ReleaseCom($item) }
+        foreach ($item in $this.formats.Values) { [NotepadGraphics]::ReleaseCom($item) }
+        foreach ($item in $this.brushes.Values) { [NotepadGraphics]::ReleaseCom($item) }
+        foreach ($item in [IntPtr[]]@($this.target, $this.writeFactory, $this.factory, $this.wicFactory)) { [NotepadGraphics]::ReleaseCom($item) }
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($this.scratch)
+    }
 }
+
+function Invoke-Graphics.Windows {
+[CmdletBinding()]
+param([Parameter(Mandatory)][IntPtr]$Hwnd, [int]$Width, [int]$Height, [single]$Dpi = 96)
+if ($MyInvocation.InvocationName -eq '.') { throw 'Invoke Graphics.Windows.ps1 with &.' }
+[NotepadGraphics]::new($Hwnd, $Width, $Height, $Dpi)
 }
 
 # Folded from src\Design.ps1
@@ -10987,7 +11222,7 @@ $window=$null;$graphics=$null
 try{
     $window=Invoke-Window.Windows -Native $native -Width 960 -Height 540 -Title 'Notepad PS graphics smoke'
     $info=$window.Info()
-    $graphics=Invoke-Graphics.Windows -Native $native -Hwnd $window.Handle() -Width $info.Width -Height $info.Height -Dpi $info.Dpi
+    $graphics=Invoke-Graphics.Windows -Hwnd $window.Handle() -Width $info.Width -Height $info.Height -Dpi $info.Dpi
     $design=Invoke-Design
     $window.Show()
     $graphics.Begin('#1f1f1f')
@@ -14111,7 +14346,7 @@ if($ui.ComparisonView){Load-ComparisonResults}
 try{
     $window=Invoke-Window.Windows -Native $native -Width $Width -Height $Height
     $info=$window.Info();$ui.Dpi=$info.Dpi;$ui.Width=$info.Width*96/$info.Dpi;$ui.Height=$info.Height*96/$info.Dpi
-    $graphics=Invoke-Graphics.Windows -Native $native -Hwnd $window.Handle() -Width $info.Width -Height $info.Height -Dpi $info.Dpi
+    $graphics=Invoke-Graphics.Windows -Hwnd $window.Handle() -Width $info.Width -Height $info.Height -Dpi $info.Dpi
     $services=Invoke-Services.Windows -Native $native -Hwnd $window.Handle()
     Apply-WindowAppearance
     Apply-WindowIcon
