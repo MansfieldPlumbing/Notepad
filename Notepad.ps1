@@ -1341,8 +1341,10 @@ class NotepadGraphics {
         $root = $document.DocumentElement
         $view = [double[]]($root.GetAttribute('viewBox').Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
         $scale = $Size / $view[2]
-        foreach ($element in $root.ChildNodes) {
-            if ($element -isnot [Xml.XmlElement] -or $element.LocalName -ne 'path') { continue }
+        foreach ($node in $root.ChildNodes) {
+            if ($node -isnot [Xml.XmlElement]) { continue }
+            [Xml.XmlElement] $element = $node
+            if ($element.LocalName -ne 'path') { continue }
             $geometry = $this.Path($element.GetAttribute('d'))
             $fill = $Color
             if ($element.HasAttribute('fill')) { $fill = $element.GetAttribute('fill') }
