@@ -357,18 +357,21 @@ class NotepadModel {
         if (-not $Session.Tabs.Count) { return }
         $this.modelState.Tabs.Clear()
         $ids = [Collections.Generic.HashSet[int]]::new()
-        foreach ($saved in $Session.Tabs) {
-            if (-not ($saved.Text -is [string]) -or -not $ids.Add([int]$saved.Id)) { throw 'Invalid session document' }
-            $tab = $this.NewTab($saved.Title, $saved.Text, $saved.Path, $saved.Markdown)
-            if ($saved.ContainsKey('Id')) { $tab.Id = $saved.Id }
-            if ($saved.ContainsKey('LineEnding')) { $tab.LineEnding = $saved.LineEnding }
-            if ($saved.ContainsKey('Encoding')) { $tab.Encoding = $saved.Encoding }
-            if ($saved.ContainsKey('Bom')) { $tab.Bom = $saved.Bom }
-            if ($saved.ContainsKey('Modified')) { $tab.Modified = $saved.Modified }
-            if ($saved.ContainsKey('Anchor')) { $tab.Anchor = $saved.Anchor }
-            if ($saved.ContainsKey('Focus')) { $tab.Focus = $saved.Focus }
-            if ($saved.ContainsKey('ScrollX')) { $tab.ScrollX = $saved.ScrollX }
-            if ($saved.ContainsKey('ScrollY')) { $tab.ScrollY = $saved.ScrollY }
+        foreach ($entry in $Session.Tabs) {
+            # A saved document is a dictionary (read from JSON, or from ExportSession).
+            if ($entry -isnot [Collections.IDictionary]) { throw 'Invalid session document' }
+            [Collections.IDictionary] $saved = $entry
+            if (-not ($saved['Text'] -is [string]) -or -not $ids.Add([int]$saved['Id'])) { throw 'Invalid session document' }
+            $tab = $this.NewTab([string]$saved['Title'], [string]$saved['Text'], [string]$saved['Path'], [bool]$saved['Markdown'])
+            if ($saved.Contains('Id')) { $tab.Id = $saved['Id'] }
+            if ($saved.Contains('LineEnding')) { $tab.LineEnding = $saved['LineEnding'] }
+            if ($saved.Contains('Encoding')) { $tab.Encoding = $saved['Encoding'] }
+            if ($saved.Contains('Bom')) { $tab.Bom = $saved['Bom'] }
+            if ($saved.Contains('Modified')) { $tab.Modified = $saved['Modified'] }
+            if ($saved.Contains('Anchor')) { $tab.Anchor = $saved['Anchor'] }
+            if ($saved.Contains('Focus')) { $tab.Focus = $saved['Focus'] }
+            if ($saved.Contains('ScrollX')) { $tab.ScrollX = $saved['ScrollX'] }
+            if ($saved.Contains('ScrollY')) { $tab.ScrollY = $saved['ScrollY'] }
             $tab.Focus = [Math]::Clamp($tab.Focus, 0, $tab.Text.Length)
             $tab.Anchor = [Math]::Clamp($tab.Anchor, 0, $tab.Text.Length)
         }
