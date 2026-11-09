@@ -353,33 +353,77 @@ class NotepadModel {
         return @{NextId=$this.modelState.NextId;ActiveId=$this.modelState.ActiveId;Tabs=$tabs.ToArray()}
     }
 
-    [void] ImportSession([hashtable]$Session) {
-        if (-not $Session.Tabs.Count) { return }
+    # The session in binary: a version, the next and active tab ids, then each tab's fields. Text is
+    # written as BinaryWriter writes strings (UTF-8, length first); a string that may be $null is preceded by whether
+    # it is present. Without tabs, only the header is written.
+    [void] WriteSession([IO.BinaryWriter]$Writer, [bool]$WithTabs) {
+        $Writer.Write([int]1)
+        $Writer.Write([int]$this.modelState.NextId)
+        $Writer.Write([int]$this.modelState.ActiveId)
+        if (-not $WithTabs) { $Writer.Write([int]0); return }
+        $Writer.Write([int]$this.modelState.Tabs.Count)
+        foreach ($tab in $this.modelState.Tabs) {
+            $Writer.Write([int]$tab.Id)
+            [NotepadModel]::WriteText($Writer, $tab.Title)
+            [NotepadModel]::WriteText($Writer, $tab.Text)
+            [NotepadModel]::WriteText($Writer, $tab.Path)
+            $Writer.Write([bool]$tab.Markdown)
+            [NotepadModel]::WriteText($Writer, $tab.LineEnding)
+            [NotepadModel]::WriteText($Writer, $tab.Encoding)
+            $Writer.Write([bool]$tab.Bom)
+            $Writer.Write([bool]$tab.Modified)
+            $Writer.Write([int]$tab.Anchor)
+            $Writer.Write([int]$tab.Focus)
+            $Writer.Write([double]$tab.ScrollX)
+            $Writer.Write([double]$tab.ScrollY)
+        }
+    }
+
+    static [void] WriteText([IO.BinaryWriter]$Writer, [string]$Value) {
+        $Writer.Write($null -ne $Value)
+        if ($null -ne $Value) { $Writer.Write($Value) }
+    }
+
+    static [string] ReadText([IO.BinaryReader]$Reader) {
+        if (-not $Reader.ReadBoolean()) { return $null }
+        return $Reader.ReadString()
+    }
+
+    # Restores a session WriteSession wrote. A session without tabs leaves the open tabs as they are. A tab
+    # without text or with a repeated id makes the session invalid; carets are clamped to the text.
+    [void] ReadSession([IO.BinaryReader]$Reader) {
+        if ($Reader.ReadInt32() -ne 1) { throw 'Invalid session document' }
+        $nextId = $Reader.ReadInt32()
+        $activeId = $Reader.ReadInt32()
+        $count = $Reader.ReadInt32()
+        if ($count -le 0) { return }
         $this.modelState.Tabs.Clear()
         $ids = [Collections.Generic.HashSet[int]]::new()
-        foreach ($entry in $Session.Tabs) {
-            # A saved document is a dictionary (read from JSON, or from ExportSession).
-            if ($entry -isnot [Collections.IDictionary]) { throw 'Invalid session document' }
-            [Collections.IDictionary] $saved = $entry
-            if (-not ($saved['Text'] -is [string]) -or -not $ids.Add([int]$saved['Id'])) { throw 'Invalid session document' }
-            $tab = $this.NewTab([string]$saved['Title'], [string]$saved['Text'], [string]$saved['Path'], [bool]$saved['Markdown'])
-            if ($saved.Contains('Id')) { $tab.Id = $saved['Id'] }
-            if ($saved.Contains('LineEnding')) { $tab.LineEnding = $saved['LineEnding'] }
-            if ($saved.Contains('Encoding')) { $tab.Encoding = $saved['Encoding'] }
-            if ($saved.Contains('Bom')) { $tab.Bom = $saved['Bom'] }
-            if ($saved.Contains('Modified')) { $tab.Modified = $saved['Modified'] }
-            if ($saved.Contains('Anchor')) { $tab.Anchor = $saved['Anchor'] }
-            if ($saved.Contains('Focus')) { $tab.Focus = $saved['Focus'] }
-            if ($saved.Contains('ScrollX')) { $tab.ScrollX = $saved['ScrollX'] }
-            if ($saved.Contains('ScrollY')) { $tab.ScrollY = $saved['ScrollY'] }
+        for ($i = 0; $i -lt $count; $i++) {
+            $id = $Reader.ReadInt32()
+            $title = [NotepadModel]::ReadText($Reader)
+            $text = [NotepadModel]::ReadText($Reader)
+            $path = [NotepadModel]::ReadText($Reader)
+            $markdown = $Reader.ReadBoolean()
+            if ($null -eq $text -or -not $ids.Add($id)) { throw 'Invalid session document' }
+            $tab = $this.NewTab($title, $text, $path, $markdown)
+            $tab.Id = $id
+            $tab.LineEnding = [NotepadModel]::ReadText($Reader)
+            $tab.Encoding = [NotepadModel]::ReadText($Reader)
+            $tab.Bom = $Reader.ReadBoolean()
+            $tab.Modified = $Reader.ReadBoolean()
+            $tab.Anchor = $Reader.ReadInt32()
+            $tab.Focus = $Reader.ReadInt32()
+            $tab.ScrollX = $Reader.ReadDouble()
+            $tab.ScrollY = $Reader.ReadDouble()
             $tab.Focus = [Math]::Clamp($tab.Focus, 0, $tab.Text.Length)
             $tab.Anchor = [Math]::Clamp($tab.Anchor, 0, $tab.Text.Length)
         }
         $highest = 0
         foreach ($tab in $this.modelState.Tabs) { $highest = [Math]::Max($highest, $tab.Id) }
-        $this.modelState.NextId = [Math]::Max([int]$Session.NextId, $highest + 1)
+        $this.modelState.NextId = [Math]::Max($nextId, $highest + 1)
         $this.modelState.ActiveId = $this.modelState.Tabs[0].Id
-        if ($ids.Contains([int]$Session.ActiveId)) { $this.modelState.ActiveId = [int]$Session.ActiveId }
+        if ($ids.Contains($activeId)) { $this.modelState.ActiveId = $activeId }
     }
 }
 
@@ -441,8 +485,11 @@ try{
     Assert (($bytes[0..2] -join ',') -eq '239,187,191') 'UTF-8 BOM missing.'
     Assert ([IO.File]::ReadAllText($secondPath) -ceq "α`r`nβ") 'CRLF output mismatch.'
     $third=$model.Open($secondPath);Assert ($third.Text -ceq "α`nβ" -and $third.Bom) 'UTF-8 reopen mismatch.'
-    $session=$model.ExportSession()|ConvertTo-Json -Depth 16|ConvertFrom-Json -AsHashtable
-    $restored=Invoke-Model;$restored.ImportSession($session)
+    $buffer=[IO.MemoryStream]::new();$sessionWriter=[IO.BinaryWriter]::new($buffer);$model.WriteSession($sessionWriter,$true);$sessionWriter.Flush();$buffer.Position=0
+    $restored=Invoke-Model;$restored.ReadSession([IO.BinaryReader]::new($buffer))
+    $before=foreach($tab in $model.State().Tabs){$tab.Text+'|'+$tab.Path+'|'+$tab.LineEnding+'|'+$tab.Encoding+'|'+$tab.Bom+'|'+$tab.Modified+'|'+$tab.Anchor+'|'+$tab.Focus}
+    $after=foreach($tab in $restored.State().Tabs){$tab.Text+'|'+$tab.Path+'|'+$tab.LineEnding+'|'+$tab.Encoding+'|'+$tab.Bom+'|'+$tab.Modified+'|'+$tab.Anchor+'|'+$tab.Focus}
+    Assert (($before -join "`n") -ceq ($after -join "`n")) 'Session round trip changed a document.'
     Assert ($restored.State().Tabs.Count -eq 3) 'Session lost documents.'
     Assert ($restored.Active().Text -ceq "α`nβ") 'Session active document mismatch.'
     $lastId=$restored.Active().Id;$restored.CloseTab($lastId);Assert ($restored.State().Tabs.Count -eq 2) 'Close-tab failed.'
@@ -13714,6 +13761,79 @@ class NotepadSettings {
         }
         throw [ArgumentException]::new("No setting is named '$Name'.")
     }
+
+    # An independent copy: the colour table and the ANSI colours are copied, not shared.
+    [NotepadSettings] Copy() {
+        $copy = [NotepadSettings]::new()
+        foreach ($name in $this.SettingNames()) {
+            $value = $this.Get($name)
+            if ($value -is [string[]]) { $value = [string[]]$value.Clone() }
+            $copy.Set($name, $value)
+        }
+        return $copy
+    }
+
+    # A setting's value as config.ini writes it: true/false, invariant integers, text as it is.
+    static [string] IniText([object]$Value) {
+        if ($Value -is [bool]) { return $(if ($Value) { 'true' } else { 'false' }) }
+        if ($Value -is [int]) { return ([int]$Value).ToString([Globalization.CultureInfo]::InvariantCulture) }
+        return [string]$Value
+    }
+
+    # Writes config.ini: every setting, the ones that differ from -Defaults as key=value and the rest commented out
+    # as ;key=value, so the file shows every setting while only changes take effect. The colour table and the ANSI
+    # colours have sections of their own, entry by entry.
+    [void] WriteIni([IO.TextWriter]$Writer, [NotepadSettings]$Defaults) {
+        $Writer.WriteLine('; Notepad settings. Lines starting with ; are defaults; remove the ; to change one.')
+        $Writer.WriteLine('[Notepad]')
+        foreach ($name in $this.SettingNames()) {
+            if ($name -in 'colors', 'ansiColors') { continue }
+            $value = [NotepadSettings]::IniText($this.Get($name))
+            $prefix = if ([string]::Equals($value, [NotepadSettings]::IniText($Defaults.Get($name)), [StringComparison]::Ordinal)) { ';' } else { '' }
+            $Writer.WriteLine($prefix + $name + '=' + $value)
+        }
+        $Writer.WriteLine()
+        $Writer.WriteLine('[Colors]')
+        foreach ($role in $this.colors.Keys) {
+            $default = $null
+            $same = $Defaults.colors.TryGetValue($role, [ref]$default) -and [string]::Equals($this.colors[$role], $default, [StringComparison]::Ordinal)
+            $Writer.WriteLine($(if ($same) { ';' } else { '' }) + $role + '=' + $this.colors[$role])
+        }
+        $Writer.WriteLine()
+        $Writer.WriteLine('[AnsiColors]')
+        for ($i = 0; $i -lt $this.ansiColors.Length; $i++) {
+            $same = $i -lt $Defaults.ansiColors.Length -and [string]::Equals($this.ansiColors[$i], $Defaults.ansiColors[$i], [StringComparison]::Ordinal)
+            $Writer.WriteLine($(if ($same) { ';' } else { '' }) + $i.ToString([Globalization.CultureInfo]::InvariantCulture) + '=' + $this.ansiColors[$i])
+        }
+    }
+
+    # Applies config.ini over the current values. Blank lines and lines starting with ; or # are skipped; a section or
+    # key this build does not know is skipped. A value is read as its setting's type ([bool]::Parse, an invariant
+    # integer, text as it is), and one that does not read as that type throws.
+    [void] ReadIni([IO.TextReader]$Reader) {
+        $section = ''
+        $culture = [Globalization.CultureInfo]::InvariantCulture
+        for ($line = $Reader.ReadLine(); $null -ne $line; $line = $Reader.ReadLine()) {
+            $line = $line.Trim()
+            if ($line.Length -eq 0 -or $line.StartsWith(';') -or $line.StartsWith('#')) { continue }
+            if ($line.StartsWith('[') -and $line.EndsWith(']')) { $section = $line.Substring(1, $line.Length - 2).Trim(); continue }
+            $equals = $line.IndexOf('=')
+            if ($equals -le 0) { continue }
+            $key = $line.Substring(0, $equals).Trim()
+            $value = $line.Substring($equals + 1).Trim()
+            if ($section -eq 'Colors') { $this.colors[$key] = $value; continue }
+            if ($section -eq 'AnsiColors') {
+                $index = [int]::Parse($key, [Globalization.NumberStyles]::None, $culture)
+                if ($index -lt $this.ansiColors.Length) { $this.ansiColors[$index] = $value }
+                continue
+            }
+            if ($section -ne 'Notepad' -or $key -notin $this.SettingNames() -or $key -in 'colors', 'ansiColors') { continue }
+            $current = $this.Get($key)
+            if ($current -is [bool]) { $this.Set($key, [bool]::Parse($value)) }
+            elseif ($current -is [int]) { $this.Set($key, [int]::Parse($value, [Globalization.NumberStyles]::AllowLeadingSign, $culture)) }
+            else { $this.Set($key, $value) }
+        }
+    }
 }
 $design=Invoke-Design
 [NotepadSettings]$settings=[NotepadSettings]::new()
@@ -13724,14 +13844,18 @@ $settings.colors=[NotepadSettings]::ColorTable(@{foreground='';tabs='';cursor=''
 $settings.ansiColors=@('#0C0C0C','#C50F1F','#13A10E','#C19C00','#0037DA','#881798','#3A96DD','#CCCCCC','#767676','#E74856','#16C60C','#F9F1A5','#3B78FF','#B4009E','#61D6D6','#F2F2F2')
 $settings.windowIcon='default'
 $store=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'NotepadPS1'
-if(-not $NoSession -and (Test-Path "$store\settings.json")){
-    try{$saved=Get-Content "$store\settings.json" -Raw|ConvertFrom-Json -AsHashtable;foreach($key in $settings.SettingNames()){if($saved.ContainsKey($key)){$settings.Set($key,$saved[$key])}}}catch{Write-Warning 'Saved settings could not be loaded; using defaults.'}
+# Settings live in config.ini beside the program; the open tabs in session.bin in the user's application data.
+[NotepadSettings]$defaultSettings=$settings.Copy()
+$configPath=Join-Path $PSScriptRoot 'config.ini'
+$sessionPath=Join-Path $store 'session.bin'
+if(-not $NoSession -and (Test-Path -LiteralPath $configPath)){
+    try{$configReader=[IO.StreamReader]::new($configPath);try{$settings.ReadIni($configReader)}finally{$configReader.Dispose()}}catch{Write-Warning 'config.ini could not be read; using defaults for the rest.'}
 }
 if($Backdrop){$settings.backdrop=$Backdrop};if($CornerStyle){$settings.cornerStyle=$CornerStyle}
 [NotepadModel]$model=Invoke-Model -Settings $settings
 [NotepadModelState]$state=$model.State()
-if(-not $NoSession -and $settings.startupOption -eq 'continueSession' -and (Test-Path "$store\session.json")){
-    try{$model.ImportSession((Get-Content "$store\session.json" -Raw|ConvertFrom-Json -AsHashtable))}catch{Write-Warning 'Saved session could not be restored.'}
+if(-not $NoSession -and $settings.startupOption -eq 'continueSession' -and (Test-Path -LiteralPath $sessionPath)){
+    try{$sessionReader=[IO.BinaryReader]::new([IO.File]::OpenRead($sessionPath));try{$model.ReadSession($sessionReader)}finally{$sessionReader.Dispose()}}catch{Write-Warning 'Saved session could not be restored.'}
 }
 if(-not $state.Tabs.Count){$null=$model.NewTab()}
 if($Path){$null=$model.Open($Path);if($state.Tabs[0].Text -eq '' -and $state.Tabs.Count -eq 2){$model.CloseTab($state.Tabs[0].Id)}}
@@ -13952,11 +14076,18 @@ function Set-OpacityFromPoint([double]$X){
 }
 function Persist {
     if($NoSession){return}
+    # Each file is written beside its destination and moved over it, so a reader never sees half a file.
+    $temporary=$configPath+'.tmp'
+    try{
+        $configWriter=[IO.StreamWriter]::new($temporary,$false,[Text.UTF8Encoding]::new($false))
+        try{$settings.WriteIni($configWriter,$defaultSettings)}finally{$configWriter.Dispose()}
+        [IO.File]::Move($temporary,$configPath,$true)
+    }catch [UnauthorizedAccessException] {Write-Warning "config.ini cannot be written beside the program: $($_.Exception.Message)"}
     New-Item -ItemType Directory -Path $store -Force|Out-Null
-    foreach($item in @(@{Name='settings';Value=$settings},@{Name='session';Value=$(if($settings.startupOption -eq 'continueSession'){$model.ExportSession()}else{@{Tabs=@()}})})){
-        $temporary=Join-Path $store ($item.Name+'.tmp');$destination=Join-Path $store ($item.Name+'.json')
-        [IO.File]::WriteAllText($temporary,($item.Value|ConvertTo-Json -Depth 32),[Text.UTF8Encoding]::new($false));[IO.File]::Move($temporary,$destination,$true)
-    }
+    $temporary=$sessionPath+'.tmp'
+    $sessionWriter=[IO.BinaryWriter]::new([IO.File]::Create($temporary))
+    try{$model.WriteSession($sessionWriter,($settings.startupOption -eq 'continueSession'))}finally{$sessionWriter.Dispose()}
+    [IO.File]::Move($temporary,$sessionPath,$true)
 }
 function Invalidate([bool]$Caret=$false){$ui.Dirty=$true;if($Caret){$ui.EnsureCaret=$true;$ui.Blink=$true;$ui.LastBlink=[DateTime]::UtcNow}}
 function Node([string]$Id,[double]$X,[double]$Y,[double]$W,[double]$H,[string]$Action,[object]$Data=$null,[string]$Cursor='pointer'){
