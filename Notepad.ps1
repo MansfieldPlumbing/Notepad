@@ -13653,7 +13653,78 @@ if(-not $state.Tabs.Count){$null=$model.NewTab()}
 if($Path){$null=$model.Open($Path);if($state.Tabs[0].Text -eq '' -and $state.Tabs.Count -eq 2){$model.CloseTab($state.Tabs[0].Id)}}
 $native=Invoke-Native
 [NotepadWindow]$window=$null;[NotepadGraphics]$graphics=$null;$services=$null
-$ui=@{Dirty=$true;Running=$true;Hover='';Pressed='';Focus='editor-area';Menu='';Submenu='';Settings=$false;Expanded=@{};SettingsScroll=0.0;Find=$false;Replace=$false;Modal=$null;Dropdown=$null;Drag=$false;Blink=$true;LastBlink=[DateTime]::UtcNow;LastSession=[DateTime]::UtcNow;Width=0.0;Height=0.0;Dpi=96.0;Generation=0;Nodes=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal);Hits=[Collections.Generic.List[object]]::new();NextHits=$null;TextCache=@{};EditorLayout=[IntPtr]::Zero;EditorKey='';EditorOrigin=@(16.0,92.0);EditorRect=@(0,78,1280,614);EditorMetrics=@{};EnsureCaret=$true;InputAnchor=0;InputFocus=0;InputBuffers=@{};PendingHigh='';Focused=$true}
+# The interface state. A value-type member that starts unset is Nullable: it reads $null until first set.
+class NotepadUi {
+    [bool]$Dirty
+    [bool]$Running
+    [string]$Hover
+    [string]$Pressed
+    [string]$Focus
+    [string]$Menu
+    [string]$Submenu
+    [bool]$Settings
+    [hashtable]$Expanded
+    [double]$SettingsScroll
+    [bool]$Find
+    [bool]$Replace
+    [hashtable]$Modal
+    [hashtable]$Dropdown
+    [bool]$Drag
+    [bool]$Blink
+    [datetime]$LastBlink
+    [datetime]$LastSession
+    [double]$Width
+    [double]$Height
+    [double]$Dpi
+    [int]$Generation
+    [Collections.Generic.Dictionary[string,object]]$Nodes
+    [Collections.Generic.List[object]]$Hits
+    [Collections.Generic.List[object]]$NextHits
+    [hashtable]$TextCache
+    [IntPtr]$EditorLayout
+    [string]$EditorKey
+    [double[]]$EditorOrigin
+    [double[]]$EditorRect
+    [NotepadTextMetrics]$EditorMetrics
+    [bool]$EnsureCaret
+    [int]$InputAnchor
+    [int]$InputFocus
+    [hashtable]$InputBuffers
+    [string]$PendingHigh
+    [bool]$Focused
+    [Nullable[bool]]$ComparisonView
+    [Nullable[double]]$ComparisonScroll
+    [Diagnostics.Process]$ComparisonProcess
+    [object[]]$ComparisonRows
+    [string]$ComparisonStatus
+    [Nullable[datetime]]$ComparisonLastPoll
+    [Nullable[int]]$ClickSequence
+    [Nullable[int]]$ScrollSequence
+    [string]$EntranceStatus
+    [Collections.Generic.List[object]]$EntranceSamples
+    [Nullable[datetime]]$HoverSince
+    [Nullable[bool]]$TooltipShown
+    [Nullable[bool]]$Minimized
+    [Nullable[bool]]$SliderDrag
+    [hashtable]$ColorPicker
+    [string]$ColorDrag
+    [string]$ComparisonLog
+    [string]$ComparisonError
+    [string]$Theme
+    [NotepadAppearance]$Appearance
+    [string]$AppearanceError
+    [NotepadEntrance]$Entrance
+    [NotepadEntranceRestore]$EntranceRestore
+    [Nullable[bool]]$BackdropActive
+    [object[]]$IconCatalog
+    [Nullable[IntPtr]]$WindowIconHandle
+    [object[]]$OpacityTrack
+    [double[]]$HitClip
+    [Nullable[int]]$ComparisonExtent
+    [Nullable[int]]$SettingsExtent
+    [Nullable[datetime]]$EntranceStart
+}
+[NotepadUi]$ui=@{Dirty=$true;Running=$true;Hover='';Pressed='';Focus='editor-area';Menu='';Submenu='';Settings=$false;Expanded=@{};SettingsScroll=0.0;Find=$false;Replace=$false;Modal=$null;Dropdown=$null;Drag=$false;Blink=$true;LastBlink=[DateTime]::UtcNow;LastSession=[DateTime]::UtcNow;Width=0.0;Height=0.0;Dpi=96.0;Generation=0;Nodes=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal);Hits=[Collections.Generic.List[object]]::new();NextHits=$null;TextCache=@{};EditorLayout=[IntPtr]::Zero;EditorKey='';EditorOrigin=@(16.0,92.0);EditorRect=@(0,78,1280,614);EnsureCaret=$true;InputAnchor=0;InputFocus=0;InputBuffers=@{};PendingHigh='';Focused=$true}
 $palette=@{}
 $ui.ComparisonView=$false;$ui.ComparisonScroll=0.0;$ui.ComparisonProcess=$null
 $ui.ComparisonRows=@();$ui.ComparisonStatus='Ready';$ui.ComparisonLastPoll=[DateTime]::MinValue
