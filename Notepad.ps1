@@ -4,7 +4,7 @@ param(
     [switch]$Compare,[string]$EvidenceDirectory=(Join-Path $PSScriptRoot 'evidence'),
     [switch]$RefreshReal,[switch]$SkipBrowser,[switch]$KeepProbeOpen,
     [switch]$ExtractTypeScript,[switch]$BuildTypeScript,[switch]$BuildDesign,[switch]$VerifyNativeFeatures,[switch]$CatalogIcons,
-    [ValidateSet('editor','settings','comparison')][string]$StartPage='editor',
+    [ValidateSet('editor','settings')][string]$StartPage='editor',
     [ValidateSet('mica','acrylic','reverseMica')][string]$Backdrop,
     [ValidateSet('curved','straight')][string]$CornerStyle,[switch]$NoAnimation,
     [switch]$VerifyModel,[switch]$VerifyGraphics,[switch]$VerifyWindow
@@ -12777,12 +12777,7 @@ if ($VerifyNativeFeatures) {
         Click-Replay 'toggle-setting-copyAsFile'
         $d=Read-Replay
         $replayChecks.Add([pscustomobject]@{Property='Whole-document file mode rocker';Expected=$true;Observed=$d.Settings.copyAsFile;Verdict=if($d.Settings.copyAsFile){'TRUE'}else{'FALSE'}})
-        Click-Replay 'settings-btn-back';Click-Replay 'btn-whats-new'
-        Capture-Replay 'comparison'
-        Click-Replay 'comparison-run'
-        for($j=0;$j -lt 300;$j++){Start-Sleep -Milliseconds 150;$d=Read-Replay;if($d.ComparisonStatus -like 'Comparison complete*' -or $d.ComparisonStatus -like 'Comparison failed*'){break}}
-        $replayChecks.Add([pscustomobject]@{Property='Integrated asynchronous comparison';Expected='Comparison complete';Observed=$d.ComparisonStatus;Verdict=if($d.ComparisonStatus -like 'Comparison complete*'){'TRUE'}else{'FALSE'}})
-        Capture-Replay 'comparison-complete'
+        Click-Replay 'settings-btn-back'
         [pscustomobject]@{Machine=$env:COMPUTERNAME;WindowsBuild=[Environment]::OSVersion.Version.ToString();TimeUtc=[DateTime]::UtcNow;SourceSHA256=(Get-FileHash (Join-Path $PSScriptRoot 'Notepad.ps1') -Algorithm SHA256).Hash;States=$replayStates.ToArray();Checks=$replayChecks.ToArray()} | Export-Clixml (Join-Path $EvidenceDirectory 'native-feature-replay.clixml')
         $replayChecks | Format-Table -AutoSize
         if(@($replayChecks|Where-Object Verdict -eq 'FALSE').Count){throw 'The native feature replay found a defect.'}
@@ -13847,12 +13842,6 @@ class NotepadUi {
     [hashtable]$InputBuffers
     [string]$PendingHigh
     [bool]$Focused
-    [Nullable[bool]]$ComparisonView
-    [Nullable[double]]$ComparisonScroll
-    [Diagnostics.Process]$ComparisonProcess
-    [object[]]$ComparisonRows
-    [string]$ComparisonStatus
-    [Nullable[datetime]]$ComparisonLastPoll
     [Nullable[int]]$ClickSequence
     [Nullable[int]]$ScrollSequence
     [string]$EntranceStatus
@@ -13863,8 +13852,6 @@ class NotepadUi {
     [Nullable[bool]]$SliderDrag
     [NotepadColorPicker]$ColorPicker
     [string]$ColorDrag
-    [string]$ComparisonLog
-    [string]$ComparisonError
     [string]$Theme
     [NotepadAppearance]$Appearance
     [string]$AppearanceError
@@ -13875,7 +13862,6 @@ class NotepadUi {
     [Nullable[IntPtr]]$WindowIconHandle
     [object[]]$OpacityTrack
     [double[]]$HitClip
-    [Nullable[int]]$ComparisonExtent
     [Nullable[int]]$SettingsExtent
     [Nullable[datetime]]$EntranceStart
 }
@@ -13883,8 +13869,6 @@ class NotepadUi {
 # The theme's colours by CSS custom property, as the design's declarations give them (all text); case-insensitive keys,
 # as the hashtable's were. A property the theme does not declare reads $null.
 [Collections.Generic.Dictionary[string,string]]$palette=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
-$ui.ComparisonView=$false;$ui.ComparisonScroll=0.0;$ui.ComparisonProcess=$null
-$ui.ComparisonRows=@();$ui.ComparisonStatus='Ready';$ui.ComparisonLastPoll=[DateTime]::MinValue
 $ui.ClickSequence=0
 $ui.ScrollSequence=0
 $ui.EntranceStatus='Pending';$ui.EntranceSamples=[Collections.Generic.List[object]]::new()
@@ -13892,37 +13876,10 @@ $ui.HoverSince=[DateTime]::UtcNow;$ui.TooltipShown=$false
 $ui.Minimized=$false
 $ui.SliderDrag=$false
 $ui.ColorPicker=$null;$ui.ColorDrag=''
-if($StartPage -ne 'editor'){$ui.Settings=$true;$ui.Focus='settings';$ui.ComparisonView=$StartPage -eq 'comparison'}
-function Load-ComparisonResults {
-    $file=Join-Path $EvidenceDirectory 'comparison-table.clixml'
-    if(Test-Path -LiteralPath $file){try{$ui.ComparisonRows=@(Import-Clixml -LiteralPath $file)}catch{$ui.ComparisonStatus='The saved comparison could not be read.'}}
-}
-function Start-Comparison([bool]$Refresh=$false){
-    if($ui.ComparisonProcess -and -not $ui.ComparisonProcess.HasExited){return}
-    New-Item -ItemType Directory -Path $EvidenceDirectory -Force|Out-Null
-    $runId=[DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')+'-'+[guid]::NewGuid().ToString('N').Substring(0,8)
-    $ui.ComparisonLog=Join-Path $EvidenceDirectory ($runId+'-comparison.log')
-    $ui.ComparisonError=Join-Path $EvidenceDirectory ($runId+'-comparison-error.log')
-    $arguments=@('-NoProfile','-STA','-File',('"'+$PSCommandPath+'"'),'-Compare','-EvidenceDirectory',('"'+$EvidenceDirectory+'"'))
-    if($Refresh){$arguments+='-RefreshReal'}
-    try{
-        $ui.ComparisonProcess=Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -ArgumentList $arguments -WindowStyle Hidden -RedirectStandardOutput $ui.ComparisonLog -RedirectStandardError $ui.ComparisonError -PassThru
-        $ui.ComparisonStatus=if($Refresh){'Capturing a fresh Windows Notepad baseline...'}else{'Comparing with the saved Windows Notepad baseline...'}
-    }catch{$ui.ComparisonStatus='Could not start comparison: '+$_.Exception.Message}
-    Invalidate
-}
-function Update-Comparison {
-    if(-not $ui.ComparisonProcess -or ([DateTime]::UtcNow-$ui.ComparisonLastPoll).TotalMilliseconds -lt 250){return}
-    $ui.ComparisonLastPoll=[DateTime]::UtcNow;$ui.ComparisonProcess.Refresh()
-    if(-not $ui.ComparisonProcess.HasExited){return}
-    $exitCode=$ui.ComparisonProcess.ExitCode;$ui.ComparisonProcess.Dispose();$ui.ComparisonProcess=$null
-    if($exitCode -eq 0){Load-ComparisonResults;$ui.ComparisonStatus='Comparison complete. Results are measured from the saved evidence.'}
-    else{$ui.ComparisonStatus='Comparison failed. The previous results remain visible; see '+[IO.Path]::GetFileName($ui.ComparisonError)}
-    Invalidate
-}
+if($StartPage -ne 'editor'){$ui.Settings=$true;$ui.Focus='settings'}
 function Write-ApplicationDiagnostic {
     if(-not $DiagnosticPath){return}
-    $snapshot=@{Generation=$ui.Generation;ClickSequence=$ui.ClickSequence;Width=$ui.Width;Height=$ui.Height;Dpi=$ui.Dpi;Theme=$ui.Theme;Focus=$ui.Focus;Settings=$settings;SettingsOpen=$ui.Settings;ComparisonOpen=$ui.ComparisonView;ComparisonStatus=$ui.ComparisonStatus;Appearance=$ui.Appearance;AppearanceError=$ui.AppearanceError;EditorMetrics=$ui.EditorMetrics;Status=$model.Status();Nodes=@($ui.Hits|ForEach-Object{@{Id=$_.Id;Rect=$_.Rect;Action=$_.Action;Data=$_.Data;Generation=$_.Generation}});Session=$model.ExportSession()}
+    $snapshot=@{Generation=$ui.Generation;ClickSequence=$ui.ClickSequence;Width=$ui.Width;Height=$ui.Height;Dpi=$ui.Dpi;Theme=$ui.Theme;Focus=$ui.Focus;Settings=$settings;SettingsOpen=$ui.Settings;Appearance=$ui.Appearance;AppearanceError=$ui.AppearanceError;EditorMetrics=$ui.EditorMetrics;Status=$model.Status();Nodes=@($ui.Hits|ForEach-Object{@{Id=$_.Id;Rect=$_.Rect;Action=$_.Action;Data=$_.Data;Generation=$_.Generation}});Session=$model.ExportSession()}
     $snapshot.Entrance=$ui.Entrance;$snapshot.EntranceStatus=$ui.EntranceStatus;$snapshot.EntranceSamples=$ui.EntranceSamples.ToArray()
     $snapshot.EntranceRestore=$ui.EntranceRestore
     $snapshot.Minimized=$ui.Minimized
@@ -14118,11 +14075,8 @@ function Command([string]$Action,[object]$Data=$null){
         'toggleWordWrap'{$settings.wordWrap=-not $settings.wordWrap}
         'lineEnding'{$tab.LineEnding=if($tab.LineEnding -eq 'Unix (LF)'){'Windows (CRLF)'}else{'Unix (LF)'};$tab.Modified=$true}
         'openSettings'{$ui.Settings=$true;$ui.Menu='';$ui.Focus='settings'}
-        'openComparison'{$ui.Settings=$true;$ui.ComparisonView=$true;$ui.ComparisonScroll=0;Load-ComparisonResults;$ui.Focus='comparison'}
-        'runComparison'{Start-Comparison}
-        'refreshComparison'{Start-Comparison $true}
         'openFontSettings'{$ui.Settings=$true;$ui.Expanded['card-font-setting']=$true;$ui.SettingsScroll=0;$ui.Focus='settings'}
-        'back'{if($ui.ComparisonView){$ui.ComparisonView=$false;$ui.Focus='settings'}else{$ui.Settings=$false;$ui.Dropdown=$null;$ui.Focus='editor-area'}}
+        'back'{$ui.Settings=$false;$ui.Dropdown=$null;$ui.Focus='editor-area'}
         'accordion'{$ui.Expanded[$Data]=-not $ui.Expanded[$Data]}
         'toggleSetting'{$settings.Set($Data,(-not $settings.Get($Data)))}
         'startup'{$settings.startupOption=$Data}
@@ -14308,11 +14262,9 @@ function Paint-Chrome {
         Button 'format-link' ($fx+180) 45 30 30 'formatLink';Label ([string][char]0xE71B) ($fx+187) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
         Button 'format-more' ($fx+212) 45 30 30 'toggleMenu' '' '' 'formatMore';Label ([string][char]0xE712) ($fx+219) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
     }
-    Button 'btn-copy-document' ($w-188) 45 32 30 'copyDocument'
-    Label ([string][char]0xE8C8) ($w-180) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
-    Button 'btn-writing-tools' ($w-152) 45 28 30 'toggleMenu' '✧' '' 'writing'
-    Button 'btn-whats-new' ($w-120) 43 32 32 'openComparison' '' 'megaphone'
-    Button 'btn-person' ($w-84) 43 32 32 'openSettings';Label ([string][char]0xE77B) ($w-77) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
+    Button 'btn-copy-document' ($w-116) 45 32 30 'copyDocument'
+    Label ([string][char]0xE8C8) ($w-108) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
+    Button 'btn-writing-tools' ($w-80) 45 28 30 'toggleMenu' '✧' '' 'writing'
     Button 'btn-settings-toggle' ($w-40) 43 32 32 'openSettings' '' 'gear'
     if($settings.showStatusBar){
         $y=$ui.Height-37;if(-not $settings.gradientEnabled){$graphics.Fill(0,$y,$w,37,(Surface-Color 'bg-statusbar'),0)}
@@ -14389,39 +14341,6 @@ function Toggle-Control([string]$Key,[double]$X,[double]$Y){
     $graphics.Fill(($X+3+$(if($on){18}else{0})),($Y+$(if($on){5}else{6})),($(if($on){14}else{12})),($(if($on){14}else{12})),$knob,7)
     Label $(if($on){'On'}else{'Off'}) ($X+50) ($Y+4) 28 (Color 'text-primary') 13
 }
-function Paint-Comparison {
-    $w=$ui.Width;$h=$ui.Height
-    $graphics.Fill(0,0,$w,$h,(Surface-Color 'bg-window'),0);Node 'comparison-view' 0 0 $w $h 'none' $null 'default'
-    Button 'comparison-back' 8 4 32 32 'back' '' 'back'
-    Label 'Notepad-PS1' 52 12 220 (Color 'text-primary') 12
-    Button 'comparison-minimize' ($w-138) 0 46 40 'minimize' '' 'minimize' $null $false $false 10
-    Button 'comparison-maximize' ($w-92) 0 46 40 'maximize' '' 'maximize' $null $false $false 10
-    Button 'comparison-close' ($w-46) 0 46 40 'back' '' 'close' $null $false $false 10
-    Label 'Compare with Windows Notepad' 32 59 ([Math]::Max(280,$w-380)) (Color 'text-primary') 24 'Segoe UI' 600
-    $running=$null -ne $ui.ComparisonProcess
-    Button 'comparison-run' ($w-334) 58 142 34 'runComparison' $(if($running){'Running...'}else{'Run comparison'}) '' $null $true $true
-    Button 'comparison-refresh' ($w-180) 58 148 34 'refreshComparison' 'Refresh baseline' '' $null $false $true
-    Label $ui.ComparisonStatus 32 105 ($w-64) (Color 'text-secondary') 12
-    $left=32;$total=$w-64;$positions=@(0.0,0.29,0.44,0.59,0.74);$widths=@(0.29,0.15,0.15,0.15,0.26)
-    $headers=@('Property','Windows','Reference','PowerShell','Verdict')
-    for($i=0;$i -lt $headers.Count;$i++){Label $headers[$i] ($left+$total*$positions[$i]) 140 ($total*$widths[$i]-8) (Color 'text-primary') 13 'Segoe UI' 600}
-    $graphics.Fill(32,164,$total,1,(Color 'border-subtle'),0)
-    $bodyHeight=[Math]::Max(1,$h-215);$ui.ComparisonExtent=$ui.ComparisonRows.Count*32
-    $graphics.Clip(24,170,($w-48),$bodyHeight);$ui.HitClip=@(24,170,($w-48),$bodyHeight)
-    $y=174-$ui.ComparisonScroll
-    foreach($row in $ui.ComparisonRows){
-        $values=@($row.Property,$row.Real,$row.Reference,$row.PS1,$row.Verdict)
-        for($i=0;$i -lt $values.Count;$i++){
-            $color=if($i -eq 4){switch($row.Verdict){'TRUE'{'#4caa3d'};'FALSE'{'#e57a88'};'CONTESTED'{'#cda023'};default{Color 'text-secondary'}}}else{Color 'text-primary'}
-            $value=if($null -eq $values[$i]){'—'}else{[string]$values[$i]}
-            Label $value ($left+$total*$positions[$i]) $y ($total*$widths[$i]-8) $color 13
-        }
-        $y+=32
-    }
-    if(-not $ui.ComparisonRows.Count){Label 'Run a comparison to collect the three bearings.' 32 $y ($w-64) (Color 'text-secondary') 14}
-    $graphics.Unclip();$ui.HitClip=$null
-    Label 'UNKNOWN means unmeasured. Refresh baseline opens an instrument-owned Windows Notepad window.' 32 ($h-31) ($w-64) (Color 'text-secondary') 12
-}
 function Paint-ColorControls([double]$X,[double]$Y,[double]$W){
     $names=@('Black','Red','Green','Yellow','Blue','Purple','Cyan','White')
     $roles=@(@('foreground','Foreground'),@('tabs','Tabs'),@('cursor','Cursor color'),@('selectionBackground','Selection background'),@('topLeft','Top left'),@('topRight','Top right'),@('bottomLeft','Bottom left'),@('bottomRight','Bottom right'))
@@ -14437,7 +14356,6 @@ function Paint-ColorControls([double]$X,[double]$Y,[double]$W){
 }
 function Paint-Settings {
     if(-not $ui.Settings){return}
-    if($ui.ComparisonView){Paint-Comparison;return}
     $w=$ui.Width;$h=$ui.Height;if(-not $settings.gradientEnabled){$graphics.Fill(0,0,$w,$h,(Surface-Color 'bg-window'),0)};Node 'settings-view' 0 0 $w $h 'none' $null 'default'
     $graphics.Fill(0,39.2,$w,0.8,(Color 'border-subtle'),0)
     Button 'settings-btn-back' 8 4 32 32 'back' '' 'back';Paint-AppIcon 'settings-app-icon' 48 11 18;Label 'Notepad' 88 12 200 (Color 'text-primary') 12
@@ -14523,10 +14441,7 @@ function Paint-Settings {
     Label 'Built by MansfieldPlumbing · 2026' $left ($y+53) $col (Color 'text-secondary') 12
     $y+=86
     foreach($link in @(@('MansfieldPlumbing / JS2PS','https://github.com/MansfieldPlumbing/JS2PS'),@('MansfieldPlumbing / QuickPS','https://github.com/MansfieldPlumbing/QuickPS'))){Label $link[0] $left $y $col (Color 'text-link') 13;Node ('link-'+$y) $left $y $col 20 'link' $link[1];$y+=27}
-    $y+=24;Label 'Conformance' $left $y $col (Color 'text-primary') 14 'Segoe UI' 600
-    Label 'Compare the three renderings and inspect the evidence.' $left ($y+27) $col (Color 'text-secondary') 12
-    Button 'btn-open-comparison' $left ($y+55) 238 34 'openComparison' 'Compare with Windows Notepad' '' $null $false $true
-    $y+=100
+    $y+=24
     if($ui.AppearanceError){Label $ui.AppearanceError $left $y $col '#e57a88' 12;$y+=40}
     $ui.SettingsExtent=$y+60+$ui.SettingsScroll-40
     $graphics.Unclip();$ui.HitClip=$null
@@ -14628,13 +14543,8 @@ function Editor-Hit([double]$X,[double]$Y,[bool]$Extend=$false){
 }
 function Key-Input([NotepadWindowEvent]$Event){
     $key=[int]$Event.W;$ctrl=$Event.Ctrl;$shift=$Event.Shift
-    if($key -eq 27){if($ui.Dropdown){$ui.Dropdown=$null}elseif($ui.ColorPicker){$ui.ColorPicker=$null;$ui.Focus='settings';Persist}elseif($ui.Modal){$ui.Modal=$null;$ui.Focus='editor-area'}elseif($ui.ComparisonView){$ui.ComparisonView=$false;$ui.Focus='settings'}elseif($ui.Menu){$ui.Menu='';$ui.Submenu=''}elseif($ui.Find){$ui.Find=$false;$ui.Focus='editor-area'}elseif($ui.Settings){$ui.Settings=$false;$ui.Focus='editor-area'};Invalidate;return}
+    if($key -eq 27){if($ui.Dropdown){$ui.Dropdown=$null}elseif($ui.ColorPicker){$ui.ColorPicker=$null;$ui.Focus='settings';Persist}elseif($ui.Modal){$ui.Modal=$null;$ui.Focus='editor-area'}elseif($ui.Menu){$ui.Menu='';$ui.Submenu=''}elseif($ui.Find){$ui.Find=$false;$ui.Focus='editor-area'}elseif($ui.Settings){$ui.Settings=$false;$ui.Focus='editor-area'};Invalidate;return}
     if($ui.ColorPicker -and $key -eq 9){$fields=@('picker-input-hex','picker-input-c0','picker-input-c1','picker-input-c2');$index=[array]::IndexOf($fields,$ui.Focus);$index=($index+$(if($shift){3}else{1}))%4;Focus-Input $fields[$index];Invalidate;return}
-    if($ui.ComparisonView){
-        if($key -eq 116){Start-Comparison}
-        elseif($key -in @(33,34,38,40)){$step=if($key -in @(33,34)){240}else{32};if($key -in @(33,38)){$step=-$step};$ui.ComparisonScroll=[Math]::Clamp($ui.ComparisonScroll+$step,0,[Math]::Max(0,$ui.ComparisonExtent-($ui.Height-215)));Invalidate}
-        return
-    }
     if($ui.Focus -eq 'opacity-slider' -and $key -in @(37,39,36,35,33,34)){
         $settings.backgroundOpacity=switch($key){36{0};35{100};37{[Math]::Max(0,[int]$settings.backgroundOpacity-1)};39{[Math]::Min(100,[int]$settings.backgroundOpacity+1)};33{[Math]::Min(100,[int]$settings.backgroundOpacity+10)};34{[Math]::Max(0,[int]$settings.backgroundOpacity-10)}}
         Persist;Invalidate;return
@@ -14707,7 +14617,6 @@ function Handle-Event([NotepadWindowEvent]$Event){
         if($ui.ColorPicker){$ui.ColorPicker.Scroll=[Math]::Clamp($ui.ColorPicker.Scroll-$delta/120*48,0,[Math]::Max(0,528-$ui.ColorPicker.VisibleHeight));Invalidate}
         elseif($Event.Ctrl -and $Event.Shift){$settings.backgroundOpacity=[Math]::Clamp([int]$settings.backgroundOpacity+$(if($delta -gt 0){5}else{-5}),0,100);Persist;Invalidate}
         elseif($Event.Ctrl){Command $(if($delta -gt 0){'zoomIn'}else{'zoomOut'})}
-        elseif($ui.ComparisonView){$ui.ComparisonScroll=[Math]::Clamp($ui.ComparisonScroll-$delta/120*72,0,[Math]::Max(0,$ui.ComparisonExtent-($ui.Height-215)));Invalidate}
         elseif($ui.Settings){$ui.SettingsScroll=[Math]::Clamp($ui.SettingsScroll-$delta/120*72,0,[Math]::Max(0,$ui.SettingsExtent-$ui.Height+40));Invalidate}
         elseif(-not $ui.Modal){$tab=$model.Active();$tab.ScrollY=[Math]::Max(0,$tab.ScrollY-$delta/120*64);$ui.EnsureCaret=$false;Invalidate}
         $ui.ScrollSequence++;Invalidate;return
@@ -14751,7 +14660,6 @@ function Handle-Event([NotepadWindowEvent]$Event){
 }
 
 Resolve-Theme
-if($ui.ComparisonView){Load-ComparisonResults}
 try{
     $window=Invoke-Window.Windows -Width $Width -Height $Height
     $info=$window.Info();$ui.Dpi=$info.Dpi;$ui.Width=$info.Width*96/$info.Dpi;$ui.Height=$info.Height*96/$info.Dpi
@@ -14770,7 +14678,6 @@ try{
     else{$ui.EntranceStatus='Skipped'}
     while($ui.Running -and $window.Info().Alive){
         foreach($event in @($window.Drain())){Handle-Event $event}
-        Update-Comparison
         $now=[DateTime]::UtcNow
         if($ui.Hover -eq 'btn-copy-document' -and -not $ui.TooltipShown -and ($now-$ui.HoverSince).TotalMilliseconds -ge 450){$ui.TooltipShown=$true;Invalidate}
         if($ui.EntranceStatus -eq 'Animating'){
