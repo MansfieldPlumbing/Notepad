@@ -13938,10 +13938,10 @@ function InputBox([string]$Id,[string]$Value,[double]$X,[double]$Y,[double]$W,[s
         if($Value){$graphics.DrawLayout($layout,($X+8-$offset),$originY,(Color 'text-primary'))}else{Label $Placeholder ($X+8) $originY ($W-16) (Color 'text-secondary') 13}
     }finally{$graphics.ReleaseLayout($layout);$graphics.Unclip()}
 }
-function Open-Modal([string]$Title,[string]$Message,[NotepadModalButton[]]$Buttons,[bool]$Input=$false,[string]$Value=''){
+function Open-Modal([string]$Title,[string]$Message,[NotepadModalButton[]]$Buttons,[bool]$HasInput=$false,[string]$Value=''){
     $ui.ColorPicker=$null
-    $ui.Menu='';$ui.Dropdown=$null;$ui.Modal=[NotepadModal]@{Title=$Title;Message=$Message;Buttons=$Buttons;Input=$Input;Value=$Value}
-    if($Input){$ui.Focus='dialog-input';$ui.InputAnchor=0;$ui.InputFocus=$Value.Length}else{$ui.Focus='modal'}
+    $ui.Menu='';$ui.Dropdown=$null;$ui.Modal=[NotepadModal]@{Title=$Title;Message=$Message;Buttons=$Buttons;Input=$HasInput;Value=$Value}
+    if($HasInput){$ui.Focus='dialog-input';$ui.InputAnchor=0;$ui.InputFocus=$Value.Length}else{$ui.Focus='modal'}
     Invalidate
 }
 function Save-Document([object]$Tab,[bool]$SaveAs=$false){
