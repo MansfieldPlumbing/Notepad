@@ -13773,7 +13773,7 @@ class NotepadSettings {
         $copy = [NotepadSettings]::new()
         foreach ($name in $this.SettingNames()) {
             $value = $this.Get($name)
-            if ($value -is [string[]]) { $value = [string[]]$value.Clone() }
+            if ($value -is [string[]]) { $value = ([string[]]$value).Clone() }
             $copy.Set($name, $value)
         }
         return $copy
@@ -13813,7 +13813,7 @@ class NotepadSettings {
         $others.Sort([StringComparer]::OrdinalIgnoreCase)
         $roles.AddRange($others)
         foreach ($role in $roles) {
-            $default = $null
+            [string]$default = ''
             $same = $Defaults.colors.TryGetValue($role, [ref]$default) -and [string]::Equals($this.colors[$role], $default, [StringComparison]::Ordinal)
             $Writer.WriteLine($(if ($same) { ';' } else { '' }) + $role + '=' + $this.colors[$role])
         }
