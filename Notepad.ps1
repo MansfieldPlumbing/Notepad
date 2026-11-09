@@ -53,7 +53,7 @@ class NotepadFind {
 }
 
 class NotepadModelState {
-    [hashtable]$Settings
+    [NotepadSettings]$Settings
     [Collections.Generic.List[NotepadTab]]$Tabs = [Collections.Generic.List[NotepadTab]]::new()
     [int]$ActiveId = 0
     [int]$NextId = 1
@@ -76,7 +76,7 @@ class NotepadSaved {
 class NotepadModel {
     hidden [NotepadModelState]$modelState
 
-    NotepadModel([hashtable]$Settings) { $this.modelState = [NotepadModelState]::new(); $this.modelState.Settings = $Settings }
+    NotepadModel([NotepadSettings]$Settings) { $this.modelState = [NotepadModelState]::new(); $this.modelState.Settings = $Settings }
 
     [NotepadModelState] State() { return $this.modelState }
 
@@ -385,7 +385,7 @@ class NotepadModel {
 
 function Invoke-Model {
 [CmdletBinding()]
-param([hashtable]$Settings=@{})
+param([NotepadSettings]$Settings=$null)
 if($MyInvocation.InvocationName -eq '.'){throw 'Invoke Model.ps1 with &.'}
 [NotepadModel]::new($Settings)
 }
@@ -13632,16 +13632,105 @@ if ($Compare) {
     Invoke-NotepadComparison -EvidenceDirectory $EvidenceDirectory -RefreshReal:$RefreshReal -SkipBrowser:$SkipBrowser -KeepProbeOpen:$KeepProbeOpen -ExtractTypeScript:$ExtractTypeScript -BuildTypeScript:$BuildTypeScript -BuildDesign:$BuildDesign -VerifyNativeFeatures:$VerifyNativeFeatures -CatalogIcons:$CatalogIcons
     return
 }
+# The user's settings, one typed property per setting, named as the saved JSON names them. Get and Set reach a
+# setting by a name known only at run time (a toggle, a dropdown, the saved file), case-insensitively as the
+# hashtable did; Set converts the value to the setting's type, as an assignment to the property does.
+class NotepadSettings {
+    [string]$theme
+    [string]$fontFamily
+    [string]$fontStyle
+    [string]$fontSize
+    [bool]$wordWrap
+    [bool]$formatting
+    [string]$openingFiles
+    [string]$startupOption
+    [bool]$recentFilesEnabled
+    [bool]$spellCheck
+    [bool]$showStatusBar
+    [int]$zoom
+    [string]$backdrop
+    [string]$cornerStyle
+    [bool]$copyAsFile
+    [int]$backgroundOpacity
+    [bool]$gradientEnabled
+    [Collections.Generic.Dictionary[string,string]]$colors
+    [string[]]$ansiColors
+    [string]$windowIcon
+
+    # A colour table keyed by role, case-insensitively, from any dictionary of role to colour text.
+    static [Collections.Generic.Dictionary[string,string]] ColorTable([Collections.IDictionary]$Source) {
+        $table = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($role in $Source.Keys) { $table[[string]$role] = [string]$Source[$role] }
+        return $table
+    }
+
+    [string[]] SettingNames() {
+        return [string[]]@('theme','fontFamily','fontStyle','fontSize','wordWrap','formatting','openingFiles','startupOption','recentFilesEnabled','spellCheck','showStatusBar','zoom','backdrop','cornerStyle','copyAsFile','backgroundOpacity','gradientEnabled','colors','ansiColors','windowIcon')
+    }
+
+    [object] Get([string]$Name) {
+        switch ($Name) {
+            'theme' { return $this.theme }
+            'fontFamily' { return $this.fontFamily }
+            'fontStyle' { return $this.fontStyle }
+            'fontSize' { return $this.fontSize }
+            'wordWrap' { return $this.wordWrap }
+            'formatting' { return $this.formatting }
+            'openingFiles' { return $this.openingFiles }
+            'startupOption' { return $this.startupOption }
+            'recentFilesEnabled' { return $this.recentFilesEnabled }
+            'spellCheck' { return $this.spellCheck }
+            'showStatusBar' { return $this.showStatusBar }
+            'zoom' { return $this.zoom }
+            'backdrop' { return $this.backdrop }
+            'cornerStyle' { return $this.cornerStyle }
+            'copyAsFile' { return $this.copyAsFile }
+            'backgroundOpacity' { return $this.backgroundOpacity }
+            'gradientEnabled' { return $this.gradientEnabled }
+            'colors' { return $this.colors }
+            'ansiColors' { return $this.ansiColors }
+            'windowIcon' { return $this.windowIcon }
+        }
+        throw [ArgumentException]::new("No setting is named '$Name'.")
+    }
+
+    [void] Set([string]$Name, [object]$Value) {
+        switch ($Name) {
+            'theme' { $this.theme = $Value; return }
+            'fontFamily' { $this.fontFamily = $Value; return }
+            'fontStyle' { $this.fontStyle = $Value; return }
+            'fontSize' { $this.fontSize = $Value; return }
+            'wordWrap' { $this.wordWrap = $Value; return }
+            'formatting' { $this.formatting = $Value; return }
+            'openingFiles' { $this.openingFiles = $Value; return }
+            'startupOption' { $this.startupOption = $Value; return }
+            'recentFilesEnabled' { $this.recentFilesEnabled = $Value; return }
+            'spellCheck' { $this.spellCheck = $Value; return }
+            'showStatusBar' { $this.showStatusBar = $Value; return }
+            'zoom' { $this.zoom = $Value; return }
+            'backdrop' { $this.backdrop = $Value; return }
+            'cornerStyle' { $this.cornerStyle = $Value; return }
+            'copyAsFile' { $this.copyAsFile = $Value; return }
+            'backgroundOpacity' { $this.backgroundOpacity = $Value; return }
+            'gradientEnabled' { $this.gradientEnabled = $Value; return }
+            'colors' { $this.colors = [NotepadSettings]::ColorTable($Value); return }
+            'ansiColors' { $this.ansiColors = $Value; return }
+            'windowIcon' { $this.windowIcon = $Value; return }
+        }
+        throw [ArgumentException]::new("No setting is named '$Name'.")
+    }
+}
 $design=Invoke-Design
-$settings=$design.DefaultSettings.Clone()
+[NotepadSettings]$settings=[NotepadSettings]::new()
+foreach($key in $design.DefaultSettings.Keys){$settings.Set($key,$design.DefaultSettings[$key])}
 $settings.backdrop='mica';$settings.cornerStyle='curved';$settings.copyAsFile=$false
 $settings.backgroundOpacity=85;$settings.gradientEnabled=$false
-$settings.colors=@{foreground='';tabs='';cursor='';selectionBackground='';topLeft='#272727';topRight='#272727';bottomLeft='#272727';bottomRight='#272727'}
+$settings.colors=[NotepadSettings]::ColorTable(@{foreground='';tabs='';cursor='';selectionBackground='';topLeft='#272727';topRight='#272727';bottomLeft='#272727';bottomRight='#272727'})
 $settings.ansiColors=@('#0C0C0C','#C50F1F','#13A10E','#C19C00','#0037DA','#881798','#3A96DD','#CCCCCC','#767676','#E74856','#16C60C','#F9F1A5','#3B78FF','#B4009E','#61D6D6','#F2F2F2')
 $settings.windowIcon='default'
 $store=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'NotepadPS1'
 if(-not $NoSession -and (Test-Path "$store\settings.json")){
-    try{$saved=Get-Content "$store\settings.json" -Raw|ConvertFrom-Json -AsHashtable;foreach($key in $settings.Keys.Clone()){if($saved.ContainsKey($key)){$settings[$key]=$saved[$key]}}}catch{Write-Warning 'Saved settings could not be loaded; using defaults.'}
+    try{$saved=Get-Content "$store\settings.json" -Raw|ConvertFrom-Json -AsHashtable;foreach($key in $settings.SettingNames()){if($saved.ContainsKey($key)){$settings.Set($key,$saved[$key])}}}catch{Write-Warning 'Saved settings could not be loaded; using defaults.'}
 }
 if($Backdrop){$settings.backdrop=$Backdrop};if($CornerStyle){$settings.cornerStyle=$CornerStyle}
 [NotepadModel]$model=Invoke-Model -Settings $settings
@@ -13998,7 +14087,7 @@ function Command([string]$Action,[object]$Data=$null){
         'editAnsi'{Open-CanvasColorPicker '' ([int]$Data)}
         'cycleIcon'{Initialize-IconCatalog;$index=[array]::IndexOf(@($ui.IconCatalog|ForEach-Object Key),$settings.windowIcon);$settings.windowIcon=$ui.IconCatalog[($index+1)%$ui.IconCatalog.Count].Key;Apply-WindowIcon}
         'resetIcon'{$settings.windowIcon='default';Apply-WindowIcon}
-        'resetColors'{$settings.colors=@{foreground='';tabs='';cursor='';selectionBackground='';topLeft='#272727';topRight='#272727';bottomLeft='#272727';bottomRight='#272727'};$settings.gradientEnabled=$false}
+        'resetColors'{$settings.colors=[NotepadSettings]::ColorTable(@{foreground='';tabs='';cursor='';selectionBackground='';topLeft='#272727';topRight='#272727';bottomLeft='#272727';bottomRight='#272727'});$settings.gradientEnabled=$false}
         'formatBold'{Format-Selection '**'}
         'formatItalic'{Format-Selection '_'}
         'formatStrike'{Format-Selection '~~'}
@@ -14035,10 +14124,10 @@ function Command([string]$Action,[object]$Data=$null){
         'openFontSettings'{$ui.Settings=$true;$ui.Expanded['card-font-setting']=$true;$ui.SettingsScroll=0;$ui.Focus='settings'}
         'back'{if($ui.ComparisonView){$ui.ComparisonView=$false;$ui.Focus='settings'}else{$ui.Settings=$false;$ui.Dropdown=$null;$ui.Focus='editor-area'}}
         'accordion'{$ui.Expanded[$Data]=-not $ui.Expanded[$Data]}
-        'toggleSetting'{$settings[$Data]=-not $settings[$Data]}
+        'toggleSetting'{$settings.Set($Data,(-not $settings.Get($Data)))}
         'startup'{$settings.startupOption=$Data}
         'settingSelect'{$ui.Dropdown=[NotepadDropdown]@{Key=$Data.Key;Options=$Data.Options;Rect=$Data.Rect;Id=$Data.Id}}
-        'chooseSetting'{if($Data.Key -eq 'pickerMode'){$ui.ColorPicker.Mode=$Data.Value;$ui.Focus='color-picker';Sync-ColorPickerInputs}else{$settings[$Data.Key]=$Data.Value};$ui.Dropdown=$null;if($Data.Key -eq 'theme'){Resolve-Theme};if($Data.Key -in @('theme','backdrop','cornerStyle')){Apply-WindowAppearance}}
+        'chooseSetting'{if($Data.Key -eq 'pickerMode'){$ui.ColorPicker.Mode=$Data.Value;$ui.Focus='color-picker';Sync-ColorPickerInputs}else{$settings.Set($Data.Key,$Data.Value)};$ui.Dropdown=$null;if($Data.Key -eq 'theme'){Resolve-Theme};if($Data.Key -in @('theme','backdrop','cornerStyle')){Apply-WindowAppearance}}
         'pickerMode'{$ui.Dropdown=[NotepadDropdown]@{Key='pickerMode';Options=[NotepadOption[]]@(@{Text='RGB';Value='RGB'},@{Text='HSV';Value='HSV'});Rect=$ui.ColorPicker.ModeRect;Id='picker-mode'}}
         'toggleMenu'{$ui.Menu=if($ui.Menu -eq $Data){''}else{$Data};$ui.Submenu=''}
         'submenu'{$ui.Submenu=$Data}
@@ -14284,14 +14373,14 @@ function Paint-Menus {
     Paint-MenuRows $rows $x 80 260 ('flyout-'+$ui.Menu)
 }
 function Select-Control([string]$Id,[string]$Key,[NotepadOption[]]$Options,[double]$X,[double]$Y,[double]$W){
-    $text=[string]$settings[$Key];foreach($option in $Options){if($option.Value -eq $settings[$Key]){$text=$option.Text;break}}
+    $text=[string]$settings.Get($Key);foreach($option in $Options){if($option.Value -eq $settings.Get($Key)){$text=$option.Text;break}}
     $data=@{Id=$Id;Key=$Key;Options=$Options;Rect=@($X,$Y,$W,32)}
     Button $Id $X $Y $W 32 'settingSelect' '' '' $data $false $true
     Label $text ($X+12) ($Y+7) ($W-36) (Color 'text-primary') 13
     Icon 'chevronDown' ($X+$W-22) ($Y+10) 12 '#9d9d9d'
 }
 function Toggle-Control([string]$Key,[double]$X,[double]$Y){
-    $on=[bool]$settings[$Key];$id='toggle-setting-'+$Key
+    $on=[bool]$settings.Get($Key);$id='toggle-setting-'+$Key
     Node $id $X $Y 78 24 'toggleSetting' $Key
     $track=if($on){Color 'accent-color'}elseif($ui.Theme -eq 'light'){'#e0e0e0'}else{'#333333'}
     $border=if($on){Color 'accent-color'}elseif($ui.Theme -eq 'light'){'#999999'}else{'#777777'}
@@ -14447,7 +14536,7 @@ function Paint-Dropdown {
     if(-not $ui.Dropdown){return}
     $drop=$ui.Dropdown;$r=$drop.Rect;$height=$drop.Options.Count*28+8;$y=$r[1]+$r[3]+2
     if($y+$height -gt $ui.Height-8){$y=[Math]::Max(42,$r[1]-$height-2)}
-    $current=if($drop.Key -eq 'pickerMode'){$ui.ColorPicker.Mode}else{$settings[$drop.Key]}
+    $current=if($drop.Key -eq 'pickerMode'){$ui.ColorPicker.Mode}else{$settings.Get($drop.Key)}
     $rows=@(foreach($option in $drop.Options){@{Text=$option.Text;Action='chooseSetting';Data=@{Key=$drop.Key;Value=$option.Value};Checked=($current -eq $option.Value)}})
     Paint-MenuRows $rows $r[0] $y ([Math]::Max(160,$r[2])) ('dropdown-'+$drop.Key)
 }
