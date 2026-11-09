@@ -13653,6 +13653,57 @@ if(-not $state.Tabs.Count){$null=$model.NewTab()}
 if($Path){$null=$model.Open($Path);if($state.Tabs[0].Text -eq '' -and $state.Tabs.Count -eq 2){$model.CloseTab($state.Tabs[0].Id)}}
 $native=Invoke-Native
 [NotepadWindow]$window=$null;[NotepadGraphics]$graphics=$null;$services=$null
+# A choice in a dropdown: the text shown and the setting value it stands for.
+class NotepadOption {
+    [string]$Text
+    [string]$Value
+}
+# An open dropdown: the setting it chooses, its choices, and the control it hangs from.
+class NotepadDropdown {
+    [string]$Key
+    [NotepadOption[]]$Options
+    [double[]]$Rect
+    [string]$Id
+}
+# A modal dialog button: the command it runs and that command's data (a tab id, or none).
+class NotepadModalButton {
+    [string]$Text
+    [string]$Action
+    [Nullable[int]]$Data
+    [bool]$Primary
+}
+# A modal dialog. Markdown is $null unless the dialog previews a document.
+class NotepadModal {
+    [string]$Title
+    [string]$Message
+    [NotepadModalButton[]]$Buttons
+    [bool]$Input
+    [string]$Value
+    [string]$Markdown
+}
+# The canvas color picker: the color in HSV and RGB, the text in its inputs, and where it is drawn.
+class NotepadColorPicker {
+    [string]$Role
+    [int]$Ansi
+    [double]$H
+    [double]$S
+    [double]$V
+    [string]$Hex
+    [int]$R
+    [int]$G
+    [int]$B
+    [string]$Mode
+    [Collections.Generic.Dictionary[string,string]]$Inputs
+    [double[]]$Anchor
+    [double]$Scroll
+    [string]$Invalid
+    [DateTime]$OpenedUtc
+    [double[]]$PanelRect
+    [double[]]$SpectrumRect
+    [double[]]$ValueRect
+    [double[]]$ModeRect
+    [double]$VisibleHeight
+}
 # The interface state. A value-type member that starts unset is Nullable: it reads $null until first set.
 class NotepadUi {
     [bool]$Dirty
@@ -13667,8 +13718,8 @@ class NotepadUi {
     [double]$SettingsScroll
     [bool]$Find
     [bool]$Replace
-    [hashtable]$Modal
-    [hashtable]$Dropdown
+    [NotepadModal]$Modal
+    [NotepadDropdown]$Dropdown
     [bool]$Drag
     [bool]$Blink
     [datetime]$LastBlink
@@ -13706,7 +13757,7 @@ class NotepadUi {
     [Nullable[bool]]$TooltipShown
     [Nullable[bool]]$Minimized
     [Nullable[bool]]$SliderDrag
-    [hashtable]$ColorPicker
+    [NotepadColorPicker]$ColorPicker
     [string]$ColorDrag
     [string]$ComparisonLog
     [string]$ComparisonError
@@ -13887,9 +13938,9 @@ function InputBox([string]$Id,[string]$Value,[double]$X,[double]$Y,[double]$W,[s
         if($Value){$graphics.DrawLayout($layout,($X+8-$offset),$originY,(Color 'text-primary'))}else{Label $Placeholder ($X+8) $originY ($W-16) (Color 'text-secondary') 13}
     }finally{$graphics.ReleaseLayout($layout);$graphics.Unclip()}
 }
-function Open-Modal([string]$Title,[string]$Message,[object[]]$Buttons,[bool]$Input=$false,[string]$Value=''){
+function Open-Modal([string]$Title,[string]$Message,[NotepadModalButton[]]$Buttons,[bool]$Input=$false,[string]$Value=''){
     $ui.ColorPicker=$null
-    $ui.Menu='';$ui.Dropdown=$null;$ui.Modal=@{Title=$Title;Message=$Message;Buttons=$Buttons;Input=$Input;Value=$Value;Markdown=$null}
+    $ui.Menu='';$ui.Dropdown=$null;$ui.Modal=[NotepadModal]@{Title=$Title;Message=$Message;Buttons=$Buttons;Input=$Input;Value=$Value}
     if($Input){$ui.Focus='dialog-input';$ui.InputAnchor=0;$ui.InputFocus=$Value.Length}else{$ui.Focus='modal'}
     Invalidate
 }
@@ -13969,9 +14020,9 @@ function Command([string]$Action,[object]$Data=$null){
         'accordion'{$ui.Expanded[$Data]=-not $ui.Expanded[$Data]}
         'toggleSetting'{$settings[$Data]=-not $settings[$Data]}
         'startup'{$settings.startupOption=$Data}
-        'settingSelect'{$ui.Dropdown=@{Key=$Data.Key;Options=$Data.Options;Rect=$Data.Rect;Id=$Data.Id}}
+        'settingSelect'{$ui.Dropdown=[NotepadDropdown]@{Key=$Data.Key;Options=$Data.Options;Rect=$Data.Rect;Id=$Data.Id}}
         'chooseSetting'{if($Data.Key -eq 'pickerMode'){$ui.ColorPicker.Mode=$Data.Value;$ui.Focus='color-picker';Sync-ColorPickerInputs}else{$settings[$Data.Key]=$Data.Value};$ui.Dropdown=$null;if($Data.Key -eq 'theme'){Resolve-Theme};if($Data.Key -in @('theme','backdrop','cornerStyle')){Apply-WindowAppearance}}
-        'pickerMode'{$ui.Dropdown=@{Key='pickerMode';Options=@(@{Text='RGB';Value='RGB'},@{Text='HSV';Value='HSV'});Rect=$ui.ColorPicker.ModeRect;Id='picker-mode'}}
+        'pickerMode'{$ui.Dropdown=[NotepadDropdown]@{Key='pickerMode';Options=[NotepadOption[]]@(@{Text='RGB';Value='RGB'},@{Text='HSV';Value='HSV'});Rect=$ui.ColorPicker.ModeRect;Id='picker-mode'}}
         'toggleMenu'{$ui.Menu=if($ui.Menu -eq $Data){''}else{$Data};$ui.Submenu=''}
         'submenu'{$ui.Submenu=$Data}
         'minimize'{$window.Caption('minimize')}
@@ -14017,7 +14068,7 @@ function Commit-ColorPicker {
 function Open-CanvasColorPicker([string]$Role,[int]$Ansi=-1){
     $anchor=if($ui.Nodes.ContainsKey($ui.Pressed)){$ui.Nodes[$ui.Pressed].Rect}else{@(($ui.Width-60),80,32,32)}
     $hex=if($Ansi -ge 0){$settings.ansiColors[$Ansi]}else{Role-Color $Role}
-    $ui.ColorPicker=@{Role=$Role;Ansi=$Ansi;H=0.0;S=0.0;V=1.0;Hex=$hex;R=0;G=0;B=0;Mode='RGB';Inputs=@{};Anchor=$anchor;Scroll=0.0;Invalid='';OpenedUtc=[DateTime]::UtcNow}
+    $ui.ColorPicker=[NotepadColorPicker]@{Role=$Role;Ansi=$Ansi;H=0.0;S=0.0;V=1.0;Hex=$hex;R=0;G=0;B=0;Mode='RGB';Inputs=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase);Anchor=$anchor;Scroll=0.0;Invalid='';OpenedUtc=[DateTime]::UtcNow}
     $ui.Focus='color-picker';$ui.Dropdown=$null;Set-ColorPickerHex $hex;Sync-ColorPickerInputs;Invalidate
 }
 function Set-ColorPickerText([string]$Key,[string]$Value){
@@ -14215,7 +14266,7 @@ function Paint-Menus {
     $x=[Math]::Clamp([double]$x,8,[Math]::Max(8,$ui.Width-268))
     Paint-MenuRows $rows $x 80 260 ('flyout-'+$ui.Menu)
 }
-function Select-Control([string]$Id,[string]$Key,[object[]]$Options,[double]$X,[double]$Y,[double]$W){
+function Select-Control([string]$Id,[string]$Key,[NotepadOption[]]$Options,[double]$X,[double]$Y,[double]$W){
     $text=[string]$settings[$Key];foreach($option in $Options){if($option.Value -eq $settings[$Key]){$text=$option.Text;break}}
     $data=@{Id=$Id;Key=$Key;Options=$Options;Rect=@($X,$Y,$W,32)}
     Button $Id $X $Y $W 32 'settingSelect' '' '' $data $false $true
@@ -14437,7 +14488,7 @@ function Paint-CanvasColorPicker {
     $graphics.Circle(($vx+$vw*$p.V),($vy+6),7,(Color 'bg-control'),0);$graphics.Circle(($vx+$vw*$p.V),($vy+6),5,'#ffffff',0)
     $p.ModeRect=@(($x+16),($oy+328),120,36);Button 'picker-mode' ($x+16) ($oy+328) 120 36 'pickerMode' '' '' $null $false $true
     Label $p.Mode ($x+28) ($oy+337) 80 (Color 'text-primary') 16;Icon 'chevronDown' ($x+112) ($oy+341) 10
-    InputBox 'picker-input-hex' $p.Inputs.hex ($x+196) ($oy+328) 132 '' 36 16
+    InputBox 'picker-input-hex' $p.Inputs['hex']($x+196) ($oy+328) 132 '' 36 16
     $labels=if($p.Mode -eq 'RGB'){@('Red','Green','Blue')}else{@('Hue','Saturation','Value')}
     for($i=0;$i -lt 3;$i++){$iy=$oy+376+$i*48;InputBox ('picker-input-c'+$i) $p.Inputs['c'+$i] ($x+16) $iy 120 '' 36 16;Label $labels[$i] ($x+144) ($iy+8) 170 (Color 'text-primary') 16}
     $graphics.Unclip();$ui.HitClip=$oldClip
