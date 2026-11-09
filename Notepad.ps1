@@ -5,7 +5,7 @@ param(
     [switch]$RefreshReal,[switch]$SkipBrowser,[switch]$KeepProbeOpen,
     [switch]$ExtractTypeScript,[switch]$BuildTypeScript,[switch]$BuildDesign,[switch]$VerifyNativeFeatures,[switch]$CatalogIcons,
     [ValidateSet('editor','settings')][string]$StartPage='editor',
-    [ValidateSet('mica','acrylic','reverseMica')][string]$Backdrop,
+    [ValidateSet('solid','mica','acrylic','reverseMica')][string]$Backdrop,
     [ValidateSet('curved','straight')][string]$CornerStyle,[switch]$NoAnimation,
     [switch]$VerifyModel,[switch]$VerifyGraphics,[switch]$VerifyWindow
 )
@@ -946,11 +946,14 @@ class NotepadWindow {
         }
         finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($value) }
     }
-    [NotepadEntrance] BeginEntrance() {
+    # Starts the entrance: a fade in place, or with -Slide a fade while the window slides in from beyond the right edge
+    # of the screen.
+    [NotepadEntrance] BeginEntrance([bool]$Slide) {
         $null = [NotepadWindow]::GetWindowRect($this.hwnd, $this.scratch)
         $this.entranceX = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 0)
         $this.entranceY = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 4)
-        $this.entranceFrom = [NotepadWindow]::GetSystemMetrics(76) + [NotepadWindow]::GetSystemMetrics(78) + 24
+        $this.entranceFrom = $this.entranceX
+        if ($Slide) { $this.entranceFrom = [NotepadWindow]::GetSystemMetrics(76) + [NotepadWindow]::GetSystemMetrics(78) + 24 }
         $this.entranceStyle = [NotepadWindow]::GetWindowLongPtrW($this.hwnd, -20)
         $null = [NotepadWindow]::SetWindowLongPtrW($this.hwnd, -20, [IntPtr]($this.entranceStyle.ToInt64() -bor 0x80000))
         if ([NotepadWindow]::SetLayeredWindowAttributes($this.hwnd, [uint]0, [byte]0, [uint]2) -eq 0) { throw 'Could not initialize the window fade.' }
@@ -12760,7 +12763,7 @@ if ($VerifyNativeFeatures) {
         }
         for($i=0;$i -lt 100;$i++){if((Read-Replay).EntranceStatus -eq 'Completed'){break};Start-Sleep -Milliseconds 40}
         $entrance=Read-Replay
-        $replayChecks.Add([pscustomobject]@{Property='Painted offscreen fade entrance';Expected='Completed, alpha 0 to 255';Observed=$entrance.EntranceStatus;Verdict=if($entrance.EntranceStatus -eq 'Completed' -and $entrance.Entrance.FromX -gt $entrance.Entrance.ToX -and $entrance.EntranceSamples.Count -ge 2 -and $entrance.EntranceSamples[-1].Alpha -eq 255 -and $entrance.EntranceSamples[-1].X -eq $entrance.Entrance.ToX -and $entrance.EntranceRestore.OriginalStyle -eq $entrance.EntranceRestore.ObservedStyle){'TRUE'}else{'FALSE'}})
+        $replayChecks.Add([pscustomobject]@{Property='Painted offscreen fade entrance';Expected='Completed, alpha 0 to 255';Observed=$entrance.EntranceStatus;Verdict=if($entrance.EntranceStatus -eq 'Completed' -and $(if($entrance.Settings.entranceAnimation -eq 'slide'){$entrance.Entrance.FromX -gt $entrance.Entrance.ToX}else{$entrance.Entrance.FromX -eq $entrance.Entrance.ToX}) -and $entrance.EntranceSamples.Count -ge 2 -and $entrance.EntranceSamples[-1].Alpha -eq 255 -and $entrance.EntranceSamples[-1].X -eq $entrance.Entrance.ToX -and $entrance.EntranceRestore.OriginalStyle -eq $entrance.EntranceRestore.ObservedStyle){'TRUE'}else{'FALSE'}})
         $replayChecks.Add([pscustomobject]@{Property='DWM outline disabled';Expected=-2;Observed=$entrance.Appearance.BorderColor;Verdict=if($entrance.Appearance.BorderColor -eq -2){'TRUE'}else{'FALSE'}})
         Capture-Replay 'editor'
         Click-Replay 'app-icon'
@@ -13698,6 +13701,7 @@ class NotepadSettings {
     [Collections.Generic.Dictionary[string,string]]$colors
     [string[]]$ansiColors
     [string]$windowIcon
+    [string]$entranceAnimation
 
     # A colour table keyed by role, case-insensitively, from any dictionary of role to colour text.
     static [Collections.Generic.Dictionary[string,string]] ColorTable([Collections.IDictionary]$Source) {
@@ -13707,7 +13711,7 @@ class NotepadSettings {
     }
 
     [string[]] SettingNames() {
-        return [string[]]@('theme','fontFamily','fontStyle','fontSize','wordWrap','formatting','openingFiles','startupOption','recentFilesEnabled','spellCheck','showStatusBar','zoom','backdrop','cornerStyle','copyAsFile','backgroundOpacity','gradientEnabled','colors','ansiColors','windowIcon')
+        return [string[]]@('theme','fontFamily','fontStyle','fontSize','wordWrap','formatting','openingFiles','startupOption','recentFilesEnabled','spellCheck','showStatusBar','zoom','backdrop','cornerStyle','copyAsFile','backgroundOpacity','gradientEnabled','colors','ansiColors','windowIcon','entranceAnimation')
     }
 
     [object] Get([string]$Name) {
@@ -13732,6 +13736,7 @@ class NotepadSettings {
             'colors' { return $this.colors }
             'ansiColors' { return $this.ansiColors }
             'windowIcon' { return $this.windowIcon }
+            'entranceAnimation' { return $this.entranceAnimation }
         }
         throw [ArgumentException]::new("No setting is named '$Name'.")
     }
@@ -13758,6 +13763,7 @@ class NotepadSettings {
             'colors' { $this.colors = [NotepadSettings]::ColorTable($Value); return }
             'ansiColors' { $this.ansiColors = $Value; return }
             'windowIcon' { $this.windowIcon = $Value; return }
+            'entranceAnimation' { $this.entranceAnimation = $Value; return }
         }
         throw [ArgumentException]::new("No setting is named '$Name'.")
     }
@@ -13850,7 +13856,7 @@ class NotepadSettings {
 $design=Invoke-Design
 [NotepadSettings]$settings=[NotepadSettings]::new()
 foreach($key in $design.DefaultSettings.Keys){$settings.Set($key,$design.DefaultSettings[$key])}
-$settings.backdrop='mica';$settings.cornerStyle='curved';$settings.copyAsFile=$false
+$settings.backdrop='solid';$settings.entranceAnimation='fade';$settings.cornerStyle='curved';$settings.copyAsFile=$false
 $settings.backgroundOpacity=85;$settings.gradientEnabled=$false
 $settings.colors=[NotepadSettings]::ColorTable(@{foreground='';tabs='';cursor='';selectionBackground='';topLeft='#272727';topRight='#272727';bottomLeft='#272727';bottomRight='#272727'})
 $settings.ansiColors=@('#0C0C0C','#C50F1F','#13A10E','#C19C00','#0037DA','#881798','#3A96DD','#CCCCCC','#767676','#E74856','#16C60C','#F9F1A5','#3B78FF','#B4009E','#61D6D6','#F2F2F2')
@@ -14045,7 +14051,8 @@ function Apply-WindowAppearance {
     if(-not $window -or -not $graphics){return}
     try{
         $ui.Appearance=$window.Appearance($settings.backdrop,($ui.Theme -eq 'dark'),($settings.cornerStyle -eq 'curved'))
-        $ui.BackdropActive=$true;$ui.AppearanceError=''
+        # A solid window has no material behind it, so everything is painted opaque.
+        $ui.BackdropActive=$settings.backdrop -ne 'solid';$ui.AppearanceError=''
     }catch{$ui.BackdropActive=$false;$ui.AppearanceError=$_.Exception.Message}
     $graphics.CornerStyle(($settings.cornerStyle -eq 'curved'));Invalidate
 }
@@ -14514,7 +14521,8 @@ function Paint-Settings {
     $cards=@(
         @{Title='App theme';Subtitle='Select which app theme to display';Icon='theme';Key='theme';Select=@(@{Text='Dark';Value='dark'},@{Text='Light';Value='light'},@{Text='Use system setting';Value='system'});SelectWidth=170}
         # MansfieldPlumbing additions: native DWM material, geometry and whole-document clipboard.
-        @{Title='Window backdrop';Subtitle='Choose the material behind the window';Icon='theme';Key='backdrop';Select=@(@{Text='Mica';Value='mica'},@{Text='Acrylic';Value='acrylic'},@{Text='Reverse Mica';Value='reverseMica'});SelectWidth=170}
+        @{Title='Window backdrop';Subtitle='Choose the material behind the window';Icon='theme';Key='backdrop';Select=@(@{Text='Solid';Value='solid'},@{Text='Mica';Value='mica'},@{Text='Acrylic';Value='acrylic'},@{Text='Reverse Mica';Value='reverseMica'});SelectWidth=170}
+        @{Title='Opening animation';Subtitle='How the window appears when Notepad starts';Icon='theme';Key='entranceAnimation';Select=@(@{Text='Fade in';Value='fade'},@{Text='Slide in';Value='slide'});SelectWidth=170}
         @{Title='Background opacity';Subtitle='100% is opaque. Reduce to reveal the material.';Icon='theme';Slider=$true}
         @{Title='Four-corner gradient';Subtitle='Blend the four corner colors across the background';Icon='theme';Key='gradientEnabled';Toggle=$true}
         @{Title='Colors';Icon='theme';Accordion='card-colors-setting'}
@@ -14811,7 +14819,7 @@ try{
     Apply-WindowAppearance
     Apply-WindowIcon
     if(-not $NoAnimation){$ui.BackdropActive=$false}
-    if(-not $NoAnimation){$ui.Entrance=$window.BeginEntrance();$initialEntrance=$window.Entrance(0);$null=Entrance-Easing 0.5}
+    if(-not $NoAnimation){$ui.Entrance=$window.BeginEntrance(($settings.entranceAnimation -eq 'slide'));$initialEntrance=$window.Entrance(0);$null=Entrance-Easing 0.5}
     # Paint the entire first frame before the HWND becomes visible.
     Paint
     # A hidden PowerShell host can override the first ShowWindow call through STARTUPINFO.
