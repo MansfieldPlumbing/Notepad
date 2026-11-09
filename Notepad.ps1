@@ -13773,6 +13773,11 @@ class NotepadSettings {
         return $copy
     }
 
+    # The colour roles in the order the Settings page lists them; config.ini writes them in this order.
+    static [string[]] ColorRoles() {
+        return [string[]]@('foreground','tabs','cursor','selectionBackground','topLeft','topRight','bottomLeft','bottomRight')
+    }
+
     # A setting's value as config.ini writes it: true/false, invariant integers, text as it is.
     static [string] IniText([object]$Value) {
         if ($Value -is [bool]) { return $(if ($Value) { 'true' } else { 'false' }) }
@@ -13794,7 +13799,14 @@ class NotepadSettings {
         }
         $Writer.WriteLine()
         $Writer.WriteLine('[Colors]')
-        foreach ($role in $this.colors.Keys) {
+        # The Settings page's roles in its order, then any other role the table holds (one added by hand), by name.
+        $roles = [Collections.Generic.List[string]]::new()
+        foreach ($role in [NotepadSettings]::ColorRoles()) { if ($this.colors.ContainsKey($role)) { $roles.Add($role) } }
+        $others = [Collections.Generic.List[string]]::new()
+        foreach ($role in $this.colors.Keys) { if ($role -notin [NotepadSettings]::ColorRoles()) { $others.Add($role) } }
+        $others.Sort([StringComparer]::OrdinalIgnoreCase)
+        $roles.AddRange($others)
+        foreach ($role in $roles) {
             $default = $null
             $same = $Defaults.colors.TryGetValue($role, [ref]$default) -and [string]::Equals($this.colors[$role], $default, [StringComparison]::Ordinal)
             $Writer.WriteLine($(if ($same) { ';' } else { '' }) + $role + '=' + $this.colors[$role])
