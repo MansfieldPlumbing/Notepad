@@ -13704,6 +13704,21 @@ class NotepadColorPicker {
     [double[]]$ModeRect
     [double]$VisibleHeight
 }
+# A hit-test node: a rectangle drawn this frame, the command it runs and that command's data, the cursor over it, the
+# frame that drew it, and the clip it was drawn under ($null when unclipped).
+class NotepadHitNode {
+    [string]$Id
+    [double[]]$Rect
+    [string]$Action
+    [object]$Data
+    [string]$Cursor
+    [int]$Generation
+    [double[]]$Clip
+    # A shallow copy: the copy shares Rect, Clip and Data with this node.
+    [NotepadHitNode] Copy() {
+        return [NotepadHitNode]@{Id=$this.Id;Rect=$this.Rect;Action=$this.Action;Data=$this.Data;Cursor=$this.Cursor;Generation=$this.Generation;Clip=$this.Clip}
+    }
+}
 # The interface state. A value-type member that starts unset is Nullable: it reads $null until first set.
 class NotepadUi {
     [bool]$Dirty
@@ -13728,9 +13743,9 @@ class NotepadUi {
     [double]$Height
     [double]$Dpi
     [int]$Generation
-    [Collections.Generic.Dictionary[string,object]]$Nodes
-    [Collections.Generic.List[object]]$Hits
-    [Collections.Generic.List[object]]$NextHits
+    [Collections.Generic.Dictionary[string,NotepadHitNode]]$Nodes
+    [Collections.Generic.List[NotepadHitNode]]$Hits
+    [Collections.Generic.List[NotepadHitNode]]$NextHits
     [hashtable]$TextCache
     [IntPtr]$EditorLayout
     [string]$EditorKey
@@ -13775,7 +13790,7 @@ class NotepadUi {
     [Nullable[int]]$SettingsExtent
     [Nullable[datetime]]$EntranceStart
 }
-[NotepadUi]$ui=@{Dirty=$true;Running=$true;Hover='';Pressed='';Focus='editor-area';Menu='';Submenu='';Settings=$false;Expanded=@{};SettingsScroll=0.0;Find=$false;Replace=$false;Modal=$null;Dropdown=$null;Drag=$false;Blink=$true;LastBlink=[DateTime]::UtcNow;LastSession=[DateTime]::UtcNow;Width=0.0;Height=0.0;Dpi=96.0;Generation=0;Nodes=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal);Hits=[Collections.Generic.List[object]]::new();NextHits=$null;TextCache=@{};EditorLayout=[IntPtr]::Zero;EditorKey='';EditorOrigin=@(16.0,92.0);EditorRect=@(0,78,1280,614);EnsureCaret=$true;InputAnchor=0;InputFocus=0;InputBuffers=@{};PendingHigh='';Focused=$true}
+[NotepadUi]$ui=@{Dirty=$true;Running=$true;Hover='';Pressed='';Focus='editor-area';Menu='';Submenu='';Settings=$false;Expanded=@{};SettingsScroll=0.0;Find=$false;Replace=$false;Modal=$null;Dropdown=$null;Drag=$false;Blink=$true;LastBlink=[DateTime]::UtcNow;LastSession=[DateTime]::UtcNow;Width=0.0;Height=0.0;Dpi=96.0;Generation=0;Nodes=[Collections.Generic.Dictionary[string,NotepadHitNode]]::new([StringComparer]::Ordinal);Hits=[Collections.Generic.List[NotepadHitNode]]::new();NextHits=$null;TextCache=@{};EditorLayout=[IntPtr]::Zero;EditorKey='';EditorOrigin=@(16.0,92.0);EditorRect=@(0,78,1280,614);EnsureCaret=$true;InputAnchor=0;InputFocus=0;InputBuffers=@{};PendingHigh='';Focused=$true}
 $palette=@{}
 $ui.ComparisonView=$false;$ui.ComparisonScroll=0.0;$ui.ComparisonProcess=$null
 $ui.ComparisonRows=@();$ui.ComparisonStatus='Ready';$ui.ComparisonLastPoll=[DateTime]::MinValue
@@ -13897,9 +13912,9 @@ function Persist {
 }
 function Invalidate([bool]$Caret=$false){$ui.Dirty=$true;if($Caret){$ui.EnsureCaret=$true;$ui.Blink=$true;$ui.LastBlink=[DateTime]::UtcNow}}
 function Node([string]$Id,[double]$X,[double]$Y,[double]$W,[double]$H,[string]$Action,[object]$Data=$null,[string]$Cursor='pointer'){
-    if(-not $ui.Nodes.ContainsKey($Id)){$ui.Nodes[$Id]=@{Id=$Id}}
+    if(-not $ui.Nodes.ContainsKey($Id)){$ui.Nodes[$Id]=[NotepadHitNode]@{Id=$Id}}
     $node=$ui.Nodes[$Id];$node.Rect=@($X,$Y,$W,$H);$node.Action=$Action;$node.Data=$Data;$node.Cursor=$Cursor;$node.Generation=$ui.Generation+1;$node.Clip=$ui.HitClip
-    $ui.NextHits.Add($node.Clone())
+    $ui.NextHits.Add($node.Copy())
 }
 function Label([string]$Text,[double]$X,[double]$Y,[double]$W,[string]$Color,[double]$Size=13,[string]$Family='Segoe UI',[int]$Weight=400){
     $key="$Text|$W|$Size|$Family|$Weight"
@@ -14503,7 +14518,7 @@ function Paint-Tooltip {
     Label $(if($settings.copyAsFile){'Copy whole document as .txt file'}else{'Copy whole document'}) ($x+10) ($y+7) ($width-20) (Color 'text-primary') 12
 }
 function Paint {
-    $ui.NextHits=[Collections.Generic.List[object]]::new()
+    $ui.NextHits=[Collections.Generic.List[NotepadHitNode]]::new()
     $graphics.Begin((Color 'bg-window'),$(if($ui.BackdropActive){[single]0}else{[single]1}))
     if($settings.gradientEnabled){$graphics.FourCorner(0,0,$ui.Width,$ui.Height,[string[]]@($settings.colors.topLeft,$settings.colors.topRight,$settings.colors.bottomLeft,$settings.colors.bottomRight),[single]$(if($ui.BackdropActive){[int]$settings.backgroundOpacity/100.0}else{1.0}))}
     if($ui.Settings){Paint-Settings}else{Paint-Editor;Paint-Chrome;Paint-Find;Paint-Menus}
@@ -14520,7 +14535,7 @@ function Editor-Hit([double]$X,[double]$Y,[bool]$Extend=$false){
     $hit=$graphics.HitText($ui.EditorLayout,($X-$ui.EditorOrigin[0]),($Y-$ui.EditorOrigin[1]));$tab=$model.Active()
     $anchor=if($Extend){$tab.Anchor}else{$hit.Position};$model.Select($anchor,$hit.Position);$ui.Focus='editor-area';Invalidate $true
 }
-function Key-Input($Event){
+function Key-Input([NotepadWindowEvent]$Event){
     $key=[int]$Event.W;$ctrl=$Event.Ctrl;$shift=$Event.Shift
     if($key -eq 27){if($ui.Dropdown){$ui.Dropdown=$null}elseif($ui.ColorPicker){$ui.ColorPicker=$null;$ui.Focus='settings';Persist}elseif($ui.Modal){$ui.Modal=$null;$ui.Focus='editor-area'}elseif($ui.ComparisonView){$ui.ComparisonView=$false;$ui.Focus='settings'}elseif($ui.Menu){$ui.Menu='';$ui.Submenu=''}elseif($ui.Find){$ui.Find=$false;$ui.Focus='editor-area'}elseif($ui.Settings){$ui.Settings=$false;$ui.Focus='editor-area'};Invalidate;return}
     if($ui.ColorPicker -and $key -eq 9){$fields=@('picker-input-hex','picker-input-c0','picker-input-c1','picker-input-c2');$index=[array]::IndexOf($fields,$ui.Focus);$index=($index+$(if($shift){3}else{1}))%4;Focus-Input $fields[$index];Invalidate;return}
@@ -14534,7 +14549,7 @@ function Key-Input($Event){
         Persist;Invalidate;return
     }
     if($ui.Modal -and $ui.Focus -ne 'dialog-input'){
-        if($key -eq 13){$button=$ui.Modal.Buttons|Where-Object Primary|Select-Object -First 1;if(-not $button){$button=$ui.Modal.Buttons[0]};$ui.Modal=$null;Command $button.Action $button.Data};return
+        if($key -eq 13){$button=$null;foreach($candidate in $ui.Modal.Buttons){if($candidate.Primary){$button=$candidate;break}};if(-not $button){$button=$ui.Modal.Buttons[0]};$ui.Modal=$null;Command $button.Action $button.Data};return
     }
     if($ui.Focus -in @('find-query-input','replace-query-input','dialog-input') -or ($ui.ColorPicker -and $ui.Focus.StartsWith('picker-input-'))){
         $value=Input-Value $ui.Focus
@@ -14546,7 +14561,7 @@ function Key-Input($Event){
             Input-Insert ''
         }elseif($key -in @(37,39,36,35)){
             $pos=switch($key){37{[Math]::Max(0,$ui.InputFocus-1)};39{[Math]::Min($value.Length,$ui.InputFocus+1)};36{0};35{$value.Length}};$ui.InputFocus=$pos;if(-not $shift){$ui.InputAnchor=$pos}
-        }elseif($key -eq 13){if($ui.ColorPicker){if(-not $ui.ColorPicker.Invalid){$ui.ColorPicker=$null;$ui.Focus='settings';Persist}}elseif($ui.Focus -eq 'dialog-input'){$m=$ui.Modal;$ui.Modal=$null;$button=$m.Buttons|Where-Object Primary|Select-Object -First 1;Command $button.Action $m.Value}elseif($shift){$model.SelectMatch(-1)}else{$model.SelectMatch(1)}}
+        }elseif($key -eq 13){if($ui.ColorPicker){if(-not $ui.ColorPicker.Invalid){$ui.ColorPicker=$null;$ui.Focus='settings';Persist}}elseif($ui.Focus -eq 'dialog-input'){$m=$ui.Modal;$ui.Modal=$null;$button=$null;foreach($candidate in $m.Buttons){if($candidate.Primary){$button=$candidate;break}};Command $button.Action $m.Value}elseif($shift){$model.SelectMatch(-1)}else{$model.SelectMatch(1)}}
         elseif($key -eq 9){if($ui.Focus -eq 'find-query-input' -and $ui.Replace){Focus-Input 'replace-query-input'}else{$ui.Focus='editor-area'}}
         Invalidate $true;return
     }
@@ -14569,7 +14584,7 @@ function Key-Input($Event){
     }
     Invalidate $true
 }
-function Handle-Event($Event){
+function Handle-Event([NotepadWindowEvent]$Event){
     if($Event.Kind -eq 'minimized'){$ui.Minimized=$true;Write-ApplicationDiagnostic;return}
     if($Event.Kind -eq 'close'){Request-Close;return}
     if($Event.Kind -eq 'paint'){Invalidate;return}
