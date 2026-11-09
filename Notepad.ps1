@@ -13791,7 +13791,9 @@ class NotepadUi {
     [Nullable[datetime]]$EntranceStart
 }
 [NotepadUi]$ui=@{Dirty=$true;Running=$true;Hover='';Pressed='';Focus='editor-area';Menu='';Submenu='';Settings=$false;Expanded=@{};SettingsScroll=0.0;Find=$false;Replace=$false;Modal=$null;Dropdown=$null;Drag=$false;Blink=$true;LastBlink=[DateTime]::UtcNow;LastSession=[DateTime]::UtcNow;Width=0.0;Height=0.0;Dpi=96.0;Generation=0;Nodes=[Collections.Generic.Dictionary[string,NotepadHitNode]]::new([StringComparer]::Ordinal);Hits=[Collections.Generic.List[NotepadHitNode]]::new();NextHits=$null;TextCache=@{};EditorLayout=[IntPtr]::Zero;EditorKey='';EditorOrigin=@(16.0,92.0);EditorRect=@(0,78,1280,614);EnsureCaret=$true;InputAnchor=0;InputFocus=0;InputBuffers=@{};PendingHigh='';Focused=$true}
-$palette=@{}
+# The theme's colours by CSS custom property, as the design's declarations give them (all text); case-insensitive keys,
+# as the hashtable's were. A property the theme does not declare reads $null.
+[Collections.Generic.Dictionary[string,string]]$palette=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
 $ui.ComparisonView=$false;$ui.ComparisonScroll=0.0;$ui.ComparisonProcess=$null
 $ui.ComparisonRows=@();$ui.ComparisonStatus='Ready';$ui.ComparisonLastPoll=[DateTime]::MinValue
 $ui.ClickSequence=0
@@ -13852,7 +13854,7 @@ function Entrance-Easing([double]$Progress){
 function Resolve-Theme {
     $theme=$settings.theme
     if($theme -eq 'system'){$value=Get-ItemPropertyValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name AppsUseLightTheme -ErrorAction SilentlyContinue;$theme=if($value -eq 1){'light'}else{'dark'}}
-    $script:palette=@{}
+    $script:palette=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach($rule in $design.Styles.Rules){if($rule.Header -eq ':root' -or ($theme -eq 'light' -and $rule.Header -eq '[data-theme="light"]')){foreach($declaration in $rule.Declarations){$palette[$declaration.Property]=$declaration.Value}}}
     if($theme -eq 'dark'){$palette['--bg-window']='#202020';$palette['--bg-titlebar']='#202020';$palette['--bg-menubar']='#2c2c2c';$palette['--bg-editor']='#272727';$palette['--bg-statusbar']='#2c2c2c'}
     $ui.Theme=$theme;$ui.Dirty=$true
@@ -14621,7 +14623,7 @@ function Handle-Event([NotepadWindowEvent]$Event){
         elseif(-not $ui.Modal){$tab=$model.Active();$tab.ScrollY=[Math]::Max(0,$tab.ScrollY-$delta/120*64);$ui.EnsureCaret=$false;Invalidate}
         $ui.ScrollSequence++;Invalidate;return
     }
-    $hit=Hit $x $y;$id=if($hit){$hit.Id}else{''}
+    [NotepadHitNode]$hit=Hit $x $y;$id=if($hit){$hit.Id}else{''}
     if($msg -eq 0x200){
         if($ui.ColorDrag){Set-ColorPickerPoint $ui.ColorDrag $x $y;return}
         if($ui.SliderDrag){Set-OpacityFromPoint $x;return}
