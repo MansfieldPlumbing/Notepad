@@ -14089,6 +14089,13 @@ class NotepadHitNode {
         return [NotepadHitNode]@{Id=$this.Id;Rect=$this.Rect;Action=$this.Action;Data=$this.Data;Cursor=$this.Cursor;Generation=$this.Generation;Clip=$this.Clip}
     }
 }
+# An icon the window can show: a Windows system icon (standard, LoadIconW) or shell stock icon (stock), and its key.
+class NotepadIconChoice {
+    [string]$Key
+    [string]$Kind
+    [int]$Id
+    NotepadIconChoice([string]$Kind, [int]$Id) { $this.Kind = $Kind; $this.Id = $Id; $this.Key = $Kind + ':' + $Id }
+}
 # The interface state. A value-type member that starts unset is Nullable: it reads $null until first set.
 class NotepadUi {
     [bool]$Dirty
@@ -14099,7 +14106,7 @@ class NotepadUi {
     [string]$Menu
     [string]$Submenu
     [bool]$Settings
-    [hashtable]$Expanded
+    [Collections.Generic.HashSet[string]]$Expanded
     [double]$SettingsScroll
     [bool]$Find
     [bool]$Replace
@@ -14116,7 +14123,7 @@ class NotepadUi {
     [Collections.Generic.Dictionary[string,NotepadHitNode]]$Nodes
     [Collections.Generic.List[NotepadHitNode]]$Hits
     [Collections.Generic.List[NotepadHitNode]]$NextHits
-    [hashtable]$TextCache
+    [Collections.Generic.Dictionary[string,IntPtr]]$TextCache
     [IntPtr]$EditorLayout
     [string]$EditorKey
     [double[]]$EditorOrigin
@@ -14131,7 +14138,7 @@ class NotepadUi {
     [Nullable[int]]$ClickSequence
     [Nullable[int]]$ScrollSequence
     [string]$EntranceStatus
-    [Collections.Generic.List[object]]$EntranceSamples
+    [Collections.Generic.List[NotepadEntranceSample]]$EntranceSamples
     [Nullable[datetime]]$HoverSince
     [Nullable[bool]]$TooltipShown
     [Nullable[bool]]$Minimized
@@ -14144,20 +14151,20 @@ class NotepadUi {
     [NotepadEntrance]$Entrance
     [NotepadEntranceRestore]$EntranceRestore
     [Nullable[bool]]$BackdropActive
-    [object[]]$IconCatalog
+    [NotepadIconChoice[]]$IconCatalog
     [Nullable[IntPtr]]$WindowIconHandle
-    [object[]]$OpacityTrack
+    [double[]]$OpacityTrack
     [double[]]$HitClip
     [Nullable[int]]$SettingsExtent
     [Nullable[datetime]]$EntranceStart
 }
-[NotepadUi]$ui=@{Dirty=$true;Running=$true;Hover='';Pressed='';Focus='editor-area';Menu='';Submenu='';Settings=$false;Expanded=@{};SettingsScroll=0.0;Find=$false;Replace=$false;Modal=$null;Dropdown=$null;Drag=$false;Blink=$true;LastBlink=[DateTime]::UtcNow;LastSession=[DateTime]::UtcNow;Width=0.0;Height=0.0;Dpi=96.0;Generation=0;Nodes=[Collections.Generic.Dictionary[string,NotepadHitNode]]::new([StringComparer]::Ordinal);Hits=[Collections.Generic.List[NotepadHitNode]]::new();NextHits=$null;TextCache=@{};EditorLayout=[IntPtr]::Zero;EditorKey='';EditorOrigin=@(16.0,92.0);EditorRect=@(0,78,1280,614);EnsureCaret=$true;InputAnchor=0;InputFocus=0;InputBuffers=@{};PendingHigh='';Focused=$true}
+[NotepadUi]$ui=@{Dirty=$true;Running=$true;Hover='';Pressed='';Focus='editor-area';Menu='';Submenu='';Settings=$false;Expanded=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase);SettingsScroll=0.0;Find=$false;Replace=$false;Modal=$null;Dropdown=$null;Drag=$false;Blink=$true;LastBlink=[DateTime]::UtcNow;LastSession=[DateTime]::UtcNow;Width=0.0;Height=0.0;Dpi=96.0;Generation=0;Nodes=[Collections.Generic.Dictionary[string,NotepadHitNode]]::new([StringComparer]::Ordinal);Hits=[Collections.Generic.List[NotepadHitNode]]::new();NextHits=$null;TextCache=[Collections.Generic.Dictionary[string,IntPtr]]::new([StringComparer]::OrdinalIgnoreCase);EditorLayout=[IntPtr]::Zero;EditorKey='';EditorOrigin=@(16.0,92.0);EditorRect=@(0,78,1280,614);EnsureCaret=$true;InputAnchor=0;InputFocus=0;InputBuffers=@{};PendingHigh='';Focused=$true}
 # The theme's colours by CSS custom property, as the design's declarations give them (all text); case-insensitive keys,
 # as the hashtable's were. A property the theme does not declare reads $null.
 [Collections.Generic.Dictionary[string,string]]$palette=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
 $ui.ClickSequence=0
 $ui.ScrollSequence=0
-$ui.EntranceStatus='Pending';$ui.EntranceSamples=[Collections.Generic.List[object]]::new()
+$ui.EntranceStatus='Pending';$ui.EntranceSamples=[Collections.Generic.List[NotepadEntranceSample]]::new()
 $ui.HoverSince=[DateTime]::UtcNow;$ui.TooltipShown=$false
 $ui.Minimized=$false
 $ui.SliderDrag=$false
@@ -14202,21 +14209,24 @@ function Apply-WindowAppearance {
 }
 function Initialize-IconCatalog {
     if($ui.IconCatalog){return}
-    $path=Join-Path $EvidenceDirectory 'windows-icon-catalog.clixml'
-    if(Test-Path -LiteralPath $path){try{$ui.IconCatalog=@((Import-Clixml -LiteralPath $path).CycleIcons)}catch{$ui.IconCatalog=@()}}
-    if(-not $ui.IconCatalog){$ui.IconCatalog=@(foreach($id in @(32512,32516,32515,32513,32514,32517,32518)){[pscustomobject]@{Key=('standard:'+$id);Kind='standard';Id=$id}})}
+    # Windows' seven documented system icons (LoadIconW), then its shell stock icons SIID 0 to 180, in that order: the
+    # catalog the comparison tooling recorded for this machine, built here instead of read from its evidence.
+    $choices=[Collections.Generic.List[NotepadIconChoice]]::new()
+    foreach($id in [int[]]@(32512,32516,32515,32513,32514,32517,32518)){$choices.Add([NotepadIconChoice]::new('standard',$id))}
+    for($id=0;$id -le 180;$id++){$choices.Add([NotepadIconChoice]::new('stock',$id))}
+    $ui.IconCatalog=$choices.ToArray()
 }
 function Apply-WindowIcon {
     if(-not $window -or -not $graphics){return}
     $ui.WindowIconHandle=[IntPtr]::Zero
     if($settings.windowIcon -eq 'default'){$null=$window.SelectIcon('standard',32512);return}
     Initialize-IconCatalog
-    $entry=$ui.IconCatalog|Where-Object Key -eq $settings.windowIcon|Select-Object -First 1
-    if($entry){$ui.WindowIconHandle=$window.SelectIcon($entry.Kind,[int]$entry.Id)}
+    [NotepadIconChoice]$entry=$null;foreach($choice in $ui.IconCatalog){if($choice.Key -eq $settings.windowIcon){$entry=$choice;break}}
+    if($entry){$ui.WindowIconHandle=$window.SelectIcon($entry.Kind,$entry.Id)}
     else{$settings.windowIcon='default';$null=$window.SelectIcon('standard',32512)}
 }
 function Paint-AppIcon([string]$Id,[double]$X,[double]$Y,[double]$Size){
-    if($ui.WindowIconHandle -and $ui.WindowIconHandle -ne [IntPtr]::Zero -and $settings.windowIcon -ne 'default'){$graphics.NativeIcon($ui.WindowIconHandle,$settings.windowIcon,$X,$Y,$Size)}else{Icon 'app' $X $Y $Size}
+    if($ui.WindowIconHandle -and $ui.WindowIconHandle -ne [IntPtr]::Zero -and $settings.windowIcon -ne 'default'){$graphics.NativeIcon([IntPtr]$ui.WindowIconHandle,$settings.windowIcon,$X,$Y,$Size)}else{Icon 'app' $X $Y $Size}
     Node $Id ($X-5) ($Y-5) ($Size+10) ($Size+10) 'cycleIcon' $settings.windowIcon
 }
 function Color([string]$Name){$palette['--'+$Name]}
@@ -14246,7 +14256,7 @@ function Persist {
         try{$settings.WriteIni($configWriter,$defaultSettings)}finally{$configWriter.Dispose()}
         [IO.File]::Move($temporary,$configPath,$true)
     }catch [UnauthorizedAccessException] {Write-Warning "config.ini cannot be written beside the program: $($_.Exception.Message)"}
-    New-Item -ItemType Directory -Path $store -Force|Out-Null
+    $null=[IO.Directory]::CreateDirectory($store)
     $temporary=$sessionPath+'.tmp'
     $sessionWriter=[IO.BinaryWriter]::new([IO.File]::Create($temporary))
     try{$model.WriteSession($sessionWriter,($settings.startupOption -eq 'continueSession'))}finally{$sessionWriter.Dispose()}
@@ -14289,7 +14299,7 @@ function InputBox([string]$Id,[string]$Value,[double]$X,[double]$Y,[double]$W,[s
         if($focused){
             $focus=[Math]::Clamp([int]$ui.InputFocus,0,$Value.Length);$anchor=[Math]::Clamp([int]$ui.InputAnchor,0,$Value.Length)
             $caret=$graphics.Caret($layout,$focus,$false);$offset=[Math]::Max(0,$caret.X-($W-22))
-            foreach($rect in @($graphics.Selection($layout,[Math]::Min($focus,$anchor),[Math]::Abs($focus-$anchor)))){$graphics.Fill(($X+8+$rect.X-$offset),($originY+$rect.Y),$rect.Width,$rect.Height,(Color 'selection-bg'),0)}
+            foreach($rect in [NotepadRect[]]@($graphics.Selection($layout,[Math]::Min($focus,$anchor),[Math]::Abs($focus-$anchor)))){$graphics.Fill(($X+8+$rect.X-$offset),($originY+$rect.Y),$rect.Width,$rect.Height,(Color 'selection-bg'),0)}
             if($ui.Blink){$graphics.Fill(($X+8+$caret.X-$offset),($originY+$caret.Y),1,$caret.Height,(Color 'text-primary'),0)}
         }
         if($Value){$graphics.DrawLayout($layout,($X+8-$offset),$originY,(Color 'text-primary'))}else{Label $Placeholder ($X+8) $originY ($W-16) (Color 'text-secondary') 13}
@@ -14301,7 +14311,7 @@ function Open-Modal([string]$Title,[string]$Message,[NotepadModalButton[]]$Butto
     if($HasInput){$ui.Focus='dialog-input';$ui.InputAnchor=0;$ui.InputFocus=$Value.Length}else{$ui.Focus='modal'}
     Invalidate
 }
-function Save-Document([object]$Tab,[bool]$SaveAs=$false){
+function Save-Document([NotepadTab]$Tab,[bool]$SaveAs=$false){
     try{
         $destination=$Tab.Path
         if($SaveAs -or -not $destination){$suggested=$Tab.Title;if(-not [IO.Path]::GetExtension($suggested)){$suggested+='.txt'};$destination=$services.FileDialog($true,$suggested)}
@@ -14309,9 +14319,10 @@ function Save-Document([object]$Tab,[bool]$SaveAs=$false){
         $null=$model.Save($Tab.Id,$destination);Persist;Invalidate;return $true
     }catch{Open-Modal 'Notepad' $_.Exception.Message @(@{Text='Close';Action='dismiss';Primary=$true});return $false}
 }
+function Test-AnyModified{foreach($candidate in $state.Tabs){if($candidate.Modified){return $true}};return $false}
 function Request-Close([int]$TabId=0){
-    if($TabId){$tab=$state.Tabs|Where-Object Id -eq $TabId|Select-Object -First 1;if(-not $tab.Modified){$model.CloseTab($TabId);Invalidate $true;return};Open-Modal 'Notepad' "Do you want to save changes to $($tab.Title)?" @(@{Text='Save';Action='saveCloseTab';Data=$TabId;Primary=$true},@{Text="Don't Save";Action='discardTab';Data=$TabId},@{Text='Cancel';Action='dismiss'})}
-    elseif(@($state.Tabs|Where-Object Modified).Count){Open-Modal 'Notepad' 'You have unsaved changes. Do you want to save before closing?' @(@{Text='Save All';Action='saveCloseWindow';Primary=$true},@{Text="Don't Save";Action='discardWindow'},@{Text='Cancel';Action='dismiss'})}
+    if($TabId){[NotepadTab]$tab=$null;foreach($candidate in $state.Tabs){if($candidate.Id -eq $TabId){$tab=$candidate;break}};if(-not $tab.Modified){$model.CloseTab($TabId);Invalidate $true;return};Open-Modal 'Notepad' "Do you want to save changes to $($tab.Title)?" @(@{Text='Save';Action='saveCloseTab';Data=$TabId;Primary=$true},@{Text="Don't Save";Action='discardTab';Data=$TabId},@{Text='Cancel';Action='dismiss'})}
+    elseif(Test-AnyModified){Open-Modal 'Notepad' 'You have unsaved changes. Do you want to save before closing?' @(@{Text='Save All';Action='saveCloseWindow';Primary=$true},@{Text="Don't Save";Action='discardWindow'},@{Text='Cancel';Action='dismiss'})}
     else{$ui.Running=$false}
 }
 function Command([string]$Action,[object]$Data=$null){
@@ -14336,7 +14347,7 @@ function Command([string]$Action,[object]$Data=$null){
         'copyDocument'{try{if($settings.copyAsFile){$services.WriteClipboardFile($tab.Text,$tab.Title)}else{$services.WriteClipboard($tab.Text)}}catch{Open-Modal 'Copy document' $_.Exception.Message @(@{Text='Close';Action='dismiss';Primary=$true})}}
         'editColor'{Open-CanvasColorPicker $Data -1}
         'editAnsi'{Open-CanvasColorPicker '' ([int]$Data)}
-        'cycleIcon'{Initialize-IconCatalog;$index=[array]::IndexOf(@($ui.IconCatalog|ForEach-Object Key),$settings.windowIcon);$settings.windowIcon=$ui.IconCatalog[($index+1)%$ui.IconCatalog.Count].Key;Apply-WindowIcon}
+        'cycleIcon'{Initialize-IconCatalog;$index=-1;for($i=0;$i -lt $ui.IconCatalog.Count;$i++){if($ui.IconCatalog[$i].Key -eq $settings.windowIcon){$index=$i;break}};$settings.windowIcon=$ui.IconCatalog[($index+1)%$ui.IconCatalog.Count].Key;Apply-WindowIcon}
         'resetIcon'{$settings.windowIcon='default';Apply-WindowIcon}
         'resetColors'{$settings.colors=[NotepadSettings]::ColorTable(@{foreground='';tabs='';cursor='';selectionBackground='';topLeft='#272727';topRight='#272727';bottomLeft='#272727';bottomRight='#272727'});$settings.gradientEnabled=$false}
         'formatBold'{Format-Selection '**'}
@@ -14369,9 +14380,9 @@ function Command([string]$Action,[object]$Data=$null){
         'toggleWordWrap'{$settings.wordWrap=-not $settings.wordWrap}
         'lineEnding'{$tab.LineEnding=if($tab.LineEnding -eq 'Unix (LF)'){'Windows (CRLF)'}else{'Unix (LF)'};$tab.Modified=$true}
         'openSettings'{$ui.Settings=$true;$ui.Menu='';$ui.Focus='settings'}
-        'openFontSettings'{$ui.Settings=$true;$ui.Expanded['card-font-setting']=$true;$ui.SettingsScroll=0;$ui.Focus='settings'}
+        'openFontSettings'{$ui.Settings=$true;$null=$ui.Expanded.Add('card-font-setting');$ui.SettingsScroll=0;$ui.Focus='settings'}
         'back'{$ui.Settings=$false;$ui.Dropdown=$null;$ui.Focus='editor-area'}
-        'accordion'{$ui.Expanded[$Data]=-not $ui.Expanded[$Data]}
+        'accordion'{if(-not $ui.Expanded.Remove([string]$Data)){$null=$ui.Expanded.Add([string]$Data)}}
         'toggleSetting'{$settings.Set($Data,(-not $settings.Get($Data)))}
         'startup'{$settings.startupOption=$Data}
         'settingSelect'{$ui.Dropdown=[NotepadDropdown]@{Key=$Data.Key;Options=$Data.Options;Rect=$Data.Rect;Id=$Data.Id}}
@@ -14384,7 +14395,7 @@ function Command([string]$Action,[object]$Data=$null){
         'drag'{$window.Caption('drag')}
         'focusInput'{Focus-Input $Data}
         'discardTab'{$model.CloseTab([int]$Data);$ui.Focus='editor-area'}
-        'saveCloseTab'{$document=$state.Tabs|Where-Object Id -eq $Data|Select-Object -First 1;if(Save-Document $document){$model.CloseTab([int]$Data);$ui.Focus='editor-area'}}
+        'saveCloseTab'{[NotepadTab]$document=$null;foreach($candidate in $state.Tabs){if($candidate.Id -eq $Data){$document=$candidate;break}};if(Save-Document $document){$model.CloseTab([int]$Data);$ui.Focus='editor-area'}}
         'discardWindow'{$ui.Running=$false}
         'saveCloseWindow'{$success=$true;foreach($document in $state.Tabs){if($document.Modified -and -not(Save-Document $document)){$success=$false;break}};if($success){$ui.Running=$false}}
         'dismiss'{$ui.Focus='editor-area'}
@@ -14398,7 +14409,7 @@ function Command([string]$Action,[object]$Data=$null){
 }
 function Convert-HsvToHex([double]$Hue,[double]$Saturation,[double]$Value){
     $h=($Hue%360+360)%360;$c=$Value*$Saturation;$x=$c*(1-[Math]::Abs(($h/60)%2-1));$m=$Value-$c
-    $rgb=switch([int][Math]::Floor($h/60)){0{@($c,$x,0)};1{@($x,$c,0)};2{@(0,$c,$x)};3{@(0,$x,$c)};4{@($x,0,$c)};default{@($c,0,$x)}}
+    [double[]]$rgb=switch([int][Math]::Floor($h/60)){0{@($c,$x,0)};1{@($x,$c,0)};2{@(0,$c,$x)};3{@(0,$x,$c)};4{@($x,0,$c)};default{@($c,0,$x)}}
     '#{0:X2}{1:X2}{2:X2}' -f ([int][Math]::Round(255*($rgb[0]+$m))),([int][Math]::Round(255*($rgb[1]+$m))),([int][Math]::Round(255*($rgb[2]+$m)))
 }
 function Set-ColorPickerHex([string]$Hex){
@@ -14409,7 +14420,7 @@ function Set-ColorPickerHex([string]$Hex){
 }
 function Sync-ColorPickerInputs {
     $p=$ui.ColorPicker;if(-not $p){return}
-    $values=if($p.Mode -eq 'HSV'){@([string][int][Math]::Round($p.H),[string][int][Math]::Round($p.S*100),[string][int][Math]::Round($p.V*100))}else{@([string]$p.R,[string]$p.G,[string]$p.B)}
+    [string[]]$values=if($p.Mode -eq 'HSV'){@([string][int][Math]::Round($p.H),[string][int][Math]::Round($p.S*100),[string][int][Math]::Round($p.V*100))}else{@([string]$p.R,[string]$p.G,[string]$p.B)}
     $all=@{hex=$p.Hex;c0=$values[0];c1=$values[1];c2=$values[2]}
     foreach($key in $all.Keys){if($ui.Focus -ne 'picker-input-'+$key){$p.Inputs[$key]=$all[$key]}}
 }
@@ -14459,7 +14470,9 @@ function Format-Lines([string]$Prefix){
     $lineStart=if($start -gt 0){$tab.Text.LastIndexOf("`n",$start-1)+1}else{0}
     $lineEnd=$tab.Text.IndexOf("`n",$end);if($lineEnd -lt 0){$lineEnd=$tab.Text.Length}
     $lines=$tab.Text.Substring($lineStart,$lineEnd-$lineStart).Split("`n")
-    $text=(@($lines|ForEach-Object {if($Prefix -and $_.StartsWith($Prefix)){$_.Substring($Prefix.Length)}else{$Prefix+$_}}) -join "`n")
+    $formatted=[Collections.Generic.List[string]]::new()
+    foreach($line in $lines){if($Prefix -and $line.StartsWith($Prefix)){$formatted.Add($line.Substring($Prefix.Length))}else{$formatted.Add($Prefix+$line)}}
+    $text=[string]::Join("`n",$formatted)
     $model.Select($lineStart,$lineEnd);$model.Insert($text,$false);$model.Select($lineStart,($lineStart+$text.Length));$tab.Markdown=$true;$ui.Focus='editor-area'
 }
 function Open-Find([bool]$Replace){
@@ -14497,7 +14510,7 @@ function Paint-Editor {
     $ox=16-$tab.ScrollX;$oy=94-$tab.ScrollY;$ui.EditorOrigin=@($ox,$oy)
     $graphics.Clip(0,80,($ui.Width-12),$h)
     $start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor)
-    $rects=@($graphics.Selection($layout,$start,$length))
+    [NotepadRect[]]$rects=@($graphics.Selection($layout,$start,$length))
     foreach($rect in $rects){$graphics.Fill(($ox+$rect.X),($oy+$rect.Y),[Math]::Max(1,$rect.Width),$rect.Height,(Role-Color 'selectionBackground'),0)}
     $graphics.DrawLayout($layout,$ox,$oy,(Role-Color 'foreground'))
     # Repaint selected glyphs through each selection clip, using selection-text.
@@ -14579,7 +14592,7 @@ function Paint-Find {
     $count=if(-not $state.Find.Query){'0 of 0'}elseif(-not $state.Find.Matches.Count){'No results'}else{"$($state.Find.Index+1) of $($state.Find.Matches.Count)"}
     Label $count ($x+174) ($y+16) 62 (Color 'text-secondary') 12
     $bx=$x+244
-    foreach($button in @(@('prev','arrowUp','findPrevious'),@('next','arrowDown','findNext'),@('case','caseSensitive','findCase'),@('wrap','wrapAround','findWrap'),@('replace','chevronDown','toggleReplace'),@('close','close','closeFind'))){
+    foreach($button in [string[][]]@(@('prev','arrowUp','findPrevious'),@('next','arrowDown','findNext'),@('case','caseSensitive','findCase'),@('wrap','wrapAround','findWrap'),@('replace','chevronDown','toggleReplace'),@('close','close','closeFind'))){
         if(($button[0] -eq 'case' -and $state.Find.MatchCase) -or ($button[0] -eq 'wrap' -and $state.Find.Wrap)){$graphics.Fill($bx,($y+9),28,28,(Color 'bg-control-active'),4)}
         Button ('find-btn-'+$button[0]) $bx ($y+9) 28 28 $button[2] '' $button[1] $null $false $false 14;$bx+=34
     }
@@ -14619,7 +14632,7 @@ function Paint-Menus {
     Paint-MenuRows $rows $x 80 260 ('flyout-'+$ui.Menu)
 }
 function Select-Control([string]$Id,[string]$Key,[NotepadOption[]]$Options,[double]$X,[double]$Y,[double]$W){
-    $text=[string]$settings.Get($Key);foreach($option in $Options){if($option.Value -eq $settings.Get($Key)){$text=$option.Text;break}}
+    $text=[string]$settings.Get($Key);foreach($option in $Options){if($option.Value -eq [string]$settings.Get($Key)){$text=$option.Text;break}}
     $data=@{Id=$Id;Key=$Key;Options=$Options;Rect=@($X,$Y,$W,32)}
     Button $Id $X $Y $W 32 'settingSelect' '' '' $data $false $true
     Label $text ($X+12) ($Y+7) ($W-36) (Color 'text-primary') 13
@@ -14641,7 +14654,7 @@ function Paint-ColorControls([double]$X,[double]$Y,[double]$W){
     for($i=0;$i -lt 8;$i++){
         $rowY=$Y+$i*40
         Label $names[$i] ($X+24) ($rowY+8) 72 (Color 'text-primary') 14
-        foreach($bright in @(0,1)){$index=$i+8*$bright;$sx=$X+112+42*$bright;Node ('palette-'+$index) $sx $rowY 32 32 'editAnsi' $index;$graphics.Fill($sx,$rowY,32,32,$settings.ansiColors[$index],4);$graphics.Stroke($sx,$rowY,32,32,(Color 'border-control'),4,1)}
+        foreach($bright in [int[]]@(0,1)){$index=$i+8*$bright;$sx=$X+112+42*$bright;Node ('palette-'+$index) $sx $rowY 32 32 'editAnsi' $index;$graphics.Fill($sx,$rowY,32,32,$settings.ansiColors[$index],4);$graphics.Stroke($sx,$rowY,32,32,(Color 'border-control'),4,1)}
         Label $roles[$i][1] ($X+$W/2) ($rowY+8) ($W/2-66) (Color 'text-primary') 14
         $cx=$X+$W-56;Node ('color-'+$roles[$i][0]) $cx $rowY 32 32 'editColor' $roles[$i][0]
         $graphics.Fill($cx,$rowY,32,32,(Role-Color $roles[$i][0]),4);$graphics.Stroke($cx,$rowY,32,32,(Color 'border-control'),4,1)
@@ -14688,7 +14701,7 @@ function Paint-Settings {
     foreach($card in $cards){
         if($card.Section){$y+=24;Label $card.Section $left $y $col (Color 'text-primary') 14 'Segoe UI' 600;$y+=28;continue}
         $height=if($card.Subtitle){68.0}else{49.6}
-        $expanded=$card.Accordion -and $ui.Expanded[$card.Accordion]
+        $expanded=$card.Accordion -and $ui.Expanded.Contains([string]$card.Accordion)
         if($card.Accordion){$height=51.6;if($expanded){$height=switch($card.Accordion){'card-font-setting'{296.125};'card-colors-setting'{438};default{147.6}}}}
         $graphics.Fill($left,$y,$col,$height,(Surface-Color 'bg-card' 0.12),8);$graphics.Stroke($left,$y,$col,$height,(Color 'border-subtle'),8,0.8)
         $headerHeight=if($card.Subtitle){68}else{51.6};Icon $card.Icon ($left+17) ($y+($headerHeight-18)/2) 18
@@ -14712,7 +14725,7 @@ function Paint-Settings {
                 if($card.Accordion -eq 'card-font-setting'){
                     $fy=$y+68
                     $fontOptions=@(@{Label='Family';Key='fontFamily';Options=@('Consolas','Cascadia Code','Segoe UI','Courier New');Width=130},@{Label='Style';Key='fontStyle';Options=@('Regular','Bold','Italic','Bold Italic');Width=112},@{Label='Size';Key='fontSize';Options=@('8','9','10','11','12','14','16','18','20','24','28','36');Width=68})
-                    foreach($row in $fontOptions){Label $row.Label ($left+24) ($fy+7) 150 (Color 'text-primary') 13;$options=@($row.Options|ForEach-Object{@{Text=$_;Value=$_}});Select-Control ('setting-'+$row.Key) $row.Key $options ($left+$col-24-$row.Width) $fy $row.Width;$fy+=46}
+                    foreach($row in $fontOptions){Label $row.Label ($left+24) ($fy+7) 150 (Color 'text-primary') 13;$options=[Collections.Generic.List[NotepadOption]]::new();foreach($choice in $row.Options){$options.Add([NotepadOption]@{Text=$choice;Value=$choice})};Select-Control ('setting-'+$row.Key) $row.Key $options.ToArray() ($left+$col-24-$row.Width) $fy $row.Width;$fy+=46}
                     $fy+=5;$graphics.Fill(($left+16),$fy,($col-32),70.125,$(if($ui.Theme -eq 'light'){'#f7f7f7'}else{'#202020'}),6);$graphics.Stroke(($left+16),$fy,($col-32),70.125,(Color 'border-subtle'),6,0.8)
                     $layout=$graphics.Layout('The sound of ocean waves calms my soul.',$settings.fontFamily,([int]$settings.fontSize*96/72),($col-64),$false,$(if($settings.fontStyle.Contains('Bold')){700}else{400}),$settings.fontStyle.Contains('Italic'),0)
                     try{$m=$graphics.Metrics($layout);$graphics.DrawLayout($layout,($left+($col-$m.Width)/2),($fy+(70.125-$m.Height)/2),(Color 'text-primary'))}finally{$graphics.ReleaseLayout($layout)}
@@ -14746,7 +14759,7 @@ function Paint-Dropdown {
     if(-not $ui.Dropdown){return}
     $drop=$ui.Dropdown;$r=$drop.Rect;$height=$drop.Options.Count*28+8;$y=$r[1]+$r[3]+2
     if($y+$height -gt $ui.Height-8){$y=[Math]::Max(42,$r[1]-$height-2)}
-    $current=if($drop.Key -eq 'pickerMode'){$ui.ColorPicker.Mode}else{$settings.Get($drop.Key)}
+    [string]$current=if($drop.Key -eq 'pickerMode'){$ui.ColorPicker.Mode}else{$settings.Get($drop.Key)}
     $rows=@(foreach($option in $drop.Options){@{Text=$option.Text;Action='chooseSetting';Data=@{Key=$drop.Key;Value=$option.Value};Checked=($current -eq $option.Value)}})
     Paint-MenuRows $rows $r[0] $y ([Math]::Max(160,$r[2])) ('dropdown-'+$drop.Key)
 }
@@ -14805,7 +14818,7 @@ function Paint-CanvasColorPicker {
     $p.ModeRect=@(($x+16),($oy+328),120,36);Button 'picker-mode' ($x+16) ($oy+328) 120 36 'pickerMode' '' '' $null $false $true
     Label $p.Mode ($x+28) ($oy+337) 80 (Color 'text-primary') 16;Icon 'chevronDown' ($x+112) ($oy+341) 10
     InputBox 'picker-input-hex' $p.Inputs['hex']($x+196) ($oy+328) 132 '' 36 16
-    $labels=if($p.Mode -eq 'RGB'){@('Red','Green','Blue')}else{@('Hue','Saturation','Value')}
+    [string[]]$labels=if($p.Mode -eq 'RGB'){@('Red','Green','Blue')}else{@('Hue','Saturation','Value')}
     for($i=0;$i -lt 3;$i++){$iy=$oy+376+$i*48;InputBox ('picker-input-c'+$i) $p.Inputs['c'+$i] ($x+16) $iy 120 '' 36 16;Label $labels[$i] ($x+144) ($iy+8) 170 (Color 'text-primary') 16}
     $graphics.Unclip();$ui.HitClip=$oldClip
     if($height -lt $naturalHeight){$track=$height-16;$thumb=$track*$height/$naturalHeight;$ty=$y+8+($track-$thumb)*$p.Scroll/($naturalHeight-$height);$graphics.Fill(($x+$width-7),$ty,4,$thumb,'rgba(255,255,255,0.3)',2)}
@@ -14947,7 +14960,7 @@ function Handle-Event([NotepadWindowEvent]$Event){
         if($ui.SliderDrag){Set-OpacityFromPoint $x;$ui.SliderDrag=$false;$ui.Pressed='';$window.Capture($false);$ui.ClickSequence++;Persist;Invalidate;return}
         if($ui.Drag){$ui.Drag=$false;$window.Capture($false)}
         if($hit -and $id -eq $ui.Pressed -and $hit.Action -notin @('editor','drag')){
-            if($hit.Action -eq 'modalAction'){$button=$hit.Data;$value=$ui.Modal.Value;$ui.Modal=$null;Command $button.Action $(if($button.Action -in @('gotoConfirm','insertLink')){$value}else{$button.Data})}
+            if($hit.Action -eq 'modalAction'){[NotepadModalButton]$button=$hit.Data;$value=$ui.Modal.Value;$ui.Modal=$null;Command $button.Action $(if($button.Action -in @('gotoConfirm','insertLink')){$value}else{$button.Data})}
             else{if($id.StartsWith('flyout-') -and $hit.Action -ne 'submenu'){$ui.Menu='';$ui.Submenu=''};Command $hit.Action $hit.Data}
         }
         $ui.Pressed='';$ui.ClickSequence++;Invalidate
