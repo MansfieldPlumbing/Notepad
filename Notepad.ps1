@@ -1,7 +1,9 @@
 [CmdletBinding()]
+[SingleThreadedApartment()]
+[ApplicationIcon('Notepad.ico')]
 param(
     [string]$Path,[int]$Width=1280,[int]$Height=720,[switch]$NoSession,[int]$RunSeconds=0,[string]$DiagnosticPath,
-    [switch]$Compare,[string]$EvidenceDirectory=(Join-Path $PSScriptRoot 'evidence'),
+    [switch]$Compare,[string]$UIAutomationTestDataDirectory,
     [switch]$RefreshReal,[switch]$SkipBrowser,[switch]$KeepProbeOpen,
     [switch]$ExtractTypeScript,[switch]$BuildTypeScript,[switch]$BuildDesign,[switch]$VerifyNativeFeatures,[switch]$CatalogIcons,
     [ValidateSet('editor','settings')][string]$StartPage='editor',
@@ -12,16 +14,11 @@ param(
 
 # Folded from src\Model.ps1
 # The editor model. A document's text, selection and history; the find state; the open documents.
-class NotepadSnapshot {
-    [string]$Text
-    [int]$Anchor
-    [int]$Focus
-}
-
 class NotepadTab {
     [int]$Id
     [string]$Title
-    [string]$Text
+    # The text as a piece table: the text as opened, an append-only buffer of additions, and a journal of edits.
+    [NotepadDocument]$Document
     [string]$Path
     [bool]$Markdown
     [string]$LineEnding
@@ -33,10 +30,38 @@ class NotepadTab {
     [int]$Focus
     [double]$ScrollX
     [double]$ScrollY
-    # Undo and redo history, the most recent last.
-    [Collections.Generic.List[NotepadSnapshot]]$Undo = [Collections.Generic.List[NotepadSnapshot]]::new()
-    [Collections.Generic.List[NotepadSnapshot]]$Redo = [Collections.Generic.List[NotepadSnapshot]]::new()
     [datetime]$LastEdit = [datetime]::MinValue
+    # Modified is measured against the document's journal position at the last open or save, and the line ending
+    # then. SavedKnown is false when that saved state is unknown: a file tab restored modified from a session, or an
+    # untitled tab created with text.
+    [string]$SavedLineEnding = 'Windows (CRLF)'
+    [bool]$SavedKnown = $true
+
+    [int] Length() { return $this.Document.Length }
+    [string] Slice([int]$start, [int]$count) { return $this.Document.GetText($start, $count) }
+    [string] Content() { return $this.Document.GetText(0, $this.Document.Length) }
+    [char] At([int]$position) { return $this.Document.At($position) }
+
+    # Modified when the journal or line ending differs from the last open or save. An untitled tab with no text is
+    # never modified.
+    [void] RefreshModified() {
+        if (-not $this.Path -and $this.Document.Length -eq 0) { $this.Modified = $false; return }
+        $this.Modified = -not $this.SavedKnown -or $this.Document.Modified() -or $this.LineEnding -cne $this.SavedLineEnding
+    }
+
+    # The title the tab shows: its file name once it has a file; before that the first line with text (looked for in
+    # the first 400 characters), up to 40 characters, as Windows Notepad shows it; the stored title ("Untitled") while
+    # there is none.
+    [string] Caption() {
+        if ($this.Path) { return $this.Title }
+        $head = $this.Slice(0, [Math]::Min($this.Document.Length, 400))
+        $start = 0
+        while ($start -lt $head.Length -and [char]::IsWhiteSpace($head[$start])) { $start++ }
+        if ($start -ge $head.Length) { return $this.Title }
+        $end = $head.IndexOf([char]10, $start)
+        if ($end -lt 0) { $end = $head.Length }
+        return $head.Substring($start, [Math]::Min($end - $start, 40)).TrimEnd()
+    }
 }
 
 class NotepadMatch {
@@ -98,10 +123,14 @@ class NotepadModel {
         $tab.Id = $this.modelState.NextId
         $this.modelState.NextId = $this.modelState.NextId + 1
         $tab.Title = $Title
-        $tab.Text = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+        $tab.Document = [NotepadDocument]::new($Text.Replace("`r`n", "`n").Replace("`r", "`n"))
         $tab.Path = $Path
         $tab.Markdown = $Markdown
         $tab.LineEnding = $lineEnding
+        # An opened file starts unmodified; an untitled tab created with text has never been saved.
+        if (-not $Path -and $tab.Document.Length -gt 0) { $tab.SavedKnown = $false }
+        $tab.SavedLineEnding = $lineEnding
+        $tab.RefreshModified()
         $this.modelState.Tabs.Add($tab)
         $this.modelState.ActiveId = $tab.Id
         return $tab
@@ -128,45 +157,44 @@ class NotepadModel {
         $this.Find()
     }
 
-    hidden [NotepadSnapshot] Snapshot([NotepadTab]$Tab) {
-        $snapshot = [NotepadSnapshot]::new()
-        $snapshot.Text = $Tab.Text
-        $snapshot.Anchor = $Tab.Anchor
-        $snapshot.Focus = $Tab.Focus
-        return $snapshot
-    }
-
     [void] Select([int]$Anchor, [int]$Focus) {
         $tab = $this.Active()
-        $tab.Anchor = [Math]::Clamp($Anchor, 0, $tab.Text.Length)
-        $tab.Focus = [Math]::Clamp($Focus, 0, $tab.Text.Length)
+        $tab.Anchor = [Math]::Clamp($Anchor, 0, $tab.Document.Length)
+        $tab.Focus = [Math]::Clamp($Focus, 0, $tab.Document.Length)
     }
 
+    # Replaces the selection with text as one edit in the document's journal. Typing within 700 ms of the last edit
+    # with nothing selected joins the same undo group.
     [void] Insert([string]$Text) { $this.Insert($Text, $false) }
     [void] Insert([string]$Text, [bool]$Coalesce) {
         $tab = $this.Active()
         $start = [Math]::Min($tab.Anchor, $tab.Focus)
         $end = [Math]::Max($tab.Anchor, $tab.Focus)
-        if (-not $Coalesce -or ([DateTime]::UtcNow - $tab.LastEdit).TotalMilliseconds -gt 700 -or $start -ne $end) { $tab.Undo.Add($this.Snapshot($tab)) }
-        $tab.Redo.Clear()
         $Text = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
-        $tab.Text = $tab.Text.Substring(0, $start) + $Text + $tab.Text.Substring($end)
+        if ($Text.Length -eq 0 -and $start -eq $end) { return }
+        if (-not $Coalesce -or ([DateTime]::UtcNow - $tab.LastEdit).TotalMilliseconds -gt 700 -or $start -ne $end) { $tab.Document.BeginGroup() }
+        $tab.Document.Replace($start, $end - $start, $Text)
         $tab.Focus = $start + $Text.Length
         $tab.Anchor = $tab.Focus
-        $tab.Modified = $true
+        $tab.RefreshModified()
         $tab.Revision = $tab.Revision + 1
         $tab.LastEdit = [DateTime]::UtcNow
         $this.Find()
     }
 
-    hidden [int] Boundary([string]$Text, [int]$Position, [int]$Direction) {
-        $offsets = [Globalization.StringInfo]::ParseCombiningCharacters($Text)
+    # The next grapheme boundary before or after a position, read from a window of 32 characters on each side of it
+    # rather than the whole text.
+    hidden [int] Boundary([NotepadTab]$Tab, [int]$Position, [int]$Direction) {
+        $from = [Math]::Max(0, $Position - 32)
+        $to = [Math]::Min($Tab.Document.Length, $Position + 32)
+        $local = $Position - $from
+        $offsets = [Globalization.StringInfo]::ParseCombiningCharacters($Tab.Slice($from, $to - $from))
         if ($Direction -lt 0) {
-            for ($i = $offsets.Length - 1; $i -ge 0; $i--) { if ($offsets[$i] -lt $Position) { return $offsets[$i] } }
-            return 0
+            for ($i = $offsets.Length - 1; $i -ge 0; $i--) { if ($offsets[$i] -lt $local) { return $from + $offsets[$i] } }
+            return $from
         }
-        foreach ($offset in $offsets) { if ($offset -gt $Position) { return $offset } }
-        return $Text.Length
+        foreach ($offset in $offsets) { if ($offset -gt $local) { return $from + $offset } }
+        return $to
     }
 
     [void] Delete([bool]$Backspace) {
@@ -174,7 +202,7 @@ class NotepadModel {
         if ($tab.Anchor -eq $tab.Focus) {
             $direction = 1
             if ($Backspace) { $direction = -1 }
-            $other = $this.Boundary($tab.Text, $tab.Focus, $direction)
+            $other = $this.Boundary($tab, $tab.Focus, $direction)
             if ($other -eq $tab.Focus) { return }
             $tab.Anchor = $other
         }
@@ -182,19 +210,15 @@ class NotepadModel {
     }
 
     [void] Undo() { $this.Undo($false) }
+    # Undo or redo walks the document's journal one group at a time; the caret lands after the restored text.
     [void] Undo([bool]$Redo) {
         $tab = $this.Active()
-        $from = $tab.Undo
-        $to = $tab.Redo
-        if ($Redo) { $from = $tab.Redo; $to = $tab.Undo }
-        if (-not $from.Count) { return }
-        $to.Add($this.Snapshot($tab))
-        $saved = $from[$from.Count - 1]
-        $from.RemoveAt($from.Count - 1)
-        $tab.Text = $saved.Text
-        $tab.Anchor = $saved.Anchor
-        $tab.Focus = $saved.Focus
-        $tab.Modified = $true
+        $caret = -1
+        if ($Redo) { $caret = $tab.Document.Redo() } else { $caret = $tab.Document.Undo() }
+        if ($caret -lt 0) { return }
+        $tab.Anchor = $caret
+        $tab.Focus = $caret
+        $tab.RefreshModified()
         $tab.Revision = $tab.Revision + 1
         $tab.LastEdit = [DateTime]::MinValue
         $this.Find()
@@ -210,28 +234,28 @@ class NotepadModel {
         else {
             switch ($Direction) {
                 'left' {
-                    $pos = $this.Boundary($tab.Text, $pos, -1)
+                    $pos = $this.Boundary($tab, $pos, -1)
                     if ($Word) {
-                        while ($pos -gt 0 -and [char]::IsWhiteSpace($tab.Text[$pos])) { $pos = $this.Boundary($tab.Text, $pos, -1) }
-                        while ($pos -gt 0 -and -not [char]::IsWhiteSpace($tab.Text[$pos - 1])) { $pos = $this.Boundary($tab.Text, $pos, -1) }
+                        while ($pos -gt 0 -and $pos -lt $tab.Document.Length -and [char]::IsWhiteSpace($tab.At($pos))) { $pos = $this.Boundary($tab, $pos, -1) }
+                        while ($pos -gt 0 -and -not [char]::IsWhiteSpace($tab.At($pos - 1))) { $pos = $this.Boundary($tab, $pos, -1) }
                     }
                 }
                 'right' {
-                    $pos = $this.Boundary($tab.Text, $pos, 1)
+                    $pos = $this.Boundary($tab, $pos, 1)
                     if ($Word) {
-                        while ($pos -lt $tab.Text.Length -and -not [char]::IsWhiteSpace($tab.Text[$pos])) { $pos = $this.Boundary($tab.Text, $pos, 1) }
-                        while ($pos -lt $tab.Text.Length -and [char]::IsWhiteSpace($tab.Text[$pos])) { $pos = $this.Boundary($tab.Text, $pos, 1) }
+                        while ($pos -lt $tab.Document.Length -and -not [char]::IsWhiteSpace($tab.At($pos))) { $pos = $this.Boundary($tab, $pos, 1) }
+                        while ($pos -lt $tab.Document.Length -and [char]::IsWhiteSpace($tab.At($pos))) { $pos = $this.Boundary($tab, $pos, 1) }
                     }
                 }
                 'home' {
-                    if ($Word) { $pos = 0 } else { $pos = $tab.Text.LastIndexOf("`n", [Math]::Max(0, $pos - 1)) + 1 }
+                    if ($Word) { $pos = 0 } else { $pos = $tab.Document.LineStart($tab.Document.LineOf($pos)) }
                     if ($tab.Focus -eq 0) { $pos = 0 }
                 }
                 'end' {
-                    if ($Word) { $pos = $tab.Text.Length }
+                    if ($Word) { $pos = $tab.Document.Length }
                     else {
-                        $p = $tab.Text.IndexOf("`n", $pos)
-                        if ($p -lt 0) { $pos = $tab.Text.Length } else { $pos = $p }
+                        $line = $tab.Document.LineOf($pos)
+                        if ($line + 1 -ge $tab.Document.LineCount()) { $pos = $tab.Document.Length } else { $pos = $tab.Document.LineStart($line + 1) - 1 }
                     }
                 }
             }
@@ -244,12 +268,12 @@ class NotepadModel {
     [NotepadStatus] Status() {
         $tab = $this.Active()
         $start = [Math]::Min($tab.Anchor, $tab.Focus)
-        $before = $tab.Text.Substring(0, $start)
-        $lines = $before.Split("`n")
+        # Line and column from the document's line index, not by splitting the text.
+        $line = $tab.Document.LineOf($start)
         $status = [NotepadStatus]::new()
-        $status.Line = $lines.Length
-        $status.Column = $lines[$lines.Length - 1].Length + 1
-        $status.Characters = $tab.Text.Length
+        $status.Line = $line + 1
+        $status.Column = $start - $tab.Document.LineStart($line) + 1
+        $status.Characters = $tab.Document.Length
         $status.Selected = [Math]::Abs($tab.Focus - $tab.Anchor)
         return $status
     }
@@ -264,9 +288,10 @@ class NotepadModel {
         $comparison = [StringComparison]::OrdinalIgnoreCase
         if ($find.MatchCase) { $comparison = [StringComparison]::Ordinal }
         $positions = [Collections.Generic.List[NotepadMatch]]::new()
+        $content = $tab.Content()
         $offset = 0
-        while ($offset -le $tab.Text.Length - $find.Query.Length) {
-            $index = $tab.Text.IndexOf($find.Query, $offset, $comparison)
+        while ($offset -le $content.Length - $find.Query.Length) {
+            $index = $content.IndexOf($find.Query, $offset, $comparison)
             if ($index -lt 0) { break }
             $match = [NotepadMatch]::new()
             $match.Start = $index
@@ -301,12 +326,12 @@ class NotepadModel {
         if ($All) {
             $this.Find()
             $tab = $this.Active()
-            $text = $tab.Text
+            $text = $tab.Content()
             for ($i = $find.Matches.Count - 1; $i -ge 0; $i--) {
                 $m = $find.Matches[$i]
                 $text = $text.Substring(0, $m.Start) + $find.Replacement + $text.Substring($m.End)
             }
-            if ($find.Matches.Count) { $this.Select(0, $tab.Text.Length); $this.Insert($text) }
+            if ($find.Matches.Count) { $this.Select(0, $tab.Document.Length); $this.Insert($text) }
         }
         elseif ($find.Matches.Count) {
             $m = $find.Matches[$find.Index]
@@ -319,7 +344,7 @@ class NotepadModel {
     [NotepadSaved] Save([int]$Id, [string]$Path) {
         $tab = $this.Tab($Id)
         if ($null -eq $tab) { throw ('Unknown document ' + $Id) }
-        $text = $tab.Text
+        $text = $tab.Content()
         if ($tab.LineEnding -eq 'Windows (CRLF)') { $text = $text.Replace("`n", "`r`n") }
         $fullPath = [IO.Path]::GetFullPath($Path)
         # Write a sibling temporary file first, then replace the destination. A
@@ -329,7 +354,10 @@ class NotepadModel {
         finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
         $tab.Path = $fullPath
         $tab.Title = [IO.Path]::GetFileName($fullPath)
-        $tab.Modified = $false
+        $tab.Document.SavedJournalPosition = $tab.Document.JournalPosition
+        $tab.SavedLineEnding = $tab.LineEnding
+        $tab.SavedKnown = $true
+        $tab.RefreshModified()
         $saved = [NotepadSaved]::new()
         $saved.Outcome = 'Saved'
         $saved.Id = $tab.Id
@@ -350,7 +378,7 @@ class NotepadModel {
     [hashtable] ExportSession() {
         $tabs = [Collections.Generic.List[object]]::new()
         foreach ($tab in $this.modelState.Tabs) {
-            $tabs.Add(@{Id=$tab.Id;Title=$tab.Title;Text=$tab.Text;Path=$tab.Path;Markdown=$tab.Markdown;LineEnding=$tab.LineEnding;Encoding=$tab.Encoding;Bom=$tab.Bom;Modified=$tab.Modified;Anchor=$tab.Anchor;Focus=$tab.Focus;ScrollX=$tab.ScrollX;ScrollY=$tab.ScrollY})
+            $tabs.Add(@{Id=$tab.Id;Title=$tab.Title;Text=$tab.Content();Path=$tab.Path;Markdown=$tab.Markdown;LineEnding=$tab.LineEnding;Encoding=$tab.Encoding;Bom=$tab.Bom;Modified=$tab.Modified;Anchor=$tab.Anchor;Focus=$tab.Focus;ScrollX=$tab.ScrollX;ScrollY=$tab.ScrollY})
         }
         return @{NextId=$this.modelState.NextId;ActiveId=$this.modelState.ActiveId;Tabs=$tabs.ToArray()}
     }
@@ -367,7 +395,7 @@ class NotepadModel {
         foreach ($tab in $this.modelState.Tabs) {
             $Writer.Write([int]$tab.Id)
             [NotepadModel]::WriteText($Writer, $tab.Title)
-            [NotepadModel]::WriteText($Writer, $tab.Text)
+            [NotepadModel]::WriteText($Writer, $tab.Content())
             [NotepadModel]::WriteText($Writer, $tab.Path)
             $Writer.Write([bool]$tab.Markdown)
             [NotepadModel]::WriteText($Writer, $tab.LineEnding)
@@ -413,13 +441,18 @@ class NotepadModel {
             $tab.LineEnding = [NotepadModel]::ReadText($Reader)
             $tab.Encoding = [NotepadModel]::ReadText($Reader)
             $tab.Bom = $Reader.ReadBoolean()
-            $tab.Modified = $Reader.ReadBoolean()
+            # An untitled tab is measured against no text; a file tab saved unmodified against its restored text;
+            # a file tab saved modified stays modified, since what its file held is not in the session.
+            $restoredModified = $Reader.ReadBoolean()
+            $tab.SavedLineEnding = $tab.LineEnding
+            if ($path -and $restoredModified) { $tab.SavedKnown = $false }
+            $tab.RefreshModified()
             $tab.Anchor = $Reader.ReadInt32()
             $tab.Focus = $Reader.ReadInt32()
             $tab.ScrollX = $Reader.ReadDouble()
             $tab.ScrollY = $Reader.ReadDouble()
-            $tab.Focus = [Math]::Clamp($tab.Focus, 0, $tab.Text.Length)
-            $tab.Anchor = [Math]::Clamp($tab.Anchor, 0, $tab.Text.Length)
+            $tab.Focus = [Math]::Clamp($tab.Focus, 0, $tab.Document.Length)
+            $tab.Anchor = [Math]::Clamp($tab.Anchor, 0, $tab.Document.Length)
         }
         $highest = 0
         foreach ($tab in $this.modelState.Tabs) { $highest = [Math]::Max($highest, $tab.Id) }
@@ -465,35 +498,35 @@ try{
     $null=$model.Save($first.Id,$firstPath)
     Assert ([IO.File]::ReadAllText($firstPath) -ceq 'first buffer') 'Inactive save used active document text.'
     Assert ($model.Active().Id -eq $second.Id) 'Save changed active tab.'
-    $model.Select(0,$second.Text.Length);$model.Insert("A😀e$([char]0x301)`nB",$false)
-    Assert ($second.Text.Length -eq 7) 'UTF-16 storage mismatch.'
+    $model.Select(0,$second.Length());$model.Insert("A😀e$([char]0x301)`nB",$false)
+    Assert ($second.Length() -eq 7) 'UTF-16 storage mismatch.'
     $model.Select(3,3);$model.Delete($true)
-    Assert ($second.Text -ceq "Ae$([char]0x301)`nB") 'Backspace split a surrogate pair.'
+    Assert ($second.Content() -ceq "Ae$([char]0x301)`nB") 'Backspace split a surrogate pair.'
     $model.Undo($false)
-    Assert ($second.Text -ceq "A😀e$([char]0x301)`nB") 'Undo failed.'
+    Assert ($second.Content() -ceq "A😀e$([char]0x301)`nB") 'Undo failed.'
     $model.Undo($true)
-    Assert ($second.Text -ceq "Ae$([char]0x301)`nB") 'Redo failed.'
+    Assert ($second.Content() -ceq "Ae$([char]0x301)`nB") 'Redo failed.'
     $model.Select(3,3);$model.Delete($true)
-    Assert ($second.Text -ceq "A`nB") 'Backspace split a combining sequence.'
-    $model.Select(0,$second.Text.Length);$model.Insert('one ONE one',$false)
+    Assert ($second.Content() -ceq "A`nB") 'Backspace split a combining sequence.'
+    $model.Select(0,$second.Length());$model.Insert('one ONE one',$false)
     $state.Find.Query='one';$state.Find.Replacement='$literal';$state.Find.MatchCase=$false;$model.Find()
     Assert ($state.Find.Matches.Count -eq 3) 'Case-insensitive find mismatch.'
     $state.Find.MatchCase=$true;$model.Find();Assert ($state.Find.Matches.Count -eq 2) 'Case-sensitive find mismatch.'
     $model.Replace($true)
-    Assert ($second.Text -ceq '$literal ONE $literal') 'Literal replace-all mismatch.'
-    $model.Select(0,$second.Text.Length);$model.Insert("α`nβ",$false);$second.LineEnding='Windows (CRLF)';$second.Bom=$true
+    Assert ($second.Content() -ceq '$literal ONE $literal') 'Literal replace-all mismatch.'
+    $model.Select(0,$second.Length());$model.Insert("α`nβ",$false);$second.LineEnding='Windows (CRLF)';$second.Bom=$true
     $secondPath=Join-Path $testDirectory 'second.txt';$null=$model.Save($second.Id,$secondPath)
     $bytes=[IO.File]::ReadAllBytes($secondPath)
     Assert (($bytes[0..2] -join ',') -eq '239,187,191') 'UTF-8 BOM missing.'
     Assert ([IO.File]::ReadAllText($secondPath) -ceq "α`r`nβ") 'CRLF output mismatch.'
-    $third=$model.Open($secondPath);Assert ($third.Text -ceq "α`nβ" -and $third.Bom) 'UTF-8 reopen mismatch.'
+    $third=$model.Open($secondPath);Assert ($third.Content() -ceq "α`nβ" -and $third.Bom) 'UTF-8 reopen mismatch.'
     $buffer=[IO.MemoryStream]::new();$sessionWriter=[IO.BinaryWriter]::new($buffer);$model.WriteSession($sessionWriter,$true);$sessionWriter.Flush();$buffer.Position=0
     $restored=Invoke-Model;$restored.ReadSession([IO.BinaryReader]::new($buffer))
-    $before=foreach($tab in $model.State().Tabs){$tab.Text+'|'+$tab.Path+'|'+$tab.LineEnding+'|'+$tab.Encoding+'|'+$tab.Bom+'|'+$tab.Modified+'|'+$tab.Anchor+'|'+$tab.Focus}
-    $after=foreach($tab in $restored.State().Tabs){$tab.Text+'|'+$tab.Path+'|'+$tab.LineEnding+'|'+$tab.Encoding+'|'+$tab.Bom+'|'+$tab.Modified+'|'+$tab.Anchor+'|'+$tab.Focus}
+    $before=foreach($tab in $model.State().Tabs){$tab.Content()+'|'+$tab.Path+'|'+$tab.LineEnding+'|'+$tab.Encoding+'|'+$tab.Bom+'|'+$tab.Modified+'|'+$tab.Anchor+'|'+$tab.Focus}
+    $after=foreach($tab in $restored.State().Tabs){$tab.Content()+'|'+$tab.Path+'|'+$tab.LineEnding+'|'+$tab.Encoding+'|'+$tab.Bom+'|'+$tab.Modified+'|'+$tab.Anchor+'|'+$tab.Focus}
     Assert (($before -join "`n") -ceq ($after -join "`n")) 'Session round trip changed a document.'
     Assert ($restored.State().Tabs.Count -eq 3) 'Session lost documents.'
-    Assert ($restored.Active().Text -ceq "α`nβ") 'Session active document mismatch.'
+    Assert ($restored.Active().Content() -ceq "α`nβ") 'Session active document mismatch.'
     $lastId=$restored.Active().Id;$restored.CloseTab($lastId);Assert ($restored.State().Tabs.Count -eq 2) 'Close-tab failed.'
     'PASS: inactive saves, Unicode editing, undo/redo, find/replace, UTF-8/BOM/CRLF and session restoration.'
 }finally{
@@ -792,6 +825,8 @@ class NotepadWindow {
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
     static [IntPtr] LoadIconW([IntPtr]$instance, [IntPtr]$name) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] LoadImageW([IntPtr]$instance, [IntPtr]$name, [uint]$type, [int]$width, [int]$height, [uint]$load) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
     static [int] DestroyIcon([IntPtr]$icon) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
     static [int] PeekMessageW([IntPtr]$message, [IntPtr]$hwnd, [uint]$first, [uint]$last, [uint]$remove) { throw 'native' }
@@ -805,6 +840,75 @@ class NotepadWindow {
     static [int] DestroyWindow([IntPtr]$hwnd) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
     static [int] UnregisterClassW([IntPtr]$class, [IntPtr]$instance) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('advapi32.dll')]
+    static [int] RegGetValueW([IntPtr]$key, [IntPtr]$subKey, [IntPtr]$value, [uint]$flags, [IntPtr]$type, [IntPtr]$data, [IntPtr]$size) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('kernel32.dll')]
+    static [int] CreateProcessW([IntPtr]$application, [IntPtr]$commandLine, [IntPtr]$processAttributes, [IntPtr]$threadAttributes, [int]$inheritHandles, [uint]$flags, [IntPtr]$environment, [IntPtr]$directory, [IntPtr]$startupInfo, [IntPtr]$processInformation) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('kernel32.dll')]
+    static [int] CloseHandle([IntPtr]$handle) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('shell32.dll')]
+    static [IntPtr] ShellExecuteW([IntPtr]$hwnd, [IntPtr]$operation, [IntPtr]$file, [IntPtr]$fileArguments, [IntPtr]$directory, [int]$show) { throw 'native' }
+
+    # Whether Windows asks apps for the light theme: HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize
+    # AppsUseLightTheme is 1. A value that cannot be read is not 1.
+    static [bool] AppsUseLightTheme() {
+        $subKey = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('Software\Microsoft\Windows\CurrentVersion\Themes\Personalize')
+        $name = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('AppsUseLightTheme')
+        $data = [Runtime.InteropServices.Marshal]::AllocHGlobal(8)
+        try {
+            [Runtime.InteropServices.Marshal]::WriteInt32($data, 0, 0)
+            [Runtime.InteropServices.Marshal]::WriteInt32($data, 4, 4)
+            # HKEY_CURRENT_USER is 0x80000001 sign-extended; RRF_RT_REG_DWORD is 0x10.
+            $status = [NotepadWindow]::RegGetValueW([IntPtr][long]-2147483647, $subKey, $name, [uint]0x10, [IntPtr]::Zero, $data, [IntPtr]::Add($data, 4))
+            return $status -eq 0 -and [Runtime.InteropServices.Marshal]::ReadInt32($data, 0) -eq 1
+        }
+        finally {
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($data)
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($name)
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($subKey)
+        }
+    }
+
+    # Starts a program from its command line (its quoted path first, then its arguments), without waiting for it.
+    static [void] StartProgram([string]$CommandLine) {
+        # STARTUPINFOW is 104 bytes and PROCESS_INFORMATION 24 on a 64-bit process.
+        $startup = [Runtime.InteropServices.Marshal]::AllocHGlobal(104)
+        $process = [Runtime.InteropServices.Marshal]::AllocHGlobal(24)
+        $line = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($CommandLine)
+        try {
+            for ($i = 0; $i -lt 104; $i++) { [Runtime.InteropServices.Marshal]::WriteByte($startup, $i, 0) }
+            [Runtime.InteropServices.Marshal]::WriteInt32($startup, 0, 104)
+            if ([NotepadWindow]::CreateProcessW([IntPtr]::Zero, $line, [IntPtr]::Zero, [IntPtr]::Zero, 0, [uint]0, [IntPtr]::Zero, [IntPtr]::Zero, $startup, $process) -eq 0) { throw ('Could not start ' + $CommandLine) }
+            $null = [NotepadWindow]::CloseHandle([Runtime.InteropServices.Marshal]::ReadIntPtr($process, 0))
+            $null = [NotepadWindow]::CloseHandle([Runtime.InteropServices.Marshal]::ReadIntPtr($process, 8))
+        }
+        finally {
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($line)
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($process)
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($startup)
+        }
+    }
+
+    # A new activity of this program: the compiled program again, or, run as a script, pwsh running this script.
+    static [void] StartActivity() {
+        $program = [Environment]::ProcessPath
+        $line = if ([IO.Path]::GetFileNameWithoutExtension($program) -eq 'pwsh') { '"' + $program + '" -NoProfile -STA -File "' + $PSScriptRoot + '\Notepad.ps1"' } else { '"' + $program + '"' }
+        [NotepadWindow]::StartProgram($line)
+    }
+
+    # An address opened by the system's own handler for it, as the shell's "open" does (the browser, for https).
+    static [void] OpenLink([string]$Address) {
+        $operation = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('open')
+        $file = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($Address)
+        try {
+            # SW_SHOWNORMAL is 1; a result of 32 or less is an error.
+            if ([NotepadWindow]::ShellExecuteW([IntPtr]::Zero, $operation, $file, [IntPtr]::Zero, [IntPtr]::Zero, 1).ToInt64() -le 32) { throw ('Could not open ' + $Address) }
+        }
+        finally {
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($file)
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($operation)
+        }
+    }
 
     [System.Runtime.InteropServices.UnmanagedCallersOnly(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
     static [IntPtr] WndProc([IntPtr]$Handle, [uint]$Message, [IntPtr]$WParam, [IntPtr]$LParam) {
@@ -988,7 +1092,14 @@ class NotepadWindow {
     [IntPtr] SelectIcon([string]$Kind, [int]$Id) {
         $owned = $false
         $icon = [IntPtr]::Zero
-        if ($Kind -eq 'stock') {
+        $small = [IntPtr]::Zero
+        if ($Kind -eq 'application') {
+            # The program's own icon group (resource ID $Id; PSC embeds [ApplicationIcon()] as 1) at the large and
+            # small icon sizes. Loaded shared, so Windows owns the handles.
+            $icon = [NotepadWindow]::LoadImageW($this.hmodule, [IntPtr]$Id, [uint]1, [NotepadWindow]::GetSystemMetrics(11), [NotepadWindow]::GetSystemMetrics(12), [uint]0x8000)
+            $small = [NotepadWindow]::LoadImageW($this.hmodule, [IntPtr]$Id, [uint]1, [NotepadWindow]::GetSystemMetrics(49), [NotepadWindow]::GetSystemMetrics(50), [uint]0x8000)
+        }
+        elseif ($Kind -eq 'stock') {
             $info = [Runtime.InteropServices.Marshal]::AllocHGlobal(544)
             for ($i = 0; $i -lt 544; $i++) { [Runtime.InteropServices.Marshal]::WriteByte($info, $i, 0) }
             try {
@@ -1001,7 +1112,8 @@ class NotepadWindow {
         }
         else { $icon = [NotepadWindow]::LoadIconW([IntPtr]::Zero, [IntPtr]$Id) }
         if ($icon -eq [IntPtr]::Zero) { throw 'Windows did not supply the selected icon.' }
-        $null = [NotepadWindow]::SendMessageW($this.hwnd, [uint]0x80, [IntPtr]0, $icon); $null = [NotepadWindow]::SendMessageW($this.hwnd, [uint]0x80, [IntPtr]1, $icon)
+        if ($small -eq [IntPtr]::Zero) { $small = $icon }
+        $null = [NotepadWindow]::SendMessageW($this.hwnd, [uint]0x80, [IntPtr]0, $small); $null = [NotepadWindow]::SendMessageW($this.hwnd, [uint]0x80, [IntPtr]1, $icon)
         if ($this.ownsWindowIcon -and $this.windowIcon -ne [IntPtr]::Zero) { $null = [NotepadWindow]::DestroyIcon($this.windowIcon) }
         $this.windowIcon = $icon; $this.ownsWindowIcon = $owned
         return $icon
@@ -1023,14 +1135,14 @@ class NotepadWindow {
         if ($Kind -eq 'text') { $this.currentCursor = $this.ibeam } elseif ($Kind -eq 'pointer') { $this.currentCursor = $this.hand }
         $null = [NotepadWindow]::SetCursor($this.currentCursor)
     }
-    [void] Caption([string]$Action) {
-        if ($Action -eq 'minimize') { $null = [NotepadWindow]::ShowWindow($this.hwnd, 6) }
-        elseif ($Action -eq 'maximize') {
+    [void] Caption([FluentWindowDecoration]$Decoration) {
+        if ($Decoration -eq [FluentWindowDecoration]::Minimize) { $null = [NotepadWindow]::ShowWindow($this.hwnd, 6) }
+        elseif ($Decoration -eq [FluentWindowDecoration]::Maximize) {
             $show = 3
             if ([NotepadWindow]::IsZoomed($this.hwnd) -ne 0) { $show = 9 }
             $null = [NotepadWindow]::ShowWindow($this.hwnd, $show)
         }
-        elseif ($Action -eq 'drag') { $null = [NotepadWindow]::ReleaseCapture(); $null = [NotepadWindow]::SendMessageW($this.hwnd, [uint]0xA1, [IntPtr]2, [IntPtr]::Zero) }
+        elseif ($Decoration -eq [FluentWindowDecoration]::Drag) { $null = [NotepadWindow]::ReleaseCapture(); $null = [NotepadWindow]::SendMessageW($this.hwnd, [uint]0xA1, [IntPtr]2, [IntPtr]::Zero) }
     }
     [void] Dispose() {
         $null = [NotepadWindow]::DestroyWindow($this.hwnd)
@@ -1039,6 +1151,147 @@ class NotepadWindow {
         [Runtime.InteropServices.Marshal]::FreeHGlobal($this.classPtr)
         [Runtime.InteropServices.Marshal]::FreeHGlobal($this.scratch)
         $null = [NotepadWindow]::SetThreadDpiAwarenessContext($this.previousDpi)
+    }
+}
+
+# The Windows clipboard: Unicode text (CF_UNICODETEXT) and a file list (CF_HDROP), owned by a window.
+class Win32Clipboard {
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] OpenClipboard([IntPtr]$owner) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] CloseClipboard() { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] EmptyClipboard() { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] GetClipboardData([uint]$format) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] SetClipboardData([uint]$format, [IntPtr]$memory) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('kernel32.dll')]
+    static [IntPtr] GlobalAlloc([uint]$flags, [UIntPtr]$bytes) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('kernel32.dll')]
+    static [IntPtr] GlobalLock([IntPtr]$memory) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('kernel32.dll')]
+    static [int] GlobalUnlock([IntPtr]$memory) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('kernel32.dll')]
+    static [IntPtr] GlobalFree([IntPtr]$memory) { throw 'native' }
+
+    # The clipboard's text; '' when it holds none.
+    static [string] ReadText([IntPtr]$Owner) {
+        if ([Win32Clipboard]::OpenClipboard($Owner) -eq 0) { throw [InvalidOperationException]::new('Clipboard is busy') }
+        try {
+            # CF_UNICODETEXT is 13.
+            $handle = [Win32Clipboard]::GetClipboardData([uint]13)
+            if ($handle -eq [IntPtr]::Zero) { return '' }
+            $pointer = [Win32Clipboard]::GlobalLock($handle)
+            if ($pointer -eq [IntPtr]::Zero) { throw [InvalidOperationException]::new('Clipboard lock failed') }
+            try { return [Runtime.InteropServices.Marshal]::PtrToStringUni($pointer) }
+            finally { $null = [Win32Clipboard]::GlobalUnlock($handle) }
+        }
+        finally { $null = [Win32Clipboard]::CloseClipboard() }
+    }
+
+    static [void] WriteText([IntPtr]$Owner, [string]$Text) {
+        [byte[]]$bytes = [Text.Encoding]::Unicode.GetBytes($Text + [char]0)
+        # GMEM_MOVEABLE is 2; CF_UNICODETEXT is 13.
+        [Win32Clipboard]::Transfer($Owner, [uint]13, [Win32Clipboard]::Fill([uint]2, $bytes, 0))
+    }
+
+    # A file holding Text, named for Title, as a file list: a durable UTF-8 snapshot the clipboard points at.
+    static [void] WriteFile([IntPtr]$Owner, [string]$Text, [string]$Title) {
+        [string]$folder = [IO.Path]::Join([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData), 'NotepadPS1', 'Clipboard', [guid]::NewGuid().ToString('N'))
+        $null = [IO.Directory]::CreateDirectory($folder)
+        [string]$name = [IO.Path]::GetFileNameWithoutExtension($Title)
+        foreach ($invalid in [IO.Path]::GetInvalidFileNameChars()) { $name = $name.Replace($invalid, [char]'_') }
+        if ($name.Length -eq 0) { $name = 'Untitled' }
+        [string]$file = [IO.Path]::Join($folder, $name + '.txt')
+        [IO.File]::WriteAllText($file, $Text, [Text.UTF8Encoding]::new($false))
+        # DROPFILES: pFiles (the list's offset, 20) at 0 and fWide (1) at 16, then the paths, double-null-terminated.
+        # GHND (GMEM_MOVEABLE | GMEM_ZEROINIT) is 0x42; CF_HDROP is 15.
+        [byte[]]$paths = [Text.Encoding]::Unicode.GetBytes($file + [char]0 + [char]0)
+        $handle = [Win32Clipboard]::Fill([uint]0x42, $paths, 20)
+        $pointer = [Win32Clipboard]::GlobalLock($handle)
+        [Runtime.InteropServices.Marshal]::WriteInt32($pointer, 0, 20)
+        [Runtime.InteropServices.Marshal]::WriteInt32($pointer, 16, 1)
+        $null = [Win32Clipboard]::GlobalUnlock($handle)
+        [Win32Clipboard]::Transfer($Owner, [uint]15, $handle)
+    }
+
+    # Global memory of Offset bytes followed by Bytes.
+    hidden static [IntPtr] Fill([uint]$Flags, [byte[]]$Bytes, [int]$Offset) {
+        $handle = [Win32Clipboard]::GlobalAlloc($Flags, [UIntPtr][uint]($Offset + $Bytes.Length))
+        if ($handle -eq [IntPtr]::Zero) { throw [InvalidOperationException]::new('Clipboard allocation failed') }
+        $pointer = [Win32Clipboard]::GlobalLock($handle)
+        if ($pointer -eq [IntPtr]::Zero) { $null = [Win32Clipboard]::GlobalFree($handle); throw [InvalidOperationException]::new('Clipboard lock failed') }
+        try { [Runtime.InteropServices.Marshal]::Copy($Bytes, 0, [IntPtr]::Add($pointer, $Offset), $Bytes.Length) }
+        finally { $null = [Win32Clipboard]::GlobalUnlock($handle) }
+        return $handle
+    }
+
+    # Hands the memory to the clipboard, which owns it once SetClipboardData succeeds; until then it is freed here.
+    hidden static [void] Transfer([IntPtr]$Owner, [uint]$Format, [IntPtr]$Handle) {
+        [bool]$owned = $true
+        try {
+            if ([Win32Clipboard]::OpenClipboard($Owner) -eq 0) { throw [InvalidOperationException]::new('Clipboard is busy') }
+            try {
+                if ([Win32Clipboard]::EmptyClipboard() -eq 0) { throw [InvalidOperationException]::new('Cannot clear clipboard') }
+                if ([Win32Clipboard]::SetClipboardData($Format, $Handle) -eq [IntPtr]::Zero) { throw [InvalidOperationException]::new('Clipboard transfer failed') }
+                $owned = $false
+            }
+            finally { $null = [Win32Clipboard]::CloseClipboard() }
+        }
+        finally { if ($owned) { $null = [Win32Clipboard]::GlobalFree($Handle) } }
+    }
+}
+
+# The common file dialog (GetOpenFileNameW, GetSaveFileNameW) for text documents.
+class Win32FileDialog {
+    [System.Runtime.InteropServices.LibraryImport('comdlg32.dll')]
+    static [int] GetOpenFileNameW([IntPtr]$dialog) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('comdlg32.dll')]
+    static [int] GetSaveFileNameW([IntPtr]$dialog) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('comdlg32.dll')]
+    static [uint] CommDlgExtendedError() { throw 'native' }
+
+    # The chosen path; $null when the dialog is cancelled. Suggested is the save dialog's starting name.
+    static [string] Choose([IntPtr]$Owner, [bool]$Save, [string]$Suggested) {
+        # OPENFILENAMEW x64 layout, commdlg.h. All buffers outlive the modal call.
+        $dialog = [Runtime.InteropServices.Marshal]::AllocHGlobal(152)
+        $file = [Runtime.InteropServices.Marshal]::AllocHGlobal(65536)
+        $filter = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('Text documents (*.txt;*.md)' + [char]0 + '*.txt;*.md' + [char]0 + 'All files (*.*)' + [char]0 + '*.*' + [char]0 + [char]0)
+        $extension = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('txt')
+        try {
+            [byte[]]$zero = [byte[]]::new(152)
+            [Runtime.InteropServices.Marshal]::Copy($zero, 0, $dialog, 152)
+            [Runtime.InteropServices.Marshal]::WriteInt16($file, 0, [short]0)
+            if ($Save) {
+                [byte[]]$chars = [Text.Encoding]::Unicode.GetBytes($Suggested + [char]0)
+                [Runtime.InteropServices.Marshal]::Copy($chars, 0, $file, [Math]::Min($chars.Length, 65534))
+            }
+            [Runtime.InteropServices.Marshal]::WriteInt32($dialog, 0, 152)
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($dialog, 8, $Owner)
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($dialog, 24, $filter)
+            [Runtime.InteropServices.Marshal]::WriteInt32($dialog, 44, 1)
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($dialog, 48, $file)
+            [Runtime.InteropServices.Marshal]::WriteInt32($dialog, 56, 32768)
+            # OFN_EXPLORER 0x80000 | OFN_PATHMUSTEXIST 0x800 | OFN_NOCHANGEDIR 0x8, with OFN_FILEMUSTEXIST 0x1000 to open
+            # or OFN_OVERWRITEPROMPT 0x2 to save.
+            [int]$flags = 0x81808
+            if ($Save) { $flags = 0x8080A }
+            [Runtime.InteropServices.Marshal]::WriteInt32($dialog, 96, $flags)
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($dialog, 104, $extension)
+            [int]$chosen = 0
+            if ($Save) { $chosen = [Win32FileDialog]::GetSaveFileNameW($dialog) } else { $chosen = [Win32FileDialog]::GetOpenFileNameW($dialog) }
+            if ($chosen -ne 0) { return [Runtime.InteropServices.Marshal]::PtrToStringUni($file) }
+            [uint]$code = [Win32FileDialog]::CommDlgExtendedError()
+            if ($code -ne 0) { throw [InvalidOperationException]::new('File dialog failed: ' + $code) }
+            return $null
+        }
+        finally {
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($dialog)
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($file)
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($filter)
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($extension)
+        }
     }
 }
 
@@ -11596,7 +11849,6 @@ try{
     $window=Invoke-Window.Windows -Width 960 -Height 540 -Title 'Notepad PS graphics smoke'
     $info=$window.Info()
     $graphics=Invoke-Graphics.Windows -Hwnd $window.Handle() -Width $info.Width -Height $info.Height -Dpi $info.Dpi
-    $design=Invoke-Design
     $window.Show()
     $graphics.Begin('#1f1f1f')
     $graphics.Fill(0,78,960,434,'#282828',0)
@@ -11746,89 +11998,7 @@ try{
 }
 
 # Folded from src\Services.Windows.ps1
-function Invoke-Services.Windows {
-[CmdletBinding()]
-param([Parameter(Mandatory)][object]$Native,[Parameter(Mandatory)][IntPtr]$Hwnd)
-if($MyInvocation.InvocationName -eq '.'){throw 'Invoke Services.Windows.ps1 with &.'}
-New-Module -AsCustomObject -ArgumentList $Native,$Hwnd -ScriptBlock {
-    param($Native,$Hwnd)
-    $script:n=$Native;$script:hwnd=$Hwnd
-    function Bind($Dll,$Name,$Return,$Types){$n.GetExportCall($Dll,$Name,$Return,[Type[]]$Types)}
-    function FileDialog([bool]$Save,[string]$Suggested='Untitled.txt'){
-        # OPENFILENAMEW x64 layout, commdlg.h. All buffers outlive the modal call.
-        $memory=$n.Allocate(152);$file=$n.Allocate(65536)
-        $filter=[Runtime.InteropServices.Marshal]::StringToHGlobalUni("Text documents (*.txt;*.md)`0*.txt;*.md`0All files (*.*)`0*.*`0`0")
-        $extension=[Runtime.InteropServices.Marshal]::StringToHGlobalUni('txt')
-        try{
-            if($Save){$chars=([Text.Encoding]::Unicode.GetBytes($Suggested+[char]0));[Runtime.InteropServices.Marshal]::Copy($chars,0,$file,[Math]::Min($chars.Length,65534))}
-            [Runtime.InteropServices.Marshal]::WriteInt32($memory,0,152)
-            [Runtime.InteropServices.Marshal]::WriteIntPtr($memory,8,$hwnd)
-            [Runtime.InteropServices.Marshal]::WriteIntPtr($memory,24,$filter)
-            [Runtime.InteropServices.Marshal]::WriteInt32($memory,44,1)
-            [Runtime.InteropServices.Marshal]::WriteIntPtr($memory,48,$file)
-            [Runtime.InteropServices.Marshal]::WriteInt32($memory,56,32768)
-            [Runtime.InteropServices.Marshal]::WriteInt32($memory,96,$(if($Save){0x8080A}else{0x81808}))
-            [Runtime.InteropServices.Marshal]::WriteIntPtr($memory,104,$extension)
-            $call=Bind 'comdlg32.dll' $(if($Save){'GetSaveFileNameW'}else{'GetOpenFileNameW'}) ([bool]) @([IntPtr])
-            if($call.DynamicInvoke($memory)){return [Runtime.InteropServices.Marshal]::PtrToStringUni($file)}
-            $errorCall=Bind 'comdlg32.dll' 'CommDlgExtendedError' ([uint32]) @()
-            $code=$errorCall.DynamicInvoke();if($code){throw "File dialog failed: $code"}
-            $null
-        }finally{$n.Free($memory);$n.Free($file);[Runtime.InteropServices.Marshal]::FreeHGlobal($filter);[Runtime.InteropServices.Marshal]::FreeHGlobal($extension)}
-    }
-    function ReadClipboard {
-        $open=Bind 'user32.dll' 'OpenClipboard' ([bool]) @([IntPtr]);$close=Bind 'user32.dll' 'CloseClipboard' ([bool]) @()
-        if(-not $open.DynamicInvoke($hwnd)){throw 'Clipboard is busy'}
-        try{
-            $get=Bind 'user32.dll' 'GetClipboardData' ([IntPtr]) @([uint32]);$handle=$get.DynamicInvoke([uint32]13)
-            if($handle -eq [IntPtr]::Zero){return ''}
-            $lock=Bind 'kernel32.dll' 'GlobalLock' ([IntPtr]) @([IntPtr]);$unlock=Bind 'kernel32.dll' 'GlobalUnlock' ([bool]) @([IntPtr]);$ptr=$lock.DynamicInvoke($handle)
-            if($ptr -eq [IntPtr]::Zero){throw 'Clipboard lock failed'}
-            try{[Runtime.InteropServices.Marshal]::PtrToStringUni($ptr)}finally{$null=$unlock.DynamicInvoke($handle)}
-        }finally{$null=$close.DynamicInvoke()}
-    }
-    function WriteClipboard([string]$Text){
-        $open=Bind 'user32.dll' 'OpenClipboard' ([bool]) @([IntPtr]);$close=Bind 'user32.dll' 'CloseClipboard' ([bool]) @()
-        $allocate=Bind 'kernel32.dll' 'GlobalAlloc' ([IntPtr]) @([uint32],[UIntPtr]);$lock=Bind 'kernel32.dll' 'GlobalLock' ([IntPtr]) @([IntPtr]);$unlock=Bind 'kernel32.dll' 'GlobalUnlock' ([bool]) @([IntPtr]);$free=Bind 'kernel32.dll' 'GlobalFree' ([IntPtr]) @([IntPtr])
-        $bytes=[Text.Encoding]::Unicode.GetBytes($Text+[char]0);$handle=$allocate.DynamicInvoke([uint32]2,[UIntPtr]$bytes.Length);$owned=$true
-        if($handle -eq [IntPtr]::Zero){throw 'Clipboard allocation failed'}
-        try{
-            $ptr=$lock.DynamicInvoke($handle);if($ptr -eq [IntPtr]::Zero){throw 'Clipboard lock failed'}
-            try{[Runtime.InteropServices.Marshal]::Copy($bytes,0,$ptr,$bytes.Length)}finally{$null=$unlock.DynamicInvoke($handle)}
-            if(-not $open.DynamicInvoke($hwnd)){throw 'Clipboard is busy'}
-            try{
-                $empty=Bind 'user32.dll' 'EmptyClipboard' ([bool]) @();if(-not $empty.DynamicInvoke()){throw 'Cannot clear clipboard'}
-                $set=Bind 'user32.dll' 'SetClipboardData' ([IntPtr]) @([uint32],[IntPtr]);if($set.DynamicInvoke([uint32]13,$handle) -eq [IntPtr]::Zero){throw 'Clipboard transfer failed'};$owned=$false
-            }finally{$null=$close.DynamicInvoke()}
-        }finally{if($owned){$null=$free.DynamicInvoke($handle)}}
-    }
-    function WriteClipboardFile([string]$Text,[string]$Title){
-        # MansfieldPlumbing feature addition: CF_HDROP owns a path to a durable UTF-8 snapshot.
-        $folder=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('NotepadPS1\Clipboard\'+[guid]::NewGuid().ToString('N'))
-        $null=[IO.Directory]::CreateDirectory($folder)
-        $name=[IO.Path]::GetFileNameWithoutExtension($Title)
-        foreach($invalid in [IO.Path]::GetInvalidFileNameChars()){$name=$name.Replace([string]$invalid,'_')}
-        if(-not $name){$name='Untitled'}
-        $file=Join-Path $folder ($name+'.txt');[IO.File]::WriteAllText($file,$Text,[Text.UTF8Encoding]::new($false))
-        $paths=[Text.Encoding]::Unicode.GetBytes($file+[char]0+[char]0)
-        $allocate=Bind 'kernel32.dll' 'GlobalAlloc' ([IntPtr]) @([uint32],[UIntPtr]);$lock=Bind 'kernel32.dll' 'GlobalLock' ([IntPtr]) @([IntPtr]);$unlock=Bind 'kernel32.dll' 'GlobalUnlock' ([bool]) @([IntPtr]);$free=Bind 'kernel32.dll' 'GlobalFree' ([IntPtr]) @([IntPtr])
-        $handle=$allocate.DynamicInvoke([uint32]0x42,[UIntPtr](20+$paths.Length));$owned=$true
-        if($handle -eq [IntPtr]::Zero){throw 'File clipboard allocation failed'}
-        try{
-            $ptr=$lock.DynamicInvoke($handle);if($ptr -eq [IntPtr]::Zero){throw 'File clipboard lock failed'}
-            try{[Runtime.InteropServices.Marshal]::WriteInt32($ptr,0,20);[Runtime.InteropServices.Marshal]::WriteInt32($ptr,16,1);[Runtime.InteropServices.Marshal]::Copy($paths,0,[IntPtr]::Add($ptr,20),$paths.Length)}finally{$null=$unlock.DynamicInvoke($handle)}
-            $open=Bind 'user32.dll' 'OpenClipboard' ([bool]) @([IntPtr]);$close=Bind 'user32.dll' 'CloseClipboard' ([bool]) @()
-            if(-not $open.DynamicInvoke($hwnd)){throw 'Clipboard is busy'}
-            try{
-                $empty=Bind 'user32.dll' 'EmptyClipboard' ([bool]) @();if(-not $empty.DynamicInvoke()){throw 'Cannot clear clipboard'}
-                $set=Bind 'user32.dll' 'SetClipboardData' ([IntPtr]) @([uint32],[IntPtr]);if($set.DynamicInvoke([uint32]15,$handle) -eq [IntPtr]::Zero){throw 'File clipboard transfer failed'};$owned=$false
-            }finally{$null=$close.DynamicInvoke()}
-        }finally{if($owned){$null=$free.DynamicInvoke($handle)}}
-    }
-    
-    Export-ModuleMember -Function FileDialog,ReadClipboard,WriteClipboard,WriteClipboardFile
-}
-}
+
 
 if($MyInvocation.InvocationName -eq '.'){throw 'Invoke Notepad.ps1 with &, not dot-sourcing.'}
 $ErrorActionPreference='Stop'
@@ -11859,6 +12029,8 @@ class NotepadEdit {
     [int] $Position
     [NotepadPiece[]] $Removed
     [NotepadPiece[]] $Inserted
+    # Edits sharing a group undo and redo together (a burst of typing).
+    [int] $Group
     NotepadEdit([int] $position, [NotepadPiece[]] $removed, [NotepadPiece[]] $inserted) {
         $this.Position = $position
         $this.Removed = $removed
@@ -11877,6 +12049,8 @@ class NotepadDocument {
     [int] $SavedJournalPosition
     [int] $Length
     [int] $Revision
+    # The group the next recorded edit joins; BeginGroup starts a new one.
+    [int] $Group
     static [int] $ChunkLength = 65536
 
     NotepadDocument([string] $text) {
@@ -11888,6 +12062,7 @@ class NotepadDocument {
         $this.JournalPosition = 0
         $this.SavedJournalPosition = 0
         $this.Revision = 0
+        $this.Group = 0
         [int] $total = $this.Original.Length
         [int] $at = 0
         while ($at -lt $total) {
@@ -11964,9 +12139,12 @@ class NotepadDocument {
 
     [void] Record([NotepadEdit] $edit) {
         if ($this.JournalPosition -lt $this.Journal.Count) { $this.Journal.RemoveRange($this.JournalPosition, $this.Journal.Count - $this.JournalPosition) }
+        $edit.Group = $this.Group
         $this.Journal.Add($edit)
         $this.JournalPosition = $this.Journal.Count
     }
+
+    [void] BeginGroup() { $this.Group = $this.Group + 1 }
 
     [void] Insert([int] $position, [string] $text) {
         if ($text.Length -eq 0) { return }
@@ -12001,20 +12179,63 @@ class NotepadDocument {
         return $total
     }
 
-    [bool] Undo() {
-        if ($this.JournalPosition -eq 0) { return $false }
-        $this.JournalPosition = $this.JournalPosition - 1
-        [NotepadEdit] $edit = $this.Journal[$this.JournalPosition]
-        [NotepadPiece[]] $ignored = $this.ReplacePieces($edit.Position, $this.PiecesLength($edit.Inserted), $edit.Removed)
-        return $true
+    # Undoes the last group of edits; returns where the caret goes (after the restored text), or -1 when there is
+    # nothing to undo.
+    [int] Undo() {
+        if ($this.JournalPosition -eq 0) { return -1 }
+        [int] $undoing = $this.Journal[$this.JournalPosition - 1].Group
+        while ($this.JournalPosition -gt 0 -and $this.Journal[$this.JournalPosition - 1].Group -eq $undoing) {
+            $this.JournalPosition = $this.JournalPosition - 1
+            [NotepadEdit] $edit = $this.Journal[$this.JournalPosition]
+            [NotepadPiece[]] $ignored = $this.ReplacePieces($edit.Position, $this.PiecesLength($edit.Inserted), $edit.Removed)
+        }
+        # The group's first edit, now at the journal position, holds where the restored text ends.
+        [NotepadEdit] $earliest = $this.Journal[$this.JournalPosition]
+        return $earliest.Position + $this.PiecesLength($earliest.Removed)
     }
 
-    [bool] Redo() {
-        if ($this.JournalPosition -eq $this.Journal.Count) { return $false }
-        [NotepadEdit] $edit = $this.Journal[$this.JournalPosition]
-        [NotepadPiece[]] $ignored = $this.ReplacePieces($edit.Position, $this.PiecesLength($edit.Removed), $edit.Inserted)
-        $this.JournalPosition = $this.JournalPosition + 1
-        return $true
+    # Redoes the next group of edits; returns where the caret goes (after the inserted text), or -1 when there is
+    # nothing to redo.
+    [int] Redo() {
+        if ($this.JournalPosition -eq $this.Journal.Count) { return -1 }
+        [int] $redoing = $this.Journal[$this.JournalPosition].Group
+        while ($this.JournalPosition -lt $this.Journal.Count -and $this.Journal[$this.JournalPosition].Group -eq $redoing) {
+            [NotepadEdit] $edit = $this.Journal[$this.JournalPosition]
+            [NotepadPiece[]] $ignored = $this.ReplacePieces($edit.Position, $this.PiecesLength($edit.Removed), $edit.Inserted)
+            $this.JournalPosition = $this.JournalPosition + 1
+        }
+        # The group's last edit, just before the journal position, holds where the inserted text ends.
+        [NotepadEdit] $latest = $this.Journal[$this.JournalPosition - 1]
+        return $latest.Position + $this.PiecesLength($latest.Inserted)
+    }
+
+    # The character at a position in the document.
+    [char] At([int] $position) {
+        [int] $offset = 0
+        for ([int] $index = 0; $index -lt $this.Pieces.Count; $index++) {
+            [NotepadPiece] $piece = $this.Pieces[$index]
+            if ($position -lt $offset + $piece.Length) { return $this.CharAt($piece.Buffer, $piece.Start + ($position - $offset)) }
+            $offset = $offset + $piece.Length
+        }
+        throw [System.ArgumentOutOfRangeException]::new('position')
+    }
+
+    # The position where each line starts, in order; pieces without a line break are skipped whole.
+    [int[]] LineStarts() {
+        [System.Collections.Generic.List[int]] $starts = [System.Collections.Generic.List[int]]::new()
+        $starts.Add(0)
+        [int] $offset = 0
+        for ([int] $index = 0; $index -lt $this.Pieces.Count; $index++) {
+            [NotepadPiece] $piece = $this.Pieces[$index]
+            if ($piece.LineBreaks -gt 0) {
+                [int] $end = $piece.Start + $piece.Length
+                for ([int] $i = $piece.Start; $i -lt $end; $i++) {
+                    if ($this.CharAt($piece.Buffer, $i) -eq [char]10) { $starts.Add($offset + ($i - $piece.Start) + 1) }
+                }
+            }
+            $offset = $offset + $piece.Length
+        }
+        return $starts.ToArray()
     }
 
     [bool] Modified() { return $this.JournalPosition -ne $this.SavedJournalPosition }
@@ -12106,7 +12327,7 @@ class NotepadDocument {
 
 function Invoke-NotepadComparison {
 param(
-    [string] $EvidenceDirectory = (Join-Path $PSScriptRoot 'evidence'),
+    [string] $UIAutomationTestDataDirectory = (Join-Path $PSScriptRoot 'UIAutomation-TestData'),
     [switch] $KeepProbeOpen,
     [switch] $SkipBrowser,
     [switch] $ExtractTypeScript,
@@ -12128,9 +12349,9 @@ $predictions = [ordered]@{
     EditorTop = 'AllAgree'
     StatusTop = 'AllAgree'
 }
-New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+New-Item -ItemType Directory -Path $UIAutomationTestDataDirectory -Force | Out-Null
 [pscustomobject]@{ TimeUtc = [datetime]::UtcNow; Predictions = [pscustomobject]$predictions } |
-    Export-Clixml (Join-Path $EvidenceDirectory 'predictions.clixml')
+    Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'predictions.clixml')
 
 # All native calls use delegates built with Reflection.Emit. This stays in PowerShell:
 # no C#, Add-Type, external automation package, or process-wide settings.
@@ -12838,13 +13059,13 @@ if($CatalogIcons){
     }finally{[Runtime.InteropServices.Marshal]::FreeHGlobal($buffer)}
     $font=Join-Path $env:WINDIR 'Fonts\SegoeIcons.ttf'
     if(Test-Path $font){[void][Reflection.Assembly]::Load('PresentationCore');$face=[Windows.Media.GlyphTypeface]::new([uri]$font);foreach($entry in $face.CharacterToGlyphMap.GetEnumerator()|Sort-Object Key){$glyphs.Add([pscustomobject]@{CodePoint=('U+{0:X4}' -f $entry.Key);Scalar=[int]$entry.Key;GlyphIndex=[int]$entry.Value;GeometryStatus='Outline available; not yet extracted for this catalog'})}}
-    [pscustomobject]@{TimeUtc=[DateTime]::UtcNow;Machine=$env:COMPUTERNAME;WindowsBuild=[Environment]::OSVersion.Version.ToString();Scope='Available documented stock/system icons and installed Segoe Fluent glyphs';SdkHeader=$header;SdkSHA256=$(if(Test-Path $header){(Get-FileHash $header -Algorithm SHA256).Hash}else{$null});FontPath=$font;FontSHA256=$(if(Test-Path $font){(Get-FileHash $font -Algorithm SHA256).Hash}else{$null});CycleIcons=$icons.ToArray();Glyphs=$glyphs.ToArray()} | Export-Clixml (Join-Path $EvidenceDirectory 'windows-icon-catalog.clixml')
+    [pscustomobject]@{TimeUtc=[DateTime]::UtcNow;Machine=$env:COMPUTERNAME;WindowsBuild=[Environment]::OSVersion.Version.ToString();Scope='Available documented stock/system icons and installed Segoe Fluent glyphs';SdkHeader=$header;SdkSHA256=$(if(Test-Path $header){(Get-FileHash $header -Algorithm SHA256).Hash}else{$null});FontPath=$font;FontSHA256=$(if(Test-Path $font){(Get-FileHash $font -Algorithm SHA256).Hash}else{$null});CycleIcons=$icons.ToArray();Glyphs=$glyphs.ToArray()} | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'windows-icon-catalog.clixml')
     [pscustomobject]@{CycleIcons=$icons.Count;SegoeGlyphs=$glyphs.Count;Evidence='windows-icon-catalog.clixml'}
     return
 }
 if ($VerifyNativeFeatures) {
     # Tests use a fresh clone and retained hit rectangles, without touching the user's running editor.
-    $livePath=Join-Path $EvidenceDirectory 'native-feature-replay-live.json'
+    $livePath=Join-Path $UIAutomationTestDataDirectory 'native-feature-replay-live.json'
     if(Test-Path $livePath){Remove-Item -LiteralPath $livePath}
     $nativeReplay=Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -ArgumentList @('-NoProfile','-STA','-File',('"'+(Join-Path $PSScriptRoot 'Notepad.ps1')+'"'),'-NoSession','-Width','1000','-Height','720','-RunSeconds','120','-DiagnosticPath',('"'+$livePath+'"')) -WindowStyle Hidden -PassThru
     $replayStates=[Collections.Generic.List[object]]::new();$replayChecks=[Collections.Generic.List[object]]::new()
@@ -12886,7 +13107,7 @@ if ($VerifyNativeFeatures) {
         }
         function Capture-Replay([string]$Name){
             $tree=Get-UiaNode $replayRoot $replayWalker
-            $r=$tree.Properties.BoundingRectangle;$path=Join-Path $EvidenceDirectory ('native-feature-'+$Name+'.png')
+            $r=$tree.Properties.BoundingRectangle;$path=Join-Path $UIAutomationTestDataDirectory ('native-feature-'+$Name+'.png')
             Save-WindowImage $replayHandle $path ([int]$r[2]) ([int]$r[3])
             $replayStates.Add([pscustomobject]@{Name=$Name;Tree=$tree;Application=(Read-Replay);Image=$path;ImageSHA256=(Get-FileHash $path -Algorithm SHA256).Hash})
         }
@@ -12970,17 +13191,17 @@ if ($VerifyNativeFeatures) {
         $d=Read-Replay
         $replayChecks.Add([pscustomobject]@{Property='Whole-document file mode rocker';Expected=$true;Observed=$d.Settings.copyAsFile;Verdict=if($d.Settings.copyAsFile){'TRUE'}else{'FALSE'}})
         Click-Replay 'settings-btn-back'
-        [pscustomobject]@{Machine=$env:COMPUTERNAME;WindowsBuild=[Environment]::OSVersion.Version.ToString();TimeUtc=[DateTime]::UtcNow;SourceSHA256=(Get-FileHash (Join-Path $PSScriptRoot 'Notepad.ps1') -Algorithm SHA256).Hash;States=$replayStates.ToArray();Checks=$replayChecks.ToArray()} | Export-Clixml (Join-Path $EvidenceDirectory 'native-feature-replay.clixml')
+        [pscustomobject]@{Machine=$env:COMPUTERNAME;WindowsBuild=[Environment]::OSVersion.Version.ToString();TimeUtc=[DateTime]::UtcNow;SourceSHA256=(Get-FileHash (Join-Path $PSScriptRoot 'Notepad.ps1') -Algorithm SHA256).Hash;States=$replayStates.ToArray();Checks=$replayChecks.ToArray()} | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'native-feature-replay.clixml')
         $replayChecks | Format-Table -AutoSize
         if(@($replayChecks|Where-Object Verdict -eq 'FALSE').Count){throw 'The native feature replay found a defect.'}
     }finally{
-        [pscustomobject]@{TimeUtc=[DateTime]::UtcNow;SourceSHA256=(Get-FileHash (Join-Path $PSScriptRoot 'Notepad.ps1') -Algorithm SHA256).Hash;States=$replayStates.ToArray();Checks=$replayChecks.ToArray()}|Export-Clixml (Join-Path $EvidenceDirectory 'native-feature-replay-last-attempt.clixml')
+        [pscustomobject]@{TimeUtc=[DateTime]::UtcNow;SourceSHA256=(Get-FileHash (Join-Path $PSScriptRoot 'Notepad.ps1') -Algorithm SHA256).Hash;States=$replayStates.ToArray();Checks=$replayChecks.ToArray()}|Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'native-feature-replay-last-attempt.clixml')
         foreach($pointer in @($replayRoot,$replayWalker,$replayUia,$replayUnknown)){if($pointer -ne [IntPtr]::Zero){[void][Runtime.InteropServices.Marshal]::Release($pointer)}}
         $nativeReplay.Refresh();if(-not $nativeReplay.HasExited){$nativeReplay.Kill()}
     }
     return
 }
-$realCachePath = Join-Path $EvidenceDirectory 'real-notepad.clixml'
+$realCachePath = Join-Path $UIAutomationTestDataDirectory 'real-notepad.clixml'
 $useCachedReal = $false
 if (-not $RefreshReal -and (Test-Path $realCachePath)) {
     try {
@@ -13038,7 +13259,7 @@ try {
         $walker = Get-ComOut $uia 16
         try {
             $states = [Collections.Generic.List[object]]::new()
-            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'empty' $EvidenceDirectory))
+            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'empty' $UIAutomationTestDataDirectory))
             $getDpi = Get-NativeFunction 'user32.dll' 'GetDpiForWindow' $script:GetDpiType
             $dpi = $getDpi.DynamicInvoke([object[]]@([IntPtr]$probe.MainWindowHandle))
             $vk = $script:VirtualKey
@@ -13057,7 +13278,7 @@ try {
             foreach ($command in $realCommands) {
                 Send-KeyboardInput -Text $command.Text -Chord $command.Chord
                 Start-Sleep -Milliseconds 150
-                $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle $command.Name $EvidenceDirectory))
+                $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle $command.Name $UIAutomationTestDataDirectory))
             }
             Send-KeyboardInput -Chord $vk.Control, $vk.S
             # Saving can move keyboard focus away from the editor in recent Notepad builds.
@@ -13087,14 +13308,14 @@ try {
                     Send-KeyboardInput -Chord $vk.Back
                 }
                 Start-Sleep -Milliseconds 180
-                $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle $command.Name $EvidenceDirectory))
+                $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle $command.Name $UIAutomationTestDataDirectory))
             }
             Invoke-UiaElementByName $root $walker 'Open replace options' 50000
             Start-Sleep -Milliseconds 150
-            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'replace-open' $EvidenceDirectory))
+            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'replace-open' $UIAutomationTestDataDirectory))
             Invoke-UiaElementByName $root $walker 'Exit Find and Replace' 50000
             Start-Sleep -Milliseconds 150
-            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'find-close' $EvidenceDirectory))
+            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'find-close' $UIAutomationTestDataDirectory))
             Send-KeyboardInput -Chord $vk.Control, $vk.N
             Start-Sleep -Milliseconds 150
             $discardOwnProbe = Find-UiaElement $root $walker "Don't save" 50000
@@ -13104,24 +13325,24 @@ try {
                 Invoke-UiaElementByName $root $walker "Don't save" 50000
                 Start-Sleep -Milliseconds 150
             }
-            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'new-tab' $EvidenceDirectory))
+            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'new-tab' $UIAutomationTestDataDirectory))
             Invoke-UiaElementByName $root $walker 'File' 50011
             Start-Sleep -Milliseconds 150
-            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'file-menu' $EvidenceDirectory))
+            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'file-menu' $UIAutomationTestDataDirectory))
             Send-KeyboardInput -Chord $vk.Escape
             Invoke-UiaElementByName $root $walker 'Settings'
             Start-Sleep -Milliseconds 200
-            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'settings' $EvidenceDirectory))
+            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'settings' $UIAutomationTestDataDirectory))
             $unavailableStates = [Collections.Generic.List[string]]::new()
             Click-UiaElementByName $root $walker 'App theme' 50000
             Start-Sleep -Milliseconds 150
-            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'theme-options' $EvidenceDirectory))
+            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'theme-options' $UIAutomationTestDataDirectory))
             $lightOption = Find-UiaElement $root $walker 'Light' 50013
             if ($lightOption -ne [IntPtr]::Zero) {
                 [void][Runtime.InteropServices.Marshal]::Release($lightOption)
                 Click-UiaElementByName $root $walker 'Light' 50013
                 Start-Sleep -Milliseconds 180
-                $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'theme-light' $EvidenceDirectory))
+                $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'theme-light' $UIAutomationTestDataDirectory))
                 $systemOption = Find-UiaElement $root $walker 'Use system setting' 50013
                 if ($systemOption -eq [IntPtr]::Zero) {
                     Click-UiaElementByName $root $walker 'App theme' 50000
@@ -13134,16 +13355,16 @@ try {
                 $unavailableStates.Add('theme-light: App theme options did not open in UIA')
             }
             Start-Sleep -Milliseconds 180
-            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'theme-restored' $EvidenceDirectory))
+            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'theme-restored' $UIAutomationTestDataDirectory))
             Invoke-UiaElementByName $root $walker 'Back' 50000
             Start-Sleep -Milliseconds 150
-            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'settings-close' $EvidenceDirectory))
+            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'settings-close' $UIAutomationTestDataDirectory))
             Send-KeyboardInput -Chord $vk.Control, $vk.OemPlus
             Start-Sleep -Milliseconds 150
-            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'zoom-in' $EvidenceDirectory))
+            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'zoom-in' $UIAutomationTestDataDirectory))
             Send-KeyboardInput -Chord $vk.Control, $vk.D0
             Start-Sleep -Milliseconds 150
-            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'zoom-restored' $EvidenceDirectory))
+            $states.Add((Capture-RealState $root $walker $probe.MainWindowHandle 'zoom-restored' $UIAutomationTestDataDirectory))
             $exe = $probe.Path
             $observation = [pscustomobject]@{
                 Metadata = [pscustomobject]@{
@@ -13162,7 +13383,7 @@ try {
                 }
                 States = $states.ToArray()
             }
-            $observation | Export-Clixml (Join-Path $EvidenceDirectory 'real-notepad.clixml')
+            $observation | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'real-notepad.clixml')
             $states | Select-Object Name,Width,Height,ImageSHA256
         } finally {
             if ($walker -ne [IntPtr]::Zero) { [void][Runtime.InteropServices.Marshal]::Release($walker) }
@@ -13183,9 +13404,9 @@ try {
 }
 }
 
-$realEvidence = Import-Clixml (Join-Path $EvidenceDirectory 'real-notepad.clixml')
+$realEvidence = Import-Clixml (Join-Path $UIAutomationTestDataDirectory 'real-notepad.clixml')
 $iconEvidence = @(Get-CubicGlyphEvidence $realEvidence)
-$iconEvidence | Export-Clixml (Join-Path $EvidenceDirectory 'fluent-glyph-cubics.clixml')
+$iconEvidence | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'fluent-glyph-cubics.clixml')
 [pscustomobject]@{ Glyphs = $iconEvidence.Count; Cubics = @($iconEvidence | ForEach-Object { $_.Cubics.Count } | Measure-Object -Sum).Sum; FontSHA256 = if ($iconEvidence.Count) { $iconEvidence[0].FontSHA256 } else { $null } }
 
 if (-not $SkipBrowser) {
@@ -13224,7 +13445,7 @@ if (-not $SkipBrowser) {
                 StrictCheckPassed = $true
                 TimeUtc = [datetime]::UtcNow
             }
-            $compilation | Export-Clixml (Join-Path $EvidenceDirectory 'typescript-compilation.clixml')
+            $compilation | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'typescript-compilation.clixml')
             $semanticProbe = @'
 const fs = require('fs');
 const ts = require('C:/bin/vs/Common7/IDE/CommonExtensions/Microsoft/TSServer/typescript.js');
@@ -13334,7 +13555,7 @@ process.stdout.write(JSON.stringify({ source: file, nodes, unjoinedEmitted: emit
             $semanticJson = & $node -e $semanticProbe $tsSource $compiled
             if ($LASTEXITCODE -ne 0) { throw 'TypeScript semantic extraction failed.' }
             $semanticLedger = $semanticJson | ConvertFrom-Json -Depth 100
-            $semanticLedger | Export-Clixml (Join-Path $EvidenceDirectory 'typescript-node-semantics.clixml')
+            $semanticLedger | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'typescript-node-semantics.clixml')
             $traceCompiler = @'
 const ts = require('C:/bin/vs/Common7/IDE/CommonExtensions/Microsoft/TSServer/typescript.js');
 const sourcePath = process.argv[1], outputPath = process.argv[2];
@@ -13378,7 +13599,7 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
             $traceResultJson = & $node -e $traceCompiler $tsSource $traceFile
             if ($LASTEXITCODE -ne 0) { throw 'Expression trace compilation failed.' }
             $traceCompilerResult = $traceResultJson | ConvertFrom-Json -Depth 20
-            $traceCompilerResult | Export-Clixml (Join-Path $EvidenceDirectory 'typescript-trace-map.clixml')
+            $traceCompilerResult | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'typescript-trace-map.clixml')
             $builtHtml = Get-CdpValue $browser @'
 (() => {
   const root = document.documentElement.cloneNode(true);
@@ -13448,19 +13669,19 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
                 Diagnostics = $designDiagnostics
                 TimeUtc = [datetime]::UtcNow
             }
-            $designCompilation | Export-Clixml (Join-Path $EvidenceDirectory 'design-compilation.clixml')
+            $designCompilation | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'design-compilation.clixml')
             if ($BuildTypeScript) {
                 $designSemanticsJson = & $node -e $semanticProbe $designSource $designOutput
                 if ($LASTEXITCODE -ne 0) { throw 'Corrected reference semantic extraction failed.' }
                 ($designSemanticsJson | ConvertFrom-Json -Depth 100) |
-                    Export-Clixml (Join-Path $EvidenceDirectory 'design-node-semantics.clixml')
+                    Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'design-node-semantics.clixml')
             }
             # The corrected reference page is generated beside the original (reference\notepad.html), never over it.
             $currentReference = Join-Path $PSScriptRoot 'reference\notepad.design.html'
             if (Test-Path $currentReference) {
                 # A previously generated reference may be updated, but an unrecognized edit is preserved.
                 $currentHash = (Get-FileHash $currentReference -Algorithm SHA256).Hash
-                $generatedHashFile = Join-Path $EvidenceDirectory 'generated-reference-hash.clixml'
+                $generatedHashFile = Join-Path $UIAutomationTestDataDirectory 'generated-reference-hash.clixml'
                 if (-not (Test-Path $generatedHashFile) -or $currentHash -ne (Import-Clixml $generatedHashFile).SHA256) {
                     throw 'The corrected reference page differs from the last instrument build.'
                 }
@@ -13480,10 +13701,10 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
 '@
             [IO.File]::WriteAllText($currentReference, $designHtml, [Text.UTF8Encoding]::new($false))
             [pscustomobject]@{ SHA256 = (Get-FileHash $currentReference -Algorithm SHA256).Hash; TimeUtc = [datetime]::UtcNow } |
-                Export-Clixml (Join-Path $EvidenceDirectory 'generated-reference-hash.clixml')
+                Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'generated-reference-hash.clixml')
         }
         $states = [Collections.Generic.List[object]]::new()
-        $states.Add((Save-BrowserState $browser 'original-empty' $EvidenceDirectory))
+        $states.Add((Save-BrowserState $browser 'original-empty' $UIAutomationTestDataDirectory))
         $editorRect = Get-CdpValue $browser @'
 (() => { const r = document.querySelector('textarea').getBoundingClientRect(); return { x: r.x + 30, y: r.y + 30 }; })()
 '@
@@ -13494,8 +13715,8 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
             }
         }
         $null = Invoke-Cdp $browser 'Input.insertText' @{ text = 'Notepad comparison sample' }
-        $states.Add((Save-BrowserState $browser 'original-typed' $EvidenceDirectory))
-        Add-BrowserReplayStates $browser 'original' $EvidenceDirectory $states
+        $states.Add((Save-BrowserState $browser 'original-typed' $UIAutomationTestDataDirectory))
+        Add-BrowserReplayStates $browser 'original' $UIAutomationTestDataDirectory $states
         $browserEvidence = [pscustomobject]@{
             Metadata = [pscustomobject]@{
                 EdgeVersion = (Get-Item 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe').VersionInfo.FileVersion
@@ -13506,7 +13727,7 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
             }
             States = $states.ToArray()
         }
-        $browserEvidence | Export-Clixml (Join-Path $EvidenceDirectory 'original-edge.clixml')
+        $browserEvidence | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'original-edge.clixml')
         $states | Select-Object Name,ImageSHA256,Image
     } finally {
         Close-EdgePage $browser
@@ -13521,7 +13742,7 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
             }
             Start-BrowserCoverage $built
             $builtStates = [Collections.Generic.List[object]]::new()
-            $builtStates.Add((Save-BrowserState $built 'built-empty' $EvidenceDirectory))
+            $builtStates.Add((Save-BrowserState $built 'built-empty' $UIAutomationTestDataDirectory))
             $rect = Get-CdpValue $built @'
 (() => { const r = document.querySelector('textarea').getBoundingClientRect(); return { x: r.x + 30, y: r.y + 30 }; })()
 '@
@@ -13532,10 +13753,10 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
                 }
             }
             $null = Invoke-Cdp $built 'Input.insertText' @{ text = 'Notepad comparison sample' }
-            $builtStates.Add((Save-BrowserState $built 'built-typed' $EvidenceDirectory))
-            Add-BrowserReplayStates $built 'built' $EvidenceDirectory $builtStates
-            $builtStates.ToArray() | Export-Clixml (Join-Path $EvidenceDirectory 'built-edge.clixml')
-            $originalStates = (Import-Clixml (Join-Path $EvidenceDirectory 'original-edge.clixml')).States
+            $builtStates.Add((Save-BrowserState $built 'built-typed' $UIAutomationTestDataDirectory))
+            Add-BrowserReplayStates $built 'built' $UIAutomationTestDataDirectory $builtStates
+            $builtStates.ToArray() | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'built-edge.clixml')
+            $originalStates = (Import-Clixml (Join-Path $UIAutomationTestDataDirectory 'original-edge.clixml')).States
             $equivalenceRows = [Collections.Generic.List[object]]::new()
             for ($i=0; $i -lt $builtStates.Count; $i++) {
                 $domEqual = (ConvertTo-Json $originalStates[$i].DomState -Depth 30 -Compress) -ceq
@@ -13551,11 +13772,11 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
                 $equivalenceRows.Add($row)
                 $row
             }
-            $equivalenceRows.ToArray() | Export-Clixml (Join-Path $EvidenceDirectory 'refactor-equivalence.clixml')
+            $equivalenceRows.ToArray() | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'refactor-equivalence.clixml')
             if ($equivalenceRows | Where-Object { -not ($_.DomEqual -and $_.AppStateEqual -and $_.PixelsEqual) }) {
                 throw 'The TypeScript build differs from the original browser oracle.'
             }
-            $ledger = Import-Clixml (Join-Path $EvidenceDirectory 'typescript-node-semantics.clixml')
+            $ledger = Import-Clixml (Join-Path $UIAutomationTestDataDirectory 'typescript-node-semantics.clixml')
             $rangesByStep = @{}
             foreach ($step in $builtStates) {
                 $rangesByStep[$step.Name] = @($step.Coverage | ForEach-Object { $_.Functions } | ForEach-Object { $_.Ranges })
@@ -13586,7 +13807,7 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
                 }
                 $nodeRecord.runtime = $observations.ToArray()
             }
-            $ledger | Export-Clixml (Join-Path $EvidenceDirectory 'typescript-node-semantics.clixml')
+            $ledger | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'typescript-node-semantics.clixml')
         } finally {
             Close-EdgePage $built
         }
@@ -13602,12 +13823,12 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
             }
             Start-BrowserCoverage $traced
             $traceStates = [Collections.Generic.List[object]]::new()
-            $traceStates.Add((Save-BrowserState $traced 'trace-empty' $EvidenceDirectory))
+            $traceStates.Add((Save-BrowserState $traced 'trace-empty' $UIAutomationTestDataDirectory))
             Click-CdpSelector $traced 'textarea'
             $null = Invoke-Cdp $traced 'Input.insertText' @{ text = 'Notepad comparison sample' }
-            $traceStates.Add((Save-BrowserState $traced 'trace-typed' $EvidenceDirectory))
-            Add-BrowserReplayStates $traced 'trace' $EvidenceDirectory $traceStates
-            $traceStates.ToArray() | Export-Clixml (Join-Path $EvidenceDirectory 'trace-edge.clixml')
+            $traceStates.Add((Save-BrowserState $traced 'trace-typed' $UIAutomationTestDataDirectory))
+            Add-BrowserReplayStates $traced 'trace' $UIAutomationTestDataDirectory $traceStates
+            $traceStates.ToArray() | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'trace-edge.clixml')
             $traceVerdicts = [Collections.Generic.List[object]]::new()
             for ($i=0; $i -lt $traceStates.Count; $i++) {
                 $row = [pscustomobject]@{
@@ -13620,10 +13841,10 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
                 }
                 $traceVerdicts.Add($row)
             }
-            $traceVerdicts.ToArray() | Export-Clixml (Join-Path $EvidenceDirectory 'trace-equivalence.clixml')
+            $traceVerdicts.ToArray() | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'trace-equivalence.clixml')
             $traceVerdicts | Format-Table -AutoSize
             $traceTrusted = -not @($traceVerdicts | Where-Object { -not ($_.DomEqual -and $_.AppStateEqual -and $_.PixelsEqual) }).Count
-            $ledger = Import-Clixml (Join-Path $EvidenceDirectory 'typescript-node-semantics.clixml')
+            $ledger = Import-Clixml (Join-Path $UIAutomationTestDataDirectory 'typescript-node-semantics.clixml')
             for ($i=0; $i -lt $traceStates.Count; $i++) {
                 $records = $traceStates[$i].NodeRuntime
                 foreach ($nodeRecord in $ledger.nodes) {
@@ -13652,12 +13873,12 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
                     else { 'UNKNOWN' }
                 $nodeRecord | Add-Member -NotePropertyName Verdict -NotePropertyValue $verdict -Force
             }
-            $ledger | Export-Clixml (Join-Path $EvidenceDirectory 'typescript-node-semantics.clixml')
+            $ledger | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'typescript-node-semantics.clixml')
         } finally {
             Close-EdgePage $traced
         }
     }
-    $designHashRecord = Join-Path $EvidenceDirectory 'generated-reference-hash.clixml'
+    $designHashRecord = Join-Path $UIAutomationTestDataDirectory 'generated-reference-hash.clixml'
     $designPath = Join-Path $PSScriptRoot 'reference\notepad.design.html'
     if ((Test-Path $designHashRecord) -and
         (Get-FileHash $designPath -Algorithm SHA256).Hash -eq (Import-Clixml $designHashRecord).SHA256) {
@@ -13670,11 +13891,11 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
             }
             Start-BrowserCoverage $designBrowser
             $designStates = [Collections.Generic.List[object]]::new()
-            $designStates.Add((Save-BrowserState $designBrowser 'design-empty' $EvidenceDirectory))
+            $designStates.Add((Save-BrowserState $designBrowser 'design-empty' $UIAutomationTestDataDirectory))
             Click-CdpSelector $designBrowser 'textarea'
             $null = Invoke-Cdp $designBrowser 'Input.insertText' @{ text='Notepad comparison sample' }
-            $designStates.Add((Save-BrowserState $designBrowser 'design-typed' $EvidenceDirectory))
-            Add-BrowserReplayStates $designBrowser 'design' $EvidenceDirectory $designStates
+            $designStates.Add((Save-BrowserState $designBrowser 'design-typed' $UIAutomationTestDataDirectory))
+            Add-BrowserReplayStates $designBrowser 'design' $UIAutomationTestDataDirectory $designStates
             [pscustomobject]@{
                 Metadata = [pscustomobject]@{
                     ReferenceSHA256 = (Get-FileHash $designPath -Algorithm SHA256).Hash
@@ -13682,7 +13903,7 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
                     TimeUtc = [datetime]::UtcNow
                 }
                 States = $designStates.ToArray()
-            } | Export-Clixml (Join-Path $EvidenceDirectory 'design-edge.clixml')
+            } | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'design-edge.clixml')
             $designStates | Select-Object Name,ImageSHA256
             # Feature addition probe: the whole-document Copy action must ignore selection.
             $copyProbe = Get-CdpValue $designBrowser @'
@@ -13704,7 +13925,7 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
 '@
             Click-CdpSelector $designBrowser '#btn-copy-document'
             $copied = Get-CdpValue $designBrowser 'window.__copyProbe'
-            $copyTextCapture = Save-BrowserState $designBrowser 'design-copy-text' $EvidenceDirectory
+            $copyTextCapture = Save-BrowserState $designBrowser 'design-copy-text' $UIAutomationTestDataDirectory
             $copyResult = [pscustomobject]@{
                 Scenario = 'Whole active document despite partial selection'
                 SelectedText = $copyProbe.selected
@@ -13713,7 +13934,7 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
                 Calls = $copied.calls
                 Verdict = if ($copied.calls -eq 1 -and $copied.value -ceq "Whole document for LLM`nSecond line") { 'TRUE' } else { 'FALSE' }
             }
-            $copyResult | Export-Clixml (Join-Path $EvidenceDirectory 'design-copy-probe.clixml')
+            $copyResult | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'design-copy-probe.clixml')
             if ($copyResult.Verdict -ne 'TRUE') { throw 'Whole-document Copy probe failed.' }
             Click-CdpSelector $designBrowser '#btn-settings-toggle'
             $null = Get-CdpValue $designBrowser "document.querySelector('#toggle-setting-copy-mode').scrollIntoView({ block: 'center' })"
@@ -13722,7 +13943,7 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
             Click-CdpSelector $designBrowser '#settings-btn-back'
             $fileModeButton = Get-CdpValue $designBrowser "document.querySelector('#btn-copy-document').getAttribute('aria-label')"
             Click-CdpSelector $designBrowser '#btn-copy-document'
-            $copyFileCapture = Save-BrowserState $designBrowser 'design-copy-file' $EvidenceDirectory
+            $copyFileCapture = Save-BrowserState $designBrowser 'design-copy-file' $UIAutomationTestDataDirectory
             $fileModeDialog = Get-CdpValue $designBrowser @'
 (() => ({
   title: document.querySelector('#dialog-title-text')?.textContent ?? '',
@@ -13737,8 +13958,8 @@ process.stdout.write(JSON.stringify({ instrumentedNodeIds: recorded, outputPath 
                 BrowserPreviewNotice = $fileModeDialog.text
                 Verdict = if ($fileModeState.settings.copyMode -eq 'file' -and $fileModeButton -eq 'Copy whole document as .txt file' -and $fileModeDialog.text -like '*native Notepad-PS1 renderer*') { 'TRUE' } else { 'FALSE' }
             }
-            $fileModeResult | Export-Clixml (Join-Path $EvidenceDirectory 'design-copy-file-mode-probe.clixml')
-            @($copyTextCapture, $copyFileCapture) | Export-Clixml (Join-Path $EvidenceDirectory 'design-copy-captures.clixml')
+            $fileModeResult | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'design-copy-file-mode-probe.clixml')
+            @($copyTextCapture, $copyFileCapture) | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'design-copy-captures.clixml')
             if ($fileModeResult.Verdict -ne 'TRUE') { throw 'Whole-document .txt file mode probe failed.' }
         } finally {
             Close-EdgePage $designBrowser
@@ -13760,7 +13981,7 @@ try {
         if ($nativeHandle -ne [IntPtr]::Zero) { break }
     }
     if ($nativeHandle -eq [IntPtr]::Zero) { throw 'Notepad.ps1 did not expose its native app window through UIA.' }
-    $nativeImage = Join-Path $EvidenceDirectory 'ps1-empty.png'
+    $nativeImage = Join-Path $UIAutomationTestDataDirectory 'ps1-empty.png'
     Save-WindowImage $nativeHandle $nativeImage 768 478
     $nativeEvidence = [pscustomobject]@{
         Metadata = [pscustomobject]@{
@@ -13776,7 +13997,7 @@ try {
             ImageSHA256 = (Get-FileHash $nativeImage -Algorithm SHA256).Hash
         })
     }
-    $nativeEvidence | Export-Clixml (Join-Path $EvidenceDirectory 'ps1-render.clixml')
+    $nativeEvidence | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'ps1-render.clixml')
     $nativeEvidence.States | Select-Object Name,ImageSHA256,Image
 } finally {
     $nativeProcess.Refresh()
@@ -13784,9 +14005,9 @@ try {
 }
 
 $paths = [ordered]@{
-    Real = Join-Path $EvidenceDirectory 'real-empty.png'
-    Reference = Join-Path $EvidenceDirectory $(if (Test-Path (Join-Path $EvidenceDirectory 'design-edge.clixml')) { 'design-empty.png' } else { 'original-empty.png' })
-    PS1 = Join-Path $EvidenceDirectory 'ps1-empty.png'
+    Real = Join-Path $UIAutomationTestDataDirectory 'real-empty.png'
+    Reference = Join-Path $UIAutomationTestDataDirectory $(if (Test-Path (Join-Path $UIAutomationTestDataDirectory 'design-edge.clixml')) { 'design-empty.png' } else { 'original-empty.png' })
+    PS1 = Join-Path $UIAutomationTestDataDirectory 'ps1-empty.png'
 }
 $measures = [ordered]@{}
 foreach ($bearing in $paths.Keys) {
@@ -13811,17 +14032,238 @@ foreach ($property in $predictions.Keys) {
 foreach ($property in @('TypeScale','IconGeometry','CornerRadii','Elevation','MotionTiming','Mica','Acrylic','ReverseMica')) {
     $rows.Add([pscustomobject]@{ Property=$property; Prediction='Unmeasured'; Real=$null; Reference=$null; PS1=$null; Verdict='UNKNOWN' })
 }
-$rows.ToArray() | Export-Clixml (Join-Path $EvidenceDirectory 'comparison-table.clixml')
+$rows.ToArray() | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'comparison-table.clixml')
 $rows | Format-Table -AutoSize
 
 }
 if ($Compare) {
-    Invoke-NotepadComparison -EvidenceDirectory $EvidenceDirectory -RefreshReal:$RefreshReal -SkipBrowser:$SkipBrowser -KeepProbeOpen:$KeepProbeOpen -ExtractTypeScript:$ExtractTypeScript -BuildTypeScript:$BuildTypeScript -BuildDesign:$BuildDesign -VerifyNativeFeatures:$VerifyNativeFeatures -CatalogIcons:$CatalogIcons
+    if ([string]::IsNullOrEmpty($UIAutomationTestDataDirectory)) { $UIAutomationTestDataDirectory = Join-Path $PSScriptRoot 'UIAutomation-TestData' }
+    Invoke-NotepadComparison -UIAutomationTestDataDirectory $UIAutomationTestDataDirectory -RefreshReal:$RefreshReal -SkipBrowser:$SkipBrowser -KeepProbeOpen:$KeepProbeOpen -ExtractTypeScript:$ExtractTypeScript -BuildTypeScript:$BuildTypeScript -BuildDesign:$BuildDesign -VerifyNativeFeatures:$VerifyNativeFeatures -CatalogIcons:$CatalogIcons
     return
 }
 # The user's settings, one typed property per setting, named as the saved JSON names them. Get and Set reach a
 # setting by a name known only at run time (a toggle, a dropdown, the saved file), case-insensitively as the
 # hashtable did; Set converts the value to the setting's type, as an assignment to the property does.
+# What a person can ask the application to do: a menu row, a button, a key or a hit region names one. None, the
+# default, asks for nothing.
+enum FluentAction {
+    None
+    NewTab
+    NewMarkdownTab
+    NewActivity
+    SwitchTab
+    CloseTab
+    CloseSpecific
+    CloseWindow
+    Exit
+    Save
+    SaveAs
+    SaveAll
+    OpenFile
+    Undo
+    Redo
+    SelectAll
+    Copy
+    CopyDocument
+    EditColor
+    EditAnsi
+    CycleIcon
+    ResetIcon
+    ResetColors
+    FormatBold
+    FormatItalic
+    FormatStrike
+    FormatHeading
+    FormatList
+    FormatLink
+    InsertLink
+    Cut
+    Paste
+    Delete
+    TimeDate
+    Find
+    Replace
+    CloseFind
+    FindNext
+    FindPrevious
+    FindCase
+    FindWrap
+    ToggleReplace
+    DoReplace
+    DoReplaceAll
+    GoTo
+    GotoConfirm
+    ZoomIn
+    ZoomOut
+    ZoomReset
+    ToggleStatusBar
+    ToggleWordWrap
+    LineEnding
+    OpenSettings
+    OpenFontSettings
+    Back
+    Accordion
+    ToggleSetting
+    Startup
+    SettingSelect
+    ChooseSetting
+    PickerMode
+    ToggleMenu
+    Submenu
+    Minimize
+    Maximize
+    Drag
+    FocusInput
+    DiscardTab
+    SaveCloseTab
+    DiscardWindow
+    SaveCloseWindow
+    Dismiss
+    ToggleMarkdownPreview
+    Link
+    ClearFormatting
+    PageSetup
+    Print
+    Editor
+    Scrollbar
+    OpacitySlider
+    ModalAction
+    PickerSpectrum
+    PickerValue
+}
+
+# What a window's own decoration does when used: minimize, maximize or restore, and move the window by dragging.
+enum FluentWindowDecoration {
+    Minimize
+    Maximize
+    Drag
+}
+
+# A colour: red, green and blue channels and an opacity from 0 to 1.
+class FluentColor {
+    [byte]$Red
+    [byte]$Green
+    [byte]$Blue
+    [double]$Alpha
+
+    FluentColor([byte]$Red, [byte]$Green, [byte]$Blue) { $this.Red = $Red; $this.Green = $Green; $this.Blue = $Blue; $this.Alpha = 1.0 }
+    FluentColor([byte]$Red, [byte]$Green, [byte]$Blue, [double]$Opacity) { $this.Red = $Red; $this.Green = $Green; $this.Blue = $Blue; $this.Alpha = $Opacity }
+
+    # As CSS writes it: #rrggbb when opaque, rgba(r, g, b, a) otherwise.
+    [string] CssText() {
+        $culture = [Globalization.CultureInfo]::InvariantCulture
+        if ($this.Alpha -eq 1.0) { return [string]::Format($culture, '#{0:x2}{1:x2}{2:x2}', $this.Red, $this.Green, $this.Blue) }
+        return [string]::Format($culture, 'rgba({0}, {1}, {2}, {3})', [object[]]@($this.Red, $this.Green, $this.Blue, $this.Alpha))
+    }
+}
+
+# Fluent's colour theme: one colour per role. A new theme holds the design's base values, which are dark; Dark() and
+# Light() are the two themes as the design draws them.
+class FluentTheme {
+    [FluentColor]$BgWindow = [FluentColor]::new(0x1f, 0x1f, 0x1f)
+    [FluentColor]$BgTitlebar = [FluentColor]::new(0x1f, 0x1f, 0x1f)
+    [FluentColor]$BgMenubar = [FluentColor]::new(0x1f, 0x1f, 0x1f)
+    [FluentColor]$BgEditor = [FluentColor]::new(0x28, 0x28, 0x28)
+    [FluentColor]$BgTabActive = [FluentColor]::new(0x2c, 0x2c, 0x2c)
+    [FluentColor]$BgTabHover = [FluentColor]::new(0x26, 0x26, 0x26)
+    [FluentColor]$BgCard = [FluentColor]::new(0x2d, 0x2d, 0x2d)
+    [FluentColor]$BgCardHover = [FluentColor]::new(0x32, 0x32, 0x32)
+    [FluentColor]$BgFlyout = [FluentColor]::new(0x2c, 0x2c, 0x2c)
+    [FluentColor]$BgFlyoutItemHover = [FluentColor]::new(0x38, 0x38, 0x38)
+    [FluentColor]$BgControl = [FluentColor]::new(0x32, 0x32, 0x32)
+    [FluentColor]$BgControlHover = [FluentColor]::new(0x3c, 0x3c, 0x3c)
+    [FluentColor]$BgControlActive = [FluentColor]::new(0x2a, 0x2a, 0x2a)
+    [FluentColor]$BgStatusbar = [FluentColor]::new(0x1f, 0x1f, 0x1f)
+    [FluentColor]$BgDialog = [FluentColor]::new(0x2c, 0x2c, 0x2c)
+    [FluentColor]$TextPrimary = [FluentColor]::new(0xff, 0xff, 0xff)
+    [FluentColor]$TextSecondary = [FluentColor]::new(0x9d, 0x9d, 0x9d)
+    [FluentColor]$TextDisabled = [FluentColor]::new(0x60, 0x60, 0x60)
+    [FluentColor]$TextLink = [FluentColor]::new(0x60, 0xcd, 0xff)
+    [FluentColor]$BorderSubtle = [FluentColor]::new(255, 255, 255, 0.06)
+    [FluentColor]$BorderControl = [FluentColor]::new(255, 255, 255, 0.09)
+    [FluentColor]$BorderActive = [FluentColor]::new(0x60, 0xcd, 0xff)
+    [FluentColor]$AccentColor = [FluentColor]::new(0x00, 0x90, 0xf1)
+    [FluentColor]$AccentHover = [FluentColor]::new(0x1a, 0xa0, 0xff)
+    [FluentColor]$AccentActive = [FluentColor]::new(0x00, 0x78, 0xd4)
+    [FluentColor]$SelectionBg = [FluentColor]::new(0x00, 0x5f, 0xb8)
+    [FluentColor]$SelectionText = [FluentColor]::new(0xff, 0xff, 0xff)
+
+    static [FluentTheme] Dark() {
+        $theme = [FluentTheme]::new()
+        $theme.BgWindow = [FluentColor]::new(0x20, 0x20, 0x20)
+        $theme.BgTitlebar = [FluentColor]::new(0x20, 0x20, 0x20)
+        $theme.BgMenubar = [FluentColor]::new(0x2c, 0x2c, 0x2c)
+        $theme.BgEditor = [FluentColor]::new(0x27, 0x27, 0x27)
+        $theme.BgStatusbar = [FluentColor]::new(0x2c, 0x2c, 0x2c)
+        return $theme
+    }
+
+    static [FluentTheme] Light() {
+        $theme = [FluentTheme]::new()
+        $theme.BgWindow = [FluentColor]::new(0xf3, 0xf3, 0xf3)
+        $theme.BgTitlebar = [FluentColor]::new(0xf3, 0xf3, 0xf3)
+        $theme.BgMenubar = [FluentColor]::new(0xf3, 0xf3, 0xf3)
+        $theme.BgEditor = [FluentColor]::new(0xff, 0xff, 0xff)
+        $theme.BgTabActive = [FluentColor]::new(0xff, 0xff, 0xff)
+        $theme.BgTabHover = [FluentColor]::new(0xea, 0xea, 0xea)
+        $theme.BgCard = [FluentColor]::new(0xff, 0xff, 0xff)
+        $theme.BgCardHover = [FluentColor]::new(0xf9, 0xf9, 0xf9)
+        $theme.BgFlyout = [FluentColor]::new(0xff, 0xff, 0xff)
+        $theme.BgFlyoutItemHover = [FluentColor]::new(0xf0, 0xf0, 0xf0)
+        $theme.BgControl = [FluentColor]::new(0xfb, 0xfb, 0xfb)
+        $theme.BgControlHover = [FluentColor]::new(0xf5, 0xf5, 0xf5)
+        $theme.BgControlActive = [FluentColor]::new(0xeb, 0xeb, 0xeb)
+        $theme.BgStatusbar = [FluentColor]::new(0xf3, 0xf3, 0xf3)
+        $theme.BgDialog = [FluentColor]::new(0xff, 0xff, 0xff)
+        $theme.TextPrimary = [FluentColor]::new(0x1b, 0x1b, 0x1b)
+        $theme.TextSecondary = [FluentColor]::new(0x61, 0x61, 0x61)
+        $theme.TextDisabled = [FluentColor]::new(0xa0, 0xa0, 0xa0)
+        $theme.TextLink = [FluentColor]::new(0x00, 0x5f, 0xb8)
+        $theme.BorderSubtle = [FluentColor]::new(0, 0, 0, 0.06)
+        $theme.BorderControl = [FluentColor]::new(0, 0, 0, 0.12)
+        $theme.BorderActive = [FluentColor]::new(0x00, 0x5f, 0xb8)
+        $theme.AccentColor = [FluentColor]::new(0x00, 0x5f, 0xb8)
+        $theme.AccentHover = [FluentColor]::new(0x10, 0x6e, 0xbe)
+        $theme.AccentActive = [FluentColor]::new(0x00, 0x45, 0x78)
+        $theme.SelectionBg = [FluentColor]::new(0x99, 0xc9, 0xff)
+        $theme.SelectionText = [FluentColor]::new(0x00, 0x00, 0x00)
+        return $theme
+    }
+
+    # The colours by CSS custom property name, as CSS text; case-insensitive keys.
+    [Collections.Generic.Dictionary[string,string]] Tokens() {
+        $tokens = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $tokens['--bg-window'] = $this.BgWindow.CssText()
+        $tokens['--bg-titlebar'] = $this.BgTitlebar.CssText()
+        $tokens['--bg-menubar'] = $this.BgMenubar.CssText()
+        $tokens['--bg-editor'] = $this.BgEditor.CssText()
+        $tokens['--bg-tab-active'] = $this.BgTabActive.CssText()
+        $tokens['--bg-tab-hover'] = $this.BgTabHover.CssText()
+        $tokens['--bg-card'] = $this.BgCard.CssText()
+        $tokens['--bg-card-hover'] = $this.BgCardHover.CssText()
+        $tokens['--bg-flyout'] = $this.BgFlyout.CssText()
+        $tokens['--bg-flyout-item-hover'] = $this.BgFlyoutItemHover.CssText()
+        $tokens['--bg-control'] = $this.BgControl.CssText()
+        $tokens['--bg-control-hover'] = $this.BgControlHover.CssText()
+        $tokens['--bg-control-active'] = $this.BgControlActive.CssText()
+        $tokens['--bg-statusbar'] = $this.BgStatusbar.CssText()
+        $tokens['--bg-dialog'] = $this.BgDialog.CssText()
+        $tokens['--text-primary'] = $this.TextPrimary.CssText()
+        $tokens['--text-secondary'] = $this.TextSecondary.CssText()
+        $tokens['--text-disabled'] = $this.TextDisabled.CssText()
+        $tokens['--text-link'] = $this.TextLink.CssText()
+        $tokens['--border-subtle'] = $this.BorderSubtle.CssText()
+        $tokens['--border-control'] = $this.BorderControl.CssText()
+        $tokens['--border-active'] = $this.BorderActive.CssText()
+        $tokens['--accent-color'] = $this.AccentColor.CssText()
+        $tokens['--accent-hover'] = $this.AccentHover.CssText()
+        $tokens['--accent-active'] = $this.AccentActive.CssText()
+        $tokens['--selection-bg'] = $this.SelectionBg.CssText()
+        $tokens['--selection-text'] = $this.SelectionText.CssText()
+        return $tokens
+    }
+}
+
 class NotepadSettings {
     [string]$theme
     [string]$fontFamily
@@ -13995,37 +14437,41 @@ class NotepadSettings {
         }
     }
 }
-$design=Invoke-Design
 # Notepad's icons, typed geometry built once.
 [Collections.Generic.Dictionary[string,NotepadIcon]]$icons=[NotepadIcons]::All()
 [NotepadSettings]$settings=[NotepadSettings]::new()
-foreach($key in $design.DefaultSettings.Keys){$settings.Set($key,$design.DefaultSettings[$key])}
+$settings.theme='dark';$settings.fontFamily='Consolas';$settings.fontStyle='Regular';$settings.fontSize='11';$settings.wordWrap=$true;$settings.formatting=$true
+$settings.openingFiles='newTab';$settings.startupOption='continueSession';$settings.recentFilesEnabled=$false;$settings.spellCheck=$true;$settings.showStatusBar=$true;$settings.zoom=100
 $settings.backdrop='solid';$settings.entranceAnimation='fade';$settings.cornerStyle='curved';$settings.copyAsFile=$false
 $settings.backgroundOpacity=85;$settings.gradientEnabled=$false
 $settings.colors=[NotepadSettings]::ColorTable(@{foreground='';tabs='';cursor='';selectionBackground='';topLeft='#272727';topRight='#272727';bottomLeft='#272727';bottomRight='#272727'})
 $settings.ansiColors=@('#0C0C0C','#C50F1F','#13A10E','#C19C00','#0037DA','#881798','#3A96DD','#CCCCCC','#767676','#E74856','#16C60C','#F9F1A5','#3B78FF','#B4009E','#61D6D6','#F2F2F2')
 $settings.windowIcon='default'
-$store=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'NotepadPS1'
+$store=[IO.Path]::Join([Environment]::GetFolderPath('LocalApplicationData'),'NotepadPS1')
 # Settings live in config.ini beside the program; the open tabs in session.bin in the user's application data.
 [NotepadSettings]$defaultSettings=$settings.Copy()
-$configPath=Join-Path $PSScriptRoot 'config.ini'
-$sessionPath=Join-Path $store 'session.bin'
-if(-not $NoSession -and (Test-Path -LiteralPath $configPath)){
-    try{$configReader=[IO.StreamReader]::new($configPath);try{$settings.ReadIni($configReader)}finally{$configReader.Dispose()}}catch{Write-Warning 'config.ini could not be read; using defaults for the rest.'}
+[string]$configPath=[IO.Path]::Join($PSScriptRoot,'config.ini')
+$sessionPath=[IO.Path]::Join($store,'session.bin')
+if(-not $NoSession -and [IO.Path]::Exists($configPath)){
+    try{$configReader=[IO.StreamReader]::new($configPath);try{$settings.ReadIni($configReader)}finally{$configReader.Dispose()}}catch{}
 }
 if($Backdrop){$settings.backdrop=$Backdrop};if($CornerStyle){$settings.cornerStyle=$CornerStyle}
 [NotepadModel]$model=Invoke-Model -Settings $settings
 [NotepadModelState]$state=$model.State()
-if(-not $NoSession -and $settings.startupOption -eq 'continueSession' -and (Test-Path -LiteralPath $sessionPath)){
-    try{$sessionReader=[IO.BinaryReader]::new([IO.File]::OpenRead($sessionPath));try{$model.ReadSession($sessionReader)}finally{$sessionReader.Dispose()}}catch{Write-Warning 'Saved session could not be restored.'}
+if(-not $NoSession -and $settings.startupOption -eq 'continueSession' -and [IO.Path]::Exists($sessionPath)){
+    try{$sessionReader=[IO.BinaryReader]::new([IO.File]::OpenRead($sessionPath));try{$model.ReadSession($sessionReader)}finally{$sessionReader.Dispose()}}catch{}
 }
 if(-not $state.Tabs.Count){$null=$model.NewTab()}
-if($Path){$null=$model.Open($Path);if($state.Tabs[0].Text -eq '' -and $state.Tabs.Count -eq 2){$model.CloseTab($state.Tabs[0].Id)}}
-$native=Invoke-Native
-[NotepadWindow]$window=$null;[NotepadGraphics]$graphics=$null;$services=$null
+if($Path){$null=$model.Open($Path);if($state.Tabs[0].Document.Length -eq 0 -and $state.Tabs.Count -eq 2){$model.CloseTab($state.Tabs[0].Id)}}
+[NotepadWindow]$window=$null;[NotepadGraphics]$graphics=$null
 # A choice in a dropdown: the text shown and the setting value it stands for.
 class NotepadOption {
     [string]$Text
+    [string]$Value
+}
+# A choice made in a dropdown: the setting it is for and the value chosen.
+class NotepadSettingChoice {
+    [string]$Key
     [string]$Value
 }
 # An open dropdown: the setting it chooses, its choices, and the control it hangs from.
@@ -14038,7 +14484,7 @@ class NotepadDropdown {
 # A modal dialog button: the command it runs and that command's data (a tab id, or none).
 class NotepadModalButton {
     [string]$Text
-    [string]$Action
+    [FluentAction]$Action
     [Nullable[int]]$Data
     [bool]$Primary
 }
@@ -14079,7 +14525,7 @@ class NotepadColorPicker {
 class NotepadHitNode {
     [string]$Id
     [double[]]$Rect
-    [string]$Action
+    [FluentAction]$Action
     [object]$Data
     [string]$Cursor
     [int]$Generation
@@ -14096,6 +14542,72 @@ class NotepadIconChoice {
     [int]$Id
     NotepadIconChoice([string]$Kind, [int]$Id) { $this.Kind = $Kind; $this.Id = $Id; $this.Key = $Kind + ':' + $Id }
 }
+# A menu row: a command (Action, with its Data) shown as Text with its Shortcut; or a separator; or a submenu, which
+# Submenu names and Rows fills. Checked is $null on a row that shows no check mark.
+class NotepadMenuRow {
+    [string]$Text
+    [FluentAction]$Action
+    [object]$Data
+    [string]$Shortcut
+    [string]$Submenu
+    [NotepadMenuRow[]]$Rows
+    [Nullable[bool]]$Checked
+    [bool]$Disabled
+    [bool]$Separator
+}
+# A card on the Settings page: a section heading, or a setting shown with a toggle, a choice, a button, the opacity
+# slider or an accordion that opens more below it.
+class NotepadSettingCard {
+    [string]$Section
+    [string]$Title
+    [string]$Subtitle
+    [string]$Icon
+    [string]$Key
+    [bool]$Toggle
+    [NotepadOption[]]$Select
+    [double]$SelectWidth
+    [string]$Accordion
+    [FluentAction]$Button
+    [string]$ButtonText
+    [bool]$Slider
+}
+# A font setting's row in the Font accordion: its label, the setting, the choices and the dropdown's width.
+class NotepadFontRow {
+    [string]$Label
+    [string]$Key
+    [string[]]$Options
+    [double]$Width
+}
+# A status-bar item: its hit-test id, text, width and the command it runs ('none' for none).
+class NotepadStatusItem {
+    [string]$Id
+    [string]$Text
+    [double]$Width
+    [FluentAction]$Action
+}
+# A button on the find bar: its hit region's id, its icon and the action it asks for.
+class NotepadFindButton {
+    [string]$Id
+    [string]$Icon
+    [FluentAction]$Action
+}
+# A menu-bar button: the menu it opens, its text and width.
+class NotepadMenuEntry {
+    [string]$Name
+    [string]$Text
+    [double]$Width
+}
+# One line of the document as the editor's gate drew it this frame: its line number, where it starts in the text,
+# its length without the line break, its top in window coordinates, its laid-out height and its text layout.
+class NotepadGateLine {
+    [int]$Line
+    [int]$Start
+    [int]$Length
+    [double]$Top
+    [double]$Height
+    [IntPtr]$Layout
+}
+
 # The interface state. A value-type member that starts unset is Nullable: it reads $null until first set.
 class NotepadUi {
     [bool]$Dirty
@@ -14143,11 +14655,29 @@ class NotepadUi {
     [Nullable[bool]]$TooltipShown
     [Nullable[bool]]$Minimized
     [Nullable[bool]]$SliderDrag
+    # The editor scrollbar while it is dragged: the pointer's offset into the thumb, and the track as last painted
+    # (top, length, thumb length, largest scroll offset), empty when there is no scrollbar.
+    [bool]$ScrollDrag
+    [double]$ScrollGrab
+    [double[]]$ScrollTrack
+    # The editor's gate: where each line of the active text starts (rebuilt when LineStartsKey changes), each
+    # line's layout keyed by its format and text with the keys used this frame, and the lines the last frame drew.
+    [string]$LineStartsKey
+    [int[]]$LineStarts
+    [Collections.Generic.Dictionary[string,IntPtr]]$LineLayouts
+    [Collections.Generic.HashSet[string]]$LineLayoutsUsed
+    [Collections.Generic.List[NotepadGateLine]]$GateLines
+    # A selection drag: the pointer's last position and the time of the last kinetic scroll step.
+    [double]$DragX
+    [double]$DragY
+    [datetime]$DragTick
     [NotepadColorPicker]$ColorPicker
     [string]$ColorDrag
     [string]$Theme
     [NotepadAppearance]$Appearance
     [string]$AppearanceError
+    # Why config.ini could not be written, shown on the Settings page; '' when it was.
+    [string]$PersistError
     [NotepadEntrance]$Entrance
     [NotepadEntranceRestore]$EntranceRestore
     [Nullable[bool]]$BackdropActive
@@ -14192,10 +14722,9 @@ function Entrance-Easing([double]$Progress){
 }
 function Resolve-Theme {
     $theme=$settings.theme
-    if($theme -eq 'system'){$value=Get-ItemPropertyValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name AppsUseLightTheme -ErrorAction SilentlyContinue;$theme=if($value -eq 1){'light'}else{'dark'}}
-    $script:palette=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach($rule in $design.Styles.Rules){if($rule.Header -eq ':root' -or ($theme -eq 'light' -and $rule.Header -eq '[data-theme="light"]')){foreach($declaration in $rule.Declarations){$palette[$declaration.Property]=$declaration.Value}}}
-    if($theme -eq 'dark'){$palette['--bg-window']='#202020';$palette['--bg-titlebar']='#202020';$palette['--bg-menubar']='#2c2c2c';$palette['--bg-editor']='#272727';$palette['--bg-statusbar']='#2c2c2c'}
+    if($theme -eq 'system'){$theme=if([NotepadWindow]::AppsUseLightTheme()){'light'}else{'dark'}}
+    [FluentTheme]$themeColors=if($theme -eq 'light'){[FluentTheme]::Light()}elseif($theme -eq 'dark'){[FluentTheme]::Dark()}else{[FluentTheme]::new()}
+    $script:palette=$themeColors.Tokens()
     $ui.Theme=$theme;$ui.Dirty=$true
 }
 function Apply-WindowAppearance {
@@ -14219,15 +14748,16 @@ function Initialize-IconCatalog {
 function Apply-WindowIcon {
     if(-not $window -or -not $graphics){return}
     $ui.WindowIconHandle=[IntPtr]::Zero
-    if($settings.windowIcon -eq 'default'){$null=$window.SelectIcon('standard',32512);return}
+    # The default is the program's own embedded icon; a program without one (run under pwsh) gets Windows' application icon.
+    if($settings.windowIcon -eq 'default'){try{$ui.WindowIconHandle=$window.SelectIcon('application',1)}catch{$null=$window.SelectIcon('standard',32512)};return}
     Initialize-IconCatalog
     [NotepadIconChoice]$entry=$null;foreach($choice in $ui.IconCatalog){if($choice.Key -eq $settings.windowIcon){$entry=$choice;break}}
     if($entry){$ui.WindowIconHandle=$window.SelectIcon($entry.Kind,$entry.Id)}
     else{$settings.windowIcon='default';$null=$window.SelectIcon('standard',32512)}
 }
 function Paint-AppIcon([string]$Id,[double]$X,[double]$Y,[double]$Size){
-    if($ui.WindowIconHandle -and $ui.WindowIconHandle -ne [IntPtr]::Zero -and $settings.windowIcon -ne 'default'){$graphics.NativeIcon([IntPtr]$ui.WindowIconHandle,$settings.windowIcon,$X,$Y,$Size)}else{Icon 'app' $X $Y $Size}
-    Node $Id ($X-5) ($Y-5) ($Size+10) ($Size+10) 'cycleIcon' $settings.windowIcon
+    if($ui.WindowIconHandle -and $ui.WindowIconHandle -ne [IntPtr]::Zero){$graphics.NativeIcon([IntPtr]$ui.WindowIconHandle,$settings.windowIcon,$X,$Y,$Size)}else{Icon 'app' $X $Y $Size}
+    Node $Id ($X-5) ($Y-5) ($Size+10) ($Size+10) ([FluentAction]::CycleIcon) $settings.windowIcon
 }
 function Color([string]$Name){$palette['--'+$Name]}
 function Role-Color([string]$Role){
@@ -14242,6 +14772,12 @@ function Surface-Color([string]$Name,[double]$Opacity=-1){
     $alpha=[Math]::Clamp($Opacity,0.0,1.0).ToString('0.###',[Globalization.CultureInfo]::InvariantCulture)
     'rgba('+[Convert]::ToInt32($hex.Substring(0,2),16)+','+[Convert]::ToInt32($hex.Substring(2,2),16)+','+[Convert]::ToInt32($hex.Substring(4,2),16)+','+$alpha+')'
 }
+function Set-ScrollFromPoint([double]$Y){
+    if(-not $ui.ScrollTrack){return}
+    $scrollTrack=$ui.ScrollTrack;$tab=$model.Active()
+    $tab.ScrollY=[Math]::Clamp(($Y-$ui.ScrollGrab-$scrollTrack[0])/[Math]::Max(1,$scrollTrack[1]-$scrollTrack[2])*$scrollTrack[3],0,$scrollTrack[3]);$ui.EnsureCaret=$false
+    Invalidate
+}
 function Set-OpacityFromPoint([double]$X){
     if(-not $ui.OpacityTrack){return}
     $settings.backgroundOpacity=[int][Math]::Clamp([Math]::Round(($X-$ui.OpacityTrack[0])/$ui.OpacityTrack[2]*100),0,100)
@@ -14255,7 +14791,8 @@ function Persist {
         $configWriter=[IO.StreamWriter]::new($temporary,$false,[Text.UTF8Encoding]::new($false))
         try{$settings.WriteIni($configWriter,$defaultSettings)}finally{$configWriter.Dispose()}
         [IO.File]::Move($temporary,$configPath,$true)
-    }catch [UnauthorizedAccessException] {Write-Warning "config.ini cannot be written beside the program: $($_.Exception.Message)"}
+        $ui.PersistError=''
+    }catch [UnauthorizedAccessException] {$ui.PersistError='config.ini cannot be written beside the program: '+$_.Exception.Message;$ui.Dirty=$true}
     $null=[IO.Directory]::CreateDirectory($store)
     $temporary=$sessionPath+'.tmp'
     $sessionWriter=[IO.BinaryWriter]::new([IO.File]::Create($temporary))
@@ -14263,7 +14800,7 @@ function Persist {
     [IO.File]::Move($temporary,$sessionPath,$true)
 }
 function Invalidate([bool]$Caret=$false){$ui.Dirty=$true;if($Caret){$ui.EnsureCaret=$true;$ui.Blink=$true;$ui.LastBlink=[DateTime]::UtcNow}}
-function Node([string]$Id,[double]$X,[double]$Y,[double]$W,[double]$H,[string]$Action,[object]$Data=$null,[string]$Cursor='pointer'){
+function Node([string]$Id,[double]$X,[double]$Y,[double]$W,[double]$H,[FluentAction]$Action,[object]$Data=$null,[string]$Cursor='pointer'){
     if(-not $ui.Nodes.ContainsKey($Id)){$ui.Nodes[$Id]=[NotepadHitNode]@{Id=$Id}}
     $node=$ui.Nodes[$Id];$node.Rect=@($X,$Y,$W,$H);$node.Action=$Action;$node.Data=$Data;$node.Cursor=$Cursor;$node.Generation=$ui.Generation+1;$node.Clip=$ui.HitClip
     $ui.NextHits.Add($node.Copy())
@@ -14274,7 +14811,7 @@ function Label([string]$Text,[double]$X,[double]$Y,[double]$W,[string]$Color,[do
     $graphics.DrawLayout($ui.TextCache[$key],[single]$X,[single]$Y,$Color)
 }
 function Icon([string]$Name,[double]$X,[double]$Y,[double]$Size,[string]$Fill='',[double]$Rotation=0){if(-not $Fill){$Fill=Color 'text-primary'};$graphics.Icon($icons[$Name],[single]$X,[single]$Y,[single]$Size,$Fill,$Rotation)}
-function Button([string]$Id,[double]$X,[double]$Y,[double]$W,[double]$H,[string]$Action,[string]$Text='',[string]$Icon='',[object]$Data=$null,[bool]$Primary=$false,[bool]$Border=$false,[double]$IconSize=16){
+function Button([string]$Id,[double]$X,[double]$Y,[double]$W,[double]$H,[FluentAction]$Action,[string]$Text='',[string]$Icon='',[object]$Data=$null,[bool]$Primary=$false,[bool]$Border=$false,[double]$IconSize=16){
     Node $Id $X $Y $W $H $Action $Data
     $hover=$ui.Hover -eq $Id;$pressed=$ui.Pressed -eq $Id
     $bg=if($Primary){Color $(if($hover){'accent-hover'}else{'accent-color'})}elseif($pressed){Color 'bg-control-active'}elseif($hover){Color 'bg-control-hover'}elseif($Border){Surface-Color 'bg-control' 0.18}else{'transparent'}
@@ -14287,7 +14824,7 @@ function Button([string]$Id,[double]$X,[double]$Y,[double]$W,[double]$H,[string]
     if($Text){$layout=$graphics.Layout($Text,'Segoe UI',13,$W,$false,400,$false,0);try{$m=$graphics.Metrics($layout);$graphics.DrawLayout($layout,($X+($W-$m.Width)/2),($Y+($H-$m.Height)/2),$fg)}finally{$graphics.ReleaseLayout($layout)}}
 }
 function InputBox([string]$Id,[string]$Value,[double]$X,[double]$Y,[double]$W,[string]$Placeholder='',[double]$H=30,[double]$FontSize=13){
-    Node $Id $X $Y $W $H 'focusInput' $Id 'text'
+    Node $Id $X $Y $W $H ([FluentAction]::FocusInput) $Id 'text'
     $graphics.Fill($X,$Y,$W,$H,(Surface-Color 'bg-window' 0.25),4);$graphics.Stroke($X,$Y,$W,$H,(Color 'border-control'),4,1)
     $focused=$ui.Focus -eq $Id
     if($focused){$graphics.Fill(($X+1),($Y+$H-2),($W-2),2,(Color 'accent-color'),0)}
@@ -14314,96 +14851,96 @@ function Open-Modal([string]$Title,[string]$Message,[NotepadModalButton[]]$Butto
 function Save-Document([NotepadTab]$Tab,[bool]$SaveAs=$false){
     try{
         $destination=$Tab.Path
-        if($SaveAs -or -not $destination){$suggested=$Tab.Title;if(-not [IO.Path]::GetExtension($suggested)){$suggested+='.txt'};$destination=$services.FileDialog($true,$suggested)}
+        if($SaveAs -or -not $destination){$suggested=$Tab.Title;if(-not [IO.Path]::GetExtension($suggested)){$suggested+='.txt'};$destination=[Win32FileDialog]::Choose($window.Handle(),$true,$suggested)}
         if(-not $destination){return $false}
         $null=$model.Save($Tab.Id,$destination);Persist;Invalidate;return $true
-    }catch{Open-Modal 'Notepad' $_.Exception.Message @(@{Text='Close';Action='dismiss';Primary=$true});return $false}
+    }catch{Open-Modal 'Notepad' $_.Exception.Message @(@{Text='Close';Action=[FluentAction]::Dismiss;Primary=$true});return $false}
 }
 function Test-AnyModified{foreach($candidate in $state.Tabs){if($candidate.Modified){return $true}};return $false}
 function Request-Close([int]$TabId=0){
-    if($TabId){[NotepadTab]$tab=$null;foreach($candidate in $state.Tabs){if($candidate.Id -eq $TabId){$tab=$candidate;break}};if(-not $tab.Modified){$model.CloseTab($TabId);Invalidate $true;return};Open-Modal 'Notepad' "Do you want to save changes to $($tab.Title)?" @(@{Text='Save';Action='saveCloseTab';Data=$TabId;Primary=$true},@{Text="Don't Save";Action='discardTab';Data=$TabId},@{Text='Cancel';Action='dismiss'})}
-    elseif(Test-AnyModified){Open-Modal 'Notepad' 'You have unsaved changes. Do you want to save before closing?' @(@{Text='Save All';Action='saveCloseWindow';Primary=$true},@{Text="Don't Save";Action='discardWindow'},@{Text='Cancel';Action='dismiss'})}
+    if($TabId){[NotepadTab]$tab=$null;foreach($candidate in $state.Tabs){if($candidate.Id -eq $TabId){$tab=$candidate;break}};if(-not $tab.Modified){$model.CloseTab($TabId);Invalidate $true;return};Open-Modal 'Notepad' "Do you want to save changes to $($tab.Caption())?" @(@{Text='Save';Action=[FluentAction]::SaveCloseTab;Data=$TabId;Primary=$true},@{Text="Don't Save";Action=[FluentAction]::DiscardTab;Data=$TabId},@{Text='Cancel';Action=[FluentAction]::Dismiss})}
+    elseif(Test-AnyModified){Open-Modal 'Notepad' 'You have unsaved changes. Do you want to save before closing?' @(@{Text='Save All';Action=[FluentAction]::SaveCloseWindow;Primary=$true},@{Text="Don't Save";Action=[FluentAction]::DiscardWindow},@{Text='Cancel';Action=[FluentAction]::Dismiss})}
     else{$ui.Running=$false}
 }
-function Command([string]$Action,[object]$Data=$null){
+function Command([FluentAction]$Action,[object]$Data=$null){
     $tab=$model.Active()
     switch($Action){
-        'newTab'{$null=$model.NewTab();$ui.Focus='editor-area'}
-        'newMarkdownTab'{$null=$model.NewTab('Untitled.md',"# Markdown Document`n`nWrite here...",$null,$true);$ui.Focus='editor-area'}
-        'newWindow'{$start=[Diagnostics.ProcessStartInfo]::new('pwsh');foreach($a in @('-NoProfile','-STA','-File',"$PSScriptRoot\Notepad.ps1")){$start.ArgumentList.Add($a)};$start.UseShellExecute=$true;$null=[Diagnostics.Process]::Start($start)}
-        'switchTab'{$model.SwitchTab([int]$Data);$ui.Focus='editor-area'}
-        'closeTab'{Request-Close $tab.Id}
-        'closeSpecific'{Request-Close ([int]$Data)}
-        'closeWindow'{Request-Close}
-        'exit'{Request-Close}
-        'save'{$null=Save-Document $tab}
-        'saveAs'{$null=Save-Document $tab $true}
-        'saveAll'{foreach($document in $state.Tabs){if($document.Modified -and -not (Save-Document $document)){break}}}
-        'openFile'{try{$file=$services.FileDialog($false,'');if($file){$null=$model.Open($file);$ui.Focus='editor-area'}}catch{Open-Modal 'Open file' $_.Exception.Message @(@{Text='Close';Action='dismiss';Primary=$true})}}
-        'undo'{$model.Undo($false)}
-        'redo'{$model.Undo($true)}
-        'selectAll'{$model.Select(0,$tab.Text.Length)}
-        'copy'{$start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor);if($length){$services.WriteClipboard($tab.Text.Substring($start,$length))}}
-        'copyDocument'{try{if($settings.copyAsFile){$services.WriteClipboardFile($tab.Text,$tab.Title)}else{$services.WriteClipboard($tab.Text)}}catch{Open-Modal 'Copy document' $_.Exception.Message @(@{Text='Close';Action='dismiss';Primary=$true})}}
-        'editColor'{Open-CanvasColorPicker $Data -1}
-        'editAnsi'{Open-CanvasColorPicker '' ([int]$Data)}
-        'cycleIcon'{Initialize-IconCatalog;$index=-1;for($i=0;$i -lt $ui.IconCatalog.Count;$i++){if($ui.IconCatalog[$i].Key -eq $settings.windowIcon){$index=$i;break}};$settings.windowIcon=$ui.IconCatalog[($index+1)%$ui.IconCatalog.Count].Key;Apply-WindowIcon}
-        'resetIcon'{$settings.windowIcon='default';Apply-WindowIcon}
-        'resetColors'{$settings.colors=[NotepadSettings]::ColorTable(@{foreground='';tabs='';cursor='';selectionBackground='';topLeft='#272727';topRight='#272727';bottomLeft='#272727';bottomRight='#272727'});$settings.gradientEnabled=$false}
-        'formatBold'{Format-Selection '**'}
-        'formatItalic'{Format-Selection '_'}
-        'formatStrike'{Format-Selection '~~'}
-        'formatHeading'{Format-Lines ([string]$Data)}
-        'formatList'{Format-Lines ([string]$Data)}
-        'formatLink'{Open-Modal 'Insert link' 'Address:' @(@{Text='Insert';Action='insertLink';Primary=$true},@{Text='Cancel';Action='dismiss'}) $true 'https://'}
-        'insertLink'{$start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor);$text=if($length){$tab.Text.Substring($start,$length)}else{'link text'};$model.Insert(('['+$text+']('+[string]$Data+')'),$false);$tab.Markdown=$true;$ui.Focus='editor-area'}
-        'cut'{$start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor);if($length){$services.WriteClipboard($tab.Text.Substring($start,$length));$model.Insert('',$false)}}
-        'paste'{$model.Insert($services.ReadClipboard(),$false)}
-        'delete'{$model.Delete($false)}
-        'timeDate'{$now=[DateTime]::Now;$model.Insert(($now.ToString('t')+' '+$now.ToString('M/d/yyyy',[Globalization.CultureInfo]::InvariantCulture)),$false)}
-        'find' {Open-Find $false}
-        'replace'{Open-Find $true}
-        'closeFind'{$ui.Find=$false;$ui.Focus='editor-area'}
-        'findNext'{$model.SelectMatch(1)}
-        'findPrevious'{$model.SelectMatch(-1)}
-        'findCase'{$state.Find.MatchCase=-not $state.Find.MatchCase;$model.Find();$model.SelectMatch(0)}
-        'findWrap'{$state.Find.Wrap=-not $state.Find.Wrap}
-        'toggleReplace'{$ui.Replace=-not $ui.Replace;if($ui.Replace){Focus-Input 'replace-query-input'}}
-        'doReplace'{$model.Replace($false)}
-        'doReplaceAll'{$model.Replace($true)}
-        'goTo'{$s=$model.Status();Open-Modal 'Go to line' 'Line number:' @(@{Text='Go to';Action='gotoConfirm';Primary=$true},@{Text='Cancel';Action='dismiss'}) $true ([string]$s.Line)}
-        'gotoConfirm'{$line=0;if([int]::TryParse([string]$Data,[ref]$line) -and $line -gt 0){$lines=$tab.Text.Split("`n");$pos=0;for($i=0;$i -lt [Math]::Min($line-1,$lines.Length);$i++){$pos+=$lines[$i].Length+1};$model.Select([Math]::Min($pos,$tab.Text.Length),[Math]::Min($pos,$tab.Text.Length))};$ui.Focus='editor-area'}
-        'zoomIn'{$settings.zoom=[Math]::Min(500,[int]$settings.zoom+10)}
-        'zoomOut'{$settings.zoom=[Math]::Max(20,[int]$settings.zoom-10)}
-        'zoomReset'{$settings.zoom=100}
-        'toggleStatusBar'{$settings.showStatusBar=-not $settings.showStatusBar}
-        'toggleWordWrap'{$settings.wordWrap=-not $settings.wordWrap}
-        'lineEnding'{$tab.LineEnding=if($tab.LineEnding -eq 'Unix (LF)'){'Windows (CRLF)'}else{'Unix (LF)'};$tab.Modified=$true}
-        'openSettings'{$ui.Settings=$true;$ui.Menu='';$ui.Focus='settings'}
-        'openFontSettings'{$ui.Settings=$true;$null=$ui.Expanded.Add('card-font-setting');$ui.SettingsScroll=0;$ui.Focus='settings'}
-        'back'{$ui.Settings=$false;$ui.Dropdown=$null;$ui.Focus='editor-area'}
-        'accordion'{if(-not $ui.Expanded.Remove([string]$Data)){$null=$ui.Expanded.Add([string]$Data)}}
-        'toggleSetting'{$settings.Set($Data,(-not $settings.Get($Data)))}
-        'startup'{$settings.startupOption=$Data}
-        'settingSelect'{$ui.Dropdown=[NotepadDropdown]@{Key=$Data.Key;Options=$Data.Options;Rect=$Data.Rect;Id=$Data.Id}}
-        'chooseSetting'{if($Data.Key -eq 'pickerMode'){$ui.ColorPicker.Mode=$Data.Value;$ui.Focus='color-picker';Sync-ColorPickerInputs}else{$settings.Set($Data.Key,$Data.Value)};$ui.Dropdown=$null;if($Data.Key -eq 'theme'){Resolve-Theme};if($Data.Key -in @('theme','backdrop','cornerStyle')){Apply-WindowAppearance}}
-        'pickerMode'{$ui.Dropdown=[NotepadDropdown]@{Key='pickerMode';Options=[NotepadOption[]]@(@{Text='RGB';Value='RGB'},@{Text='HSV';Value='HSV'});Rect=$ui.ColorPicker.ModeRect;Id='picker-mode'}}
-        'toggleMenu'{$ui.Menu=if($ui.Menu -eq $Data){''}else{$Data};$ui.Submenu=''}
-        'submenu'{$ui.Submenu=$Data}
-        'minimize'{$window.Caption('minimize')}
-        'maximize'{$window.Caption('maximize')}
-        'drag'{$window.Caption('drag')}
-        'focusInput'{Focus-Input $Data}
-        'discardTab'{$model.CloseTab([int]$Data);$ui.Focus='editor-area'}
-        'saveCloseTab'{[NotepadTab]$document=$null;foreach($candidate in $state.Tabs){if($candidate.Id -eq $Data){$document=$candidate;break}};if(Save-Document $document){$model.CloseTab([int]$Data);$ui.Focus='editor-area'}}
-        'discardWindow'{$ui.Running=$false}
-        'saveCloseWindow'{$success=$true;foreach($document in $state.Tabs){if($document.Modified -and -not(Save-Document $document)){$success=$false;break}};if($success){$ui.Running=$false}}
-        'dismiss'{$ui.Focus='editor-area'}
-        'toggleMarkdownPreview'{Open-Modal ('Markdown Preview: '+$tab.Title) '' @(@{Text='Close';Action='dismiss';Primary=$true});$ui.Modal.Markdown=$tab.Text}
-        'link'{if($Data -match '^https://'){$start=[Diagnostics.ProcessStartInfo]::new($Data);$start.UseShellExecute=$true;$null=[Diagnostics.Process]::Start($start)}}
-        'clearFormatting'{$start=[Math]::Min($tab.Anchor,$tab.Focus);$end=[Math]::Max($tab.Anchor,$tab.Focus);if($start -ne $end){$text=$tab.Text.Substring($start,$end-$start);foreach($marker in @('**','~~','_')){$text=$text.Replace($marker,'')};$model.Insert($text,$false)}}
-        'pageSetup'{Open-Modal 'Page setup' 'Native print layout is not implemented in this build.' @(@{Text='Close';Action='dismiss';Primary=$true})}
-        'print'{Open-Modal 'Print' 'Native printing is not implemented in this build.' @(@{Text='Close';Action='dismiss';Primary=$true})}
+        ([FluentAction]::NewTab){$null=$model.NewTab();$ui.Focus='editor-area'}
+        ([FluentAction]::NewMarkdownTab){$null=$model.NewTab('Untitled.md',"# Markdown Document`n`nWrite here...",$null,$true);$ui.Focus='editor-area'}
+        ([FluentAction]::NewActivity){[NotepadWindow]::StartActivity()}
+        ([FluentAction]::SwitchTab){$model.SwitchTab([int]$Data);$ui.Focus='editor-area'}
+        ([FluentAction]::CloseTab){Request-Close $tab.Id}
+        ([FluentAction]::CloseSpecific){Request-Close ([int]$Data)}
+        ([FluentAction]::CloseWindow){Request-Close}
+        ([FluentAction]::Exit){Request-Close}
+        ([FluentAction]::Save){$null=Save-Document $tab}
+        ([FluentAction]::SaveAs){$null=Save-Document $tab $true}
+        ([FluentAction]::SaveAll){foreach($document in $state.Tabs){if($document.Modified -and -not (Save-Document $document)){break}}}
+        ([FluentAction]::OpenFile){try{$file=[Win32FileDialog]::Choose($window.Handle(),$false,'');if($file){$null=$model.Open($file);$ui.Focus='editor-area'}}catch{Open-Modal 'Open file' $_.Exception.Message @(@{Text='Close';Action=[FluentAction]::Dismiss;Primary=$true})}}
+        ([FluentAction]::Undo){$model.Undo($false)}
+        ([FluentAction]::Redo){$model.Undo($true)}
+        ([FluentAction]::SelectAll){$model.Select(0,$tab.Document.Length)}
+        ([FluentAction]::Copy){$start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor);if($length){[Win32Clipboard]::WriteText($window.Handle(),$tab.Slice($start,$length))}}
+        ([FluentAction]::CopyDocument){try{if($settings.copyAsFile){[Win32Clipboard]::WriteFile($window.Handle(),$tab.Content(),$tab.Title)}else{[Win32Clipboard]::WriteText($window.Handle(),$tab.Content())}}catch{Open-Modal 'Copy document' $_.Exception.Message @(@{Text='Close';Action=[FluentAction]::Dismiss;Primary=$true})}}
+        ([FluentAction]::EditColor){Open-CanvasColorPicker $Data -1}
+        ([FluentAction]::EditAnsi){Open-CanvasColorPicker '' ([int]$Data)}
+        ([FluentAction]::CycleIcon){Initialize-IconCatalog;$index=-1;for($i=0;$i -lt $ui.IconCatalog.Count;$i++){if($ui.IconCatalog[$i].Key -eq $settings.windowIcon){$index=$i;break}};$settings.windowIcon=$ui.IconCatalog[($index+1)%$ui.IconCatalog.Count].Key;Apply-WindowIcon}
+        ([FluentAction]::ResetIcon){$settings.windowIcon='default';Apply-WindowIcon}
+        ([FluentAction]::ResetColors){$settings.colors=[NotepadSettings]::ColorTable(@{foreground='';tabs='';cursor='';selectionBackground='';topLeft='#272727';topRight='#272727';bottomLeft='#272727';bottomRight='#272727'});$settings.gradientEnabled=$false}
+        ([FluentAction]::FormatBold){Format-Selection '**'}
+        ([FluentAction]::FormatItalic){Format-Selection '_'}
+        ([FluentAction]::FormatStrike){Format-Selection '~~'}
+        ([FluentAction]::FormatHeading){Format-Lines ([string]$Data)}
+        ([FluentAction]::FormatList){Format-Lines ([string]$Data)}
+        ([FluentAction]::FormatLink){Open-Modal 'Insert link' 'Address:' @(@{Text='Insert';Action=[FluentAction]::InsertLink;Primary=$true},@{Text='Cancel';Action=[FluentAction]::Dismiss}) $true 'https://'}
+        ([FluentAction]::InsertLink){$start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor);$text=if($length){$tab.Slice($start,$length)}else{'link text'};$model.Insert(('['+$text+']('+[string]$Data+')'),$false);$tab.Markdown=$true;$ui.Focus='editor-area'}
+        ([FluentAction]::Cut){$start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor);if($length){[Win32Clipboard]::WriteText($window.Handle(),$tab.Slice($start,$length));$model.Insert('',$false)}}
+        ([FluentAction]::Paste){$model.Insert([Win32Clipboard]::ReadText($window.Handle()),$false)}
+        ([FluentAction]::Delete){$model.Delete($false)}
+        ([FluentAction]::TimeDate){$now=[DateTime]::Now;$model.Insert(($now.ToString('t')+' '+$now.ToString('M/d/yyyy',[Globalization.CultureInfo]::InvariantCulture)),$false)}
+        ([FluentAction]::Find) {Open-Find $false}
+        ([FluentAction]::Replace){Open-Find $true}
+        ([FluentAction]::CloseFind){$ui.Find=$false;$ui.Focus='editor-area'}
+        ([FluentAction]::FindNext){$model.SelectMatch(1)}
+        ([FluentAction]::FindPrevious){$model.SelectMatch(-1)}
+        ([FluentAction]::FindCase){$state.Find.MatchCase=-not $state.Find.MatchCase;$model.Find();$model.SelectMatch(0)}
+        ([FluentAction]::FindWrap){$state.Find.Wrap=-not $state.Find.Wrap}
+        ([FluentAction]::ToggleReplace){$ui.Replace=-not $ui.Replace;if($ui.Replace){Focus-Input 'replace-query-input'}}
+        ([FluentAction]::DoReplace){$model.Replace($false)}
+        ([FluentAction]::DoReplaceAll){$model.Replace($true)}
+        ([FluentAction]::GoTo){$s=$model.Status();Open-Modal 'Go to line' 'Line number:' @(@{Text='Go to';Action=[FluentAction]::GotoConfirm;Primary=$true},@{Text='Cancel';Action=[FluentAction]::Dismiss}) $true ([string]$s.Line)}
+        ([FluentAction]::GotoConfirm){$line=0;if([int]::TryParse([string]$Data,[ref]$line) -and $line -gt 0){$pos=$tab.Document.LineStart([Math]::Min($line-1,$tab.Document.LineCount()-1));$model.Select($pos,$pos)};$ui.Focus='editor-area'}
+        ([FluentAction]::ZoomIn){$settings.zoom=[Math]::Min(500,[int]$settings.zoom+10)}
+        ([FluentAction]::ZoomOut){$settings.zoom=[Math]::Max(20,[int]$settings.zoom-10)}
+        ([FluentAction]::ZoomReset){$settings.zoom=100}
+        ([FluentAction]::ToggleStatusBar){$settings.showStatusBar=-not $settings.showStatusBar}
+        ([FluentAction]::ToggleWordWrap){$settings.wordWrap=-not $settings.wordWrap}
+        ([FluentAction]::LineEnding){$tab.LineEnding=if($tab.LineEnding -eq 'Unix (LF)'){'Windows (CRLF)'}else{'Unix (LF)'};$tab.RefreshModified()}
+        ([FluentAction]::OpenSettings){$ui.Settings=$true;$ui.Menu='';$ui.Focus='settings'}
+        ([FluentAction]::OpenFontSettings){$ui.Settings=$true;$null=$ui.Expanded.Add('card-font-setting');$ui.SettingsScroll=0;$ui.Focus='settings'}
+        ([FluentAction]::Back){$ui.Settings=$false;$ui.Dropdown=$null;$ui.Focus='editor-area'}
+        ([FluentAction]::Accordion){if(-not $ui.Expanded.Remove([string]$Data)){$null=$ui.Expanded.Add([string]$Data)}}
+        ([FluentAction]::ToggleSetting){$settings.Set($Data,(-not $settings.Get($Data)))}
+        ([FluentAction]::Startup){$settings.startupOption=$Data}
+        ([FluentAction]::SettingSelect){$ui.Dropdown=[NotepadDropdown]@{Key=$Data.Key;Options=$Data.Options;Rect=$Data.Rect;Id=$Data.Id}}
+        ([FluentAction]::ChooseSetting){[NotepadSettingChoice]$choice=$Data;if($choice.Key -eq 'pickerMode'){$ui.ColorPicker.Mode=$choice.Value;$ui.Focus='color-picker';Sync-ColorPickerInputs}else{$settings.Set($choice.Key,$choice.Value)};$ui.Dropdown=$null;if($choice.Key -eq 'theme'){Resolve-Theme};if($choice.Key -in @('theme','backdrop','cornerStyle')){Apply-WindowAppearance}}
+        ([FluentAction]::PickerMode){$ui.Dropdown=[NotepadDropdown]@{Key='pickerMode';Options=[NotepadOption[]]@(@{Text='RGB';Value='RGB'},@{Text='HSV';Value='HSV'});Rect=$ui.ColorPicker.ModeRect;Id='picker-mode'}}
+        ([FluentAction]::ToggleMenu){[string]$menu=$Data;$ui.Menu=if($ui.Menu -eq $menu){''}else{$menu};$ui.Submenu=''}
+        ([FluentAction]::Submenu){$ui.Submenu=$Data}
+        ([FluentAction]::Minimize){$window.Caption([FluentWindowDecoration]::Minimize)}
+        ([FluentAction]::Maximize){$window.Caption([FluentWindowDecoration]::Maximize)}
+        ([FluentAction]::Drag){$window.Caption([FluentWindowDecoration]::Drag)}
+        ([FluentAction]::FocusInput){Focus-Input $Data}
+        ([FluentAction]::DiscardTab){$model.CloseTab([int]$Data);$ui.Focus='editor-area'}
+        ([FluentAction]::SaveCloseTab){[int]$closeId=$Data;[NotepadTab]$document=$null;foreach($candidate in $state.Tabs){if($candidate.Id -eq $closeId){$document=$candidate;break}};if(Save-Document $document){$model.CloseTab($closeId);$ui.Focus='editor-area'}}
+        ([FluentAction]::DiscardWindow){$ui.Running=$false}
+        ([FluentAction]::SaveCloseWindow){$success=$true;foreach($document in $state.Tabs){if($document.Modified -and -not(Save-Document $document)){$success=$false;break}};if($success){$ui.Running=$false}}
+        ([FluentAction]::Dismiss){$ui.Focus='editor-area'}
+        ([FluentAction]::ToggleMarkdownPreview){Open-Modal ('Markdown Preview: '+$tab.Title) '' @(@{Text='Close';Action=[FluentAction]::Dismiss;Primary=$true});$ui.Modal.Markdown=$tab.Content()}
+        ([FluentAction]::Link){[string]$address=$Data;if($address.StartsWith('https://',[StringComparison]::Ordinal)){[NotepadWindow]::OpenLink($address)}}
+        ([FluentAction]::ClearFormatting){$start=[Math]::Min($tab.Anchor,$tab.Focus);$end=[Math]::Max($tab.Anchor,$tab.Focus);if($start -ne $end){$text=$tab.Slice($start,$end-$start);foreach($marker in @('**','~~','_')){$text=$text.Replace($marker,'')};$model.Insert($text,$false)}}
+        ([FluentAction]::PageSetup){Open-Modal 'Page setup' 'Native print layout is not implemented in this build.' @(@{Text='Close';Action=[FluentAction]::Dismiss;Primary=$true})}
+        ([FluentAction]::Print){Open-Modal 'Print' 'Native printing is not implemented in this build.' @(@{Text='Close';Action=[FluentAction]::Dismiss;Primary=$true})}
     }
     Invalidate $true
 }
@@ -14460,23 +14997,24 @@ function Set-ColorPickerPoint([string]$Part,[double]$X,[double]$Y){
     $h=$p.H;$s=$p.S;$v=$p.V;Set-ColorPickerHex (Convert-HsvToHex $h $s $v);$p.H=$h;$p.S=$s;$p.V=$v;Commit-ColorPicker
 }
 function Format-Selection([string]$Marker){
-    $tab=$model.Active();$start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Anchor-$tab.Focus);$text=$tab.Text.Substring($start,$length)
+    $tab=$model.Active();$start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Anchor-$tab.Focus);$text=$tab.Slice($start,$length)
     if($length -ge 2*$Marker.Length -and $text.StartsWith($Marker) -and $text.EndsWith($Marker)){$text=$text.Substring($Marker.Length,$text.Length-2*$Marker.Length);$model.Insert($text,$false);$model.Select($start,($start+$text.Length))}
     else{$model.Insert(($Marker+$text+$Marker),$false);$model.Select(($start+$Marker.Length),($start+$Marker.Length+$text.Length))}
     $tab.Markdown=$true;$ui.Focus='editor-area'
 }
 function Format-Lines([string]$Prefix){
     $tab=$model.Active();$start=[Math]::Min($tab.Anchor,$tab.Focus);$end=[Math]::Max($tab.Anchor,$tab.Focus)
-    $lineStart=if($start -gt 0){$tab.Text.LastIndexOf("`n",$start-1)+1}else{0}
-    $lineEnd=$tab.Text.IndexOf("`n",$end);if($lineEnd -lt 0){$lineEnd=$tab.Text.Length}
-    $lines=$tab.Text.Substring($lineStart,$lineEnd-$lineStart).Split("`n")
+    # From the start of the first selected line to the end of the last, by the document's line index.
+    $lineStart=$tab.Document.LineStart($tab.Document.LineOf($start))
+    $lastLine=$tab.Document.LineOf($end);$lineEnd=if($lastLine+1 -ge $tab.Document.LineCount()){$tab.Document.Length}else{$tab.Document.LineStart($lastLine+1)-1}
+    $lines=$tab.Slice($lineStart,$lineEnd-$lineStart).Split("`n")
     $formatted=[Collections.Generic.List[string]]::new()
     foreach($line in $lines){if($Prefix -and $line.StartsWith($Prefix)){$formatted.Add($line.Substring($Prefix.Length))}else{$formatted.Add($Prefix+$line)}}
     $text=[string]::Join("`n",$formatted)
     $model.Select($lineStart,$lineEnd);$model.Insert($text,$false);$model.Select($lineStart,($lineStart+$text.Length));$tab.Markdown=$true;$ui.Focus='editor-area'
 }
 function Open-Find([bool]$Replace){
-    $ui.Find=$true;$ui.Replace=$Replace;$ui.Menu='';$tab=$model.Active();$selected=$tab.Text.Substring([Math]::Min($tab.Anchor,$tab.Focus),[Math]::Abs($tab.Focus-$tab.Anchor))
+    $ui.Find=$true;$ui.Replace=$Replace;$ui.Menu='';$tab=$model.Active();$selected=$tab.Slice([Math]::Min($tab.Anchor,$tab.Focus),[Math]::Abs($tab.Focus-$tab.Anchor))
     if($selected -and -not $selected.Contains("`n")){$state.Find.Query=$selected}
     $model.Find();$model.SelectMatch(0);Focus-Input 'find-query-input'
 }
@@ -14485,48 +15023,119 @@ function Set-InputValue([string]$Id,[string]$Value){if($ui.ColorPicker -and $Id.
 function Focus-Input([string]$Id){$ui.Focus=$Id;$value=Input-Value $Id;$ui.InputAnchor=0;$ui.InputFocus=$value.Length}
 function Input-Insert([string]$Text){$value=Input-Value $ui.Focus;$start=[Math]::Min($ui.InputAnchor,$ui.InputFocus);$end=[Math]::Max($ui.InputAnchor,$ui.InputFocus);Set-InputValue $ui.Focus ($value.Substring(0,$start)+$Text+$value.Substring($end));$ui.InputFocus=$start+$Text.Length;$ui.InputAnchor=$ui.InputFocus}
 
+# The editor gate. The text is a strip of lines; the gate shows whole lines from the top line ($tab.ScrollY, a line
+# number) down until it is full, and only those lines are laid out and drawn. Scrolling advances the strip by whole
+# lines, so the heights of the lines above the gate never need computing, with or without word wrap.
+
+# Where each line of the tab's text starts, rebuilt only when the text changes.
+function Update-LineStarts([NotepadTab]$Tab){
+    $key="$($Tab.Id)|$($Tab.Revision)|$($Tab.Document.Length)"
+    if($key -eq $ui.LineStartsKey){return}
+    $ui.LineStarts=$Tab.Document.LineStarts();$ui.LineStartsKey=$key
+}
+
+# The line holding a position in the active text (Update-LineStarts first).
+function Get-LineIndex([int]$Position){
+    $starts=$ui.LineStarts;$low=0;$high=$starts.Length-1
+    while($low -lt $high){$middle=[int][Math]::Floor(($low+$high+1)/2);if($starts[$middle] -le $Position){$low=$middle}else{$high=$middle-1}}
+    return $low
+}
+
+# A line of the active text without its line break (Update-LineStarts first).
+function Get-LineText([int]$LineNumber){
+    $active=$model.Active();$starts=$ui.LineStarts
+    $end=if($LineNumber+1 -lt $starts.Length){$starts[$LineNumber+1]-1}else{$active.Document.Length}
+    return $active.Slice($starts[$LineNumber],$end-$starts[$LineNumber])
+}
+
+# The layout of one line in the editor's format, reused while the same text is drawn in the same format. Layouts
+# not used by a frame are released at the end of Paint-Editor.
+function Get-LineLayout([string]$Text){
+    if($null -eq $ui.LineLayouts){$ui.LineLayouts=[Collections.Generic.Dictionary[string,IntPtr]]::new();$ui.LineLayoutsUsed=[Collections.Generic.HashSet[string]]::new()}
+    $fontSize=[int]$settings.fontSize*96/72*([int]$settings.zoom/100)
+    $weight=if($settings.fontStyle.Contains('Bold')){700}else{400};$italic=$settings.fontStyle.Contains('Italic')
+    $available=[Math]::Max(1,$ui.Width-32-12)
+    $key="$fontSize|$($settings.fontFamily)|$($settings.fontStyle)|$($settings.wordWrap)|$available|$Text"
+    if(-not $ui.LineLayouts.ContainsKey($key)){$ui.LineLayouts[$key]=$graphics.Layout($Text,$settings.fontFamily,$fontSize,$available,[bool]$settings.wordWrap,$weight,$italic,($fontSize*1.45))}
+    $null=$ui.LineLayoutsUsed.Add($key)
+    return $ui.LineLayouts[$key]
+}
+
 function Paint-Editor {
     $tab=$model.Active();$bottom=if($settings.showStatusBar){37}else{0};$h=[Math]::Max(1,$ui.Height-80-$bottom)
     $ui.EditorRect=@(0.0,80.0,$ui.Width,$h)
     if(-not $settings.gradientEnabled){$graphics.Fill(0,80,$ui.Width,$h,(Surface-Color 'bg-editor'),0)}
-    Node 'editor-area' 0 80 $ui.Width $h 'editor' $null 'text'
-    $fontSize=[int]$settings.fontSize*96/72*([int]$settings.zoom/100)
-    $lineHeight=$fontSize*1.45;$weight=if($settings.fontStyle.Contains('Bold')){700}else{400};$italic=$settings.fontStyle.Contains('Italic')
-    $available=[Math]::Max(1,$ui.Width-32-12)
-    $key="$($tab.Id)|$($tab.Revision)|$available|$fontSize|$($settings.fontFamily)|$($settings.fontStyle)|$($settings.wordWrap)"
-    if($key -ne $ui.EditorKey){
-        if($ui.EditorLayout -ne [IntPtr]::Zero){$graphics.ReleaseLayout($ui.EditorLayout)}
-        $ui.EditorLayout=$graphics.Layout($tab.Text,$settings.fontFamily,$fontSize,$available,[bool]$settings.wordWrap,$weight,$italic,$lineHeight)
-        $ui.EditorKey=$key;$ui.EditorMetrics=$graphics.Metrics($ui.EditorLayout)
-    }
-    $layout=$ui.EditorLayout;$caret=$graphics.Caret($layout,[uint32]$tab.Focus,$false)
+    Node 'editor-area' 0 80 $ui.Width $h ([FluentAction]::Editor) $null 'text'
+    $available=[Math]::Max(1,$ui.Width-32-12);$view=$h-28
+    Update-LineStarts $tab
+    if($null -ne $ui.LineLayoutsUsed){$ui.LineLayoutsUsed.Clear()}
+    $starts=$ui.LineStarts;$lineCount=$starts.Length
+    $caretLine=Get-LineIndex $tab.Focus
     if($ui.EnsureCaret){
-        if($caret.Y -lt $tab.ScrollY){$tab.ScrollY=$caret.Y}
-        if($caret.Y+$caret.Height -gt $tab.ScrollY+$h-28){$tab.ScrollY=$caret.Y+$caret.Height-$h+28}
-        if(-not $settings.wordWrap){if($caret.X -lt $tab.ScrollX){$tab.ScrollX=$caret.X};if($caret.X -gt $tab.ScrollX+$available-2){$tab.ScrollX=$caret.X-$available+2}}else{$tab.ScrollX=0.0}
+        # Above the gate: the caret line becomes the top. Below it: the top moves down until the caret line ends
+        # inside the gate.
+        if($caretLine -lt [int]$tab.ScrollY){$tab.ScrollY=$caretLine}
+        else{
+            $sum=0.0;$first=$caretLine
+            while($first -ge [int]$tab.ScrollY){$sum+=$graphics.Metrics((Get-LineLayout (Get-LineText $first))).Height;if($sum -gt $view){break};$first--}
+            if($sum -gt $view){$tab.ScrollY=[Math]::Min($caretLine,$first+1)}
+        }
+        if(-not $settings.wordWrap){
+            $caretAt=$graphics.Caret((Get-LineLayout (Get-LineText $caretLine)),[uint32]($tab.Focus-$starts[$caretLine]),$false)
+            if($caretAt.X -lt $tab.ScrollX){$tab.ScrollX=$caretAt.X};if($caretAt.X -gt $tab.ScrollX+$available-2){$tab.ScrollX=$caretAt.X-$available+2}
+        }else{$tab.ScrollX=0.0}
         $ui.EnsureCaret=$false
     }
-    $tab.ScrollY=[Math]::Clamp([double]$tab.ScrollY,0,[Math]::Max(0,$ui.EditorMetrics.Height-$h+28))
-    $ox=16-$tab.ScrollX;$oy=94-$tab.ScrollY;$ui.EditorOrigin=@($ox,$oy)
+    # The position keeps any fraction of a line (small touchpad steps add up); the gate starts at its whole line.
+    $tab.ScrollY=[Math]::Clamp([double]$tab.ScrollY,0,[Math]::Max(0,$lineCount-1));$top=[int][Math]::Floor($tab.ScrollY)
+    $ox=16-$tab.ScrollX;$y=94.0;$ui.EditorOrigin=@($ox,$y)
     $graphics.Clip(0,80,($ui.Width-12),$h)
-    $start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor)
-    [NotepadRect[]]$rects=@($graphics.Selection($layout,$start,$length))
-    foreach($rect in $rects){$graphics.Fill(($ox+$rect.X),($oy+$rect.Y),[Math]::Max(1,$rect.Width),$rect.Height,(Role-Color 'selectionBackground'),0)}
-    $graphics.DrawLayout($layout,$ox,$oy,(Role-Color 'foreground'))
-    # Repaint selected glyphs through each selection clip, using selection-text.
-    foreach($rect in $rects){$graphics.Clip(($ox+$rect.X),($oy+$rect.Y),[Math]::Max(1,$rect.Width),$rect.Height);$graphics.DrawLayout($layout,$ox,$oy,(Color 'selection-text'));$graphics.Unclip()}
-    if($ui.Focus -eq 'editor-area' -and $ui.Focused -and $ui.Blink -and -not $ui.Modal -and -not $ui.Settings){$graphics.Fill(($ox+$caret.X),($oy+$caret.Y),1,$caret.Height,(Role-Color 'cursor'),0)}
+    $selStart=[Math]::Min($tab.Anchor,$tab.Focus);$selEnd=[Math]::Max($tab.Anchor,$tab.Focus)
+    $foreground=Role-Color 'foreground';$selectionBack=Role-Color 'selectionBackground';$selectionFore=Color 'selection-text'
+    $gate=[Collections.Generic.List[NotepadGateLine]]::new()
+    for($line=$top;$line -lt $lineCount -and $y -lt 80+$h;$line++){
+        $start=$starts[$line];$end=if($line+1 -lt $lineCount){$starts[$line+1]-1}else{$tab.Document.Length}
+        $layout=Get-LineLayout $tab.Slice($start,$end-$start)
+        $gateLine=[NotepadGateLine]::new();$gateLine.Line=$line;$gateLine.Start=$start;$gateLine.Length=$end-$start;$gateLine.Top=$y;$gateLine.Height=$graphics.Metrics($layout).Height;$gateLine.Layout=$layout
+        $gate.Add($gateLine)
+        # This line's share of the selection, plus a sliver for its line break when the selection runs past it.
+        $from=[Math]::Max($selStart,$start);$to=[Math]::Min($selEnd,$end)
+        [NotepadRect[]]$rects=[NotepadRect[]]::new(0)
+        if($to -gt $from){$rects=@($graphics.Selection($layout,($from-$start),($to-$from)))}
+        foreach($rect in $rects){$graphics.Fill(($ox+$rect.X),($y+$rect.Y),[Math]::Max(1,$rect.Width),$rect.Height,$selectionBack,0)}
+        if($selStart -le $end -and $selEnd -gt $end -and $line+1 -lt $lineCount){
+            $breakAt=$graphics.Caret($layout,[uint32]($end-$start),$false);$graphics.Fill(($ox+$breakAt.X),($y+$breakAt.Y),6,$breakAt.Height,$selectionBack,0)
+        }
+        $graphics.DrawLayout($layout,$ox,$y,$foreground)
+        foreach($rect in $rects){$graphics.Clip(($ox+$rect.X),($y+$rect.Y),[Math]::Max(1,$rect.Width),$rect.Height);$graphics.DrawLayout($layout,$ox,$y,$selectionFore);$graphics.Unclip()}
+        if($line -eq $caretLine -and $ui.Focus -eq 'editor-area' -and $ui.Focused -and $ui.Blink -and -not $ui.Modal -and -not $ui.Settings){
+            $caretAt=$graphics.Caret($layout,[uint32]($tab.Focus-$start),$false);$graphics.Fill(($ox+$caretAt.X),($y+$caretAt.Y),1,$caretAt.Height,(Role-Color 'cursor'),0)
+        }
+        $y+=$gateLine.Height
+    }
     $graphics.Unclip()
-    if($ui.EditorMetrics.Height -gt $h-28){
-        $track=$h-6;$thumb=[Math]::Max(24,$track*($h-28)/$ui.EditorMetrics.Height);$ty=81+($track-$thumb)*$tab.ScrollY/[Math]::Max(1,($ui.EditorMetrics.Height-$h+28))
+    $ui.GateLines=$gate
+    $metrics=[NotepadTextMetrics]::new();$metrics.Lines=$lineCount;$metrics.Height=[single]($y-94);$ui.EditorMetrics=$metrics
+    # Layouts no line used this frame are released.
+    if($null -ne $ui.LineLayouts){
+        $stale=[Collections.Generic.List[string]]::new()
+        foreach($layoutKey in $ui.LineLayouts.Keys){if(-not $ui.LineLayoutsUsed.Contains($layoutKey)){$stale.Add($layoutKey)}}
+        foreach($layoutKey in $stale){$graphics.ReleaseLayout($ui.LineLayouts[$layoutKey]);$null=$ui.LineLayouts.Remove($layoutKey)}
+    }
+    # The scrollbar measures in lines: the thumb's share of the track is the gate's share of the lines.
+    $ui.ScrollTrack=$null
+    if($top -gt 0 -or $top+$gate.Count -lt $lineCount){
+        $maxTop=[double][Math]::Max(1,$lineCount-1)
+        $track=$h-6;$thumb=[Math]::Max(24,$track*[Math]::Min(1.0,$gate.Count/[double]$lineCount));$ty=81+($track-$thumb)*$top/$maxTop
+        $ui.ScrollTrack=@(81.0,[double]$track,[double]$thumb,$maxTop)
         $graphics.Fill(($ui.Width-9),$ty,6,$thumb,'rgba(255,255,255,0.2)',3)
-        Node 'editor-scrollbar' ($ui.Width-12) 80 12 $h 'scrollbar' $null 'default'
+        Node 'editor-scrollbar' ($ui.Width-12) 80 12 $h ([FluentAction]::Scrollbar) $null 'default'
     }
 }
 function Paint-Chrome {
     $w=$ui.Width;$tab=$model.Active()
     if(-not $settings.gradientEnabled){$graphics.Fill(0,0,$w,42,(Surface-Color 'bg-titlebar'),0)}
-    Node 'titlebar-drag' 0 0 $w 42 'drag' $null 'default';Paint-AppIcon 'app-icon' 24 13 14
+    Node 'titlebar-drag' 0 0 $w 42 ([FluentAction]::Drag) $null 'default';Paint-AppIcon 'app-icon' 24 13 14
     $x=54.0;$right=$w-138
     $graphics.Clip(40,0,[Math]::Max(0,$right-76),40)
     foreach($document in $state.Tabs){
@@ -14535,50 +15144,54 @@ function Paint-Chrome {
         $bg=if($active){Role-Color 'tabs'}elseif($hover){Surface-Color 'bg-tab-hover'}else{'transparent'}
         if($bg -ne 'transparent'){$graphics.Fill($x,5.2,$tw,34,$bg,7);$graphics.Fill($x,32,($tw),7.2,$bg,0)}
         if($active){$graphics.Stroke($x,5.2,$tw,34,(Color 'border-subtle'),7,0.8)}
-        Node $id $x 5.2 $tw 34 'switchTab' $document.Id
-        $graphics.Clip(($x+12),8,($tw-44),28);Label $document.Title ($x+12) 14 ($tw-44) (Color $(if($active -or $hover){'text-primary'}else{'text-secondary'})) 12;$graphics.Unclip()
-        if($active -or $hover){
-            if($document.Modified -and -not $hover){$graphics.Fill(($x+$tw-32),19.5,4.6,6,(Color 'text-secondary'),3)}
-            $cx=$x+$tw-28
-            Node ($id+'-close') $cx 12.2 20 20 'closeSpecific' $document.Id
+        Node $id $x 5.2 $tw 34 ([FluentAction]::SwitchTab) $document.Id
+        $graphics.Clip(($x+12),8,($tw-44),28);Label $document.Caption() ($x+12) 14 ($tw-44) (Color $(if($active -or $hover){'text-primary'}else{'text-secondary'})) 12;$graphics.Unclip()
+        # One slot at the tab's right end: the modified dot (a 6 px circle) unless the tab is hovered, otherwise the
+        # close button on the active or hovered tab.
+        $cx=$x+$tw-28
+        if($document.Modified -and -not $hover){$graphics.Fill(($cx+7),19.2,6,6,(Color 'text-secondary'),3)}
+        elseif($active -or $hover){
+            Node ($id+'-close') $cx 12.2 20 20 ([FluentAction]::CloseSpecific) $document.Id
             if($ui.Hover -eq $id+'-close'){$graphics.Fill($cx,12.2,20,20,(Color 'bg-control-hover'),4)}
             Icon 'close' ($cx+4) 16 12 (Color 'text-primary')
-        }elseif($document.Modified){$graphics.Fill(($x+$tw-21),19.5,6,6,(Color 'text-secondary'),3)}
+        }
         $x+=$tw+2
     }
     $graphics.Unclip();$x=[Math]::Min($x+4,$right-36)
-    Button 'btn-add-tab' $x 6 32 32 'newTab' '' 'plus' $null $false $false 14
-    Button 'btn-win-min' ($w-138) 0 46 40 'minimize' '' 'minimize' $null $false $false 10
-    Button 'btn-win-max' ($w-92) 0 46 40 'maximize' '' 'maximize' $null $false $false 10
-    Button 'btn-win-close' ($w-46) 0 46 40 'closeWindow' '' 'close' $null $false $false 10
+    Button 'btn-add-tab' $x 6 32 32 ([FluentAction]::NewTab) '' 'plus' $null $false $false 14
+    Button 'btn-win-min' ($w-138) 0 46 40 ([FluentAction]::Minimize) '' 'minimize' $null $false $false 10
+    Button 'btn-win-max' ($w-92) 0 46 40 ([FluentAction]::Maximize) '' 'maximize' $null $false $false 10
+    Button 'btn-win-close' ($w-46) 0 46 40 ([FluentAction]::CloseWindow) '' 'close' $null $false $false 10
     if(-not $settings.gradientEnabled){$graphics.Fill(0,42,$w,38,(Surface-Color 'bg-menubar'),0)}
     $mx=8.0
-    foreach($entry in @(@('file','File',44),@('edit','Edit',44),@('view','View',48))){
-        if($ui.Menu -eq $entry[0]){$graphics.Fill($mx,44,($entry[2]),28,(Color 'bg-control-hover'),4)}
-        Button ('menu-btn-'+$entry[0]) $mx 44 $entry[2] 28 'toggleMenu' $entry[1] '' $entry[0]
-        $mx+=$entry[2]+2
+    foreach($entry in [NotepadMenuEntry[]]@(@{Name='file';Text='File';Width=44},@{Name='edit';Text='Edit';Width=44},@{Name='view';Text='View';Width=48})){
+        if($ui.Menu -eq $entry.Name){$graphics.Fill($mx,44,($entry.Width),28,(Color 'bg-control-hover'),4)}
+        Button ('menu-btn-'+$entry.Name) $mx 44 $entry.Width 28 ([FluentAction]::ToggleMenu) $entry.Text '' $entry.Name
+        $mx+=$entry.Width+2
     }
     if($settings.formatting){
-        $fx=($w-248)/2
-        Button 'format-headings' $fx 45 42 30 'toggleMenu' 'H1' '' 'headings'
+        $fx=($w-280)/2
+        Button 'format-headings' $fx 45 42 30 ([FluentAction]::ToggleMenu) 'H1' '' 'headings'
         Icon 'chevronDown' ($fx+32) 56 8
-        Button 'format-lists' ($fx+44) 45 38 30 'toggleMenu' '' '' 'lists';Label ([string][char]0xE8FD) ($fx+51) 52 22 (Color 'text-primary') 16 'Segoe Fluent Icons'
-        Button 'format-bold' ($fx+84) 45 30 30 'formatBold';Label 'B' ($fx+94) 51 20 (Color 'text-primary') 16 'Segoe UI' 700
-        Button 'format-italic' ($fx+116) 45 30 30 'formatItalic';Label ([string][char]0xE8DB) ($fx+123) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
-        Button 'format-strike' ($fx+148) 45 30 30 'formatStrike';Label ([string][char]0xEDE0) ($fx+155) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
-        Button 'format-link' ($fx+180) 45 30 30 'formatLink';Label ([string][char]0xE71B) ($fx+187) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
-        Button 'format-more' ($fx+212) 45 30 30 'toggleMenu' '' '' 'formatMore';Label ([string][char]0xE712) ($fx+219) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
+        Button 'format-lists' ($fx+44) 45 38 30 ([FluentAction]::ToggleMenu) '' '' 'lists';Label ([string][char]0xE8FD) ($fx+51) 52 22 (Color 'text-primary') 16 'Segoe Fluent Icons'
+        Button 'format-bold' ($fx+84) 45 30 30 ([FluentAction]::FormatBold);Label 'B' ($fx+94) 51 20 (Color 'text-primary') 16 'Segoe UI' 700
+        Button 'format-italic' ($fx+116) 45 30 30 ([FluentAction]::FormatItalic);Label ([string][char]0xE8DB) ($fx+123) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
+        Button 'format-strike' ($fx+148) 45 30 30 ([FluentAction]::FormatStrike);Label ([string][char]0xEDE0) ($fx+155) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
+        Button 'format-link' ($fx+180) 45 30 30 ([FluentAction]::FormatLink);Label ([string][char]0xE71B) ($fx+187) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
+        Button 'format-more' ($fx+212) 45 30 30 ([FluentAction]::ToggleMenu) '' '' 'formatMore';Label ([string][char]0xE712) ($fx+219) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
     }
-    Button 'btn-copy-document' ($w-116) 45 32 30 'copyDocument'
-    Label ([string][char]0xE8C8) ($w-108) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
-    Button 'btn-writing-tools' ($w-80) 45 28 30 'toggleMenu' '✧' '' 'writing'
-    Button 'btn-settings-toggle' ($w-40) 43 32 32 'openSettings' '' 'gear'
+    # One copy button, in the centre ribbon after the formatting buttons, or alone in the centre when formatting is off.
+    $copyX=if($settings.formatting){($w-280)/2+244}else{($w-32)/2}
+    Button 'btn-copy-document' $copyX 45 32 30 ([FluentAction]::CopyDocument)
+    Label ([string][char]0xE8C8) ($copyX+8) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
+    Button 'btn-writing-tools' ($w-80) 45 28 30 ([FluentAction]::ToggleMenu) '✧' '' 'writing'
+    Button 'btn-settings-toggle' ($w-40) 43 32 32 ([FluentAction]::OpenSettings) '' 'gear'
     if($settings.showStatusBar){
         $y=$ui.Height-37;if(-not $settings.gradientEnabled){$graphics.Fill(0,$y,$w,37,(Surface-Color 'bg-statusbar'),0)}
         $status=$model.Status();$cursor="Ln $($status.Line), Col $($status.Column)";$count=if($status.Selected){"$($status.Selected) selected"}else{"$($status.Characters) characters"}
         Label $cursor 26 ($y+6) 170 (Color 'text-secondary') 12
         $graphics.Fill(126,($y+7),0.8,14,(Color 'border-subtle'),0);Label $count 137 ($y+6) 200 (Color 'text-secondary') 12
-        $items=@(@{Id='sb-doc-type';Text=$(if($tab.Markdown){'Markdown'}else{'Plain text'});Width=100;Action='none'},@{Id='sb-zoom-level';Text=([string]$settings.zoom+'%');Width=70;Action='zoomReset'},@{Id='sb-line-ending';Text=$tab.LineEnding;Width=114;Action='lineEnding'},@{Id='sb-encoding';Text=$tab.Encoding;Width=74;Action='none'})
+        [NotepadStatusItem[]]$items=@(@{Id='sb-doc-type';Text=$(if($tab.Markdown){'Markdown'}else{'Plain text'});Width=100;Action=[FluentAction]::None},@{Id='sb-zoom-level';Text=([string]$settings.zoom+'%');Width=70;Action=[FluentAction]::ZoomReset},@{Id='sb-line-ending';Text=$tab.LineEnding;Width=114;Action=[FluentAction]::LineEnding},@{Id='sb-encoding';Text=$tab.Encoding;Width=74;Action=[FluentAction]::None})
         $sx=$w-374
         foreach($item in $items){Node $item.Id $sx $y $item.Width 28 $item.Action;if($ui.Hover -eq $item.Id){$graphics.Fill($sx,$y,$item.Width,28,(Color 'bg-control-hover'),0)};Label $item.Text ($sx+10) ($y+6) ($item.Width-20) (Color 'text-secondary') 12;$sx+=$item.Width;$graphics.Fill($sx,($y+7),0.8,14,(Color 'border-subtle'),0)}
     }
@@ -14587,29 +15200,30 @@ function Paint-Find {
     if(-not $ui.Find){return}
     $w=460.0;$x=$ui.Width-24-$w;$y=88.0;$h=if($ui.Replace){88}else{48}
     $graphics.Fill($x,$y,$w,$h,(Surface-Color 'bg-flyout' 0.35),8);$graphics.Stroke($x,$y,$w,$h,(Color 'border-control'),8,1)
-    Node 'find-replace-panel' $x $y $w $h 'none'
+    Node 'find-replace-panel' $x $y $w $h ([FluentAction]::None)
     InputBox 'find-query-input' $state.Find.Query ($x+10) ($y+9) 228 'Find' 28
     $count=if(-not $state.Find.Query){'0 of 0'}elseif(-not $state.Find.Matches.Count){'No results'}else{"$($state.Find.Index+1) of $($state.Find.Matches.Count)"}
     Label $count ($x+174) ($y+16) 62 (Color 'text-secondary') 12
     $bx=$x+244
-    foreach($button in [string[][]]@(@('prev','arrowUp','findPrevious'),@('next','arrowDown','findNext'),@('case','caseSensitive','findCase'),@('wrap','wrapAround','findWrap'),@('replace','chevronDown','toggleReplace'),@('close','close','closeFind'))){
-        if(($button[0] -eq 'case' -and $state.Find.MatchCase) -or ($button[0] -eq 'wrap' -and $state.Find.Wrap)){$graphics.Fill($bx,($y+9),28,28,(Color 'bg-control-active'),4)}
-        Button ('find-btn-'+$button[0]) $bx ($y+9) 28 28 $button[2] '' $button[1] $null $false $false 14;$bx+=34
+    foreach($button in [NotepadFindButton[]]@(@{Id='prev';Icon='arrowUp';Action=[FluentAction]::FindPrevious},@{Id='next';Icon='arrowDown';Action=[FluentAction]::FindNext},@{Id='case';Icon='caseSensitive';Action=[FluentAction]::FindCase},@{Id='wrap';Icon='wrapAround';Action=[FluentAction]::FindWrap},@{Id='replace';Icon='chevronDown';Action=[FluentAction]::ToggleReplace},@{Id='close';Icon='close';Action=[FluentAction]::CloseFind})){
+        if(($button.Action -eq [FluentAction]::FindCase -and $state.Find.MatchCase) -or ($button.Action -eq [FluentAction]::FindWrap -and $state.Find.Wrap)){$graphics.Fill($bx,($y+9),28,28,(Color 'bg-control-active'),4)}
+        Button ('find-btn-'+$button.Id) $bx ($y+9) 28 28 $button.Action '' $button.Icon $null $false $false 14;$bx+=34
     }
-    if($ui.Replace){InputBox 'replace-query-input' $state.Find.Replacement ($x+10) ($y+47) 253 'Replace with' 28;Button 'btn-do-replace' ($x+269) ($y+47) 74 28 'doReplace' 'Replace' '' $null $false $true;Button 'btn-do-replace-all' ($x+349) ($y+47) 100 28 'doReplaceAll' 'Replace all' '' $null $false $true}
+    if($ui.Replace){InputBox 'replace-query-input' $state.Find.Replacement ($x+10) ($y+47) 253 'Replace with' 28;Button 'btn-do-replace' ($x+269) ($y+47) 74 28 ([FluentAction]::DoReplace) 'Replace' '' $null $false $true;Button 'btn-do-replace-all' ($x+349) ($y+47) 100 28 ([FluentAction]::DoReplaceAll) 'Replace all' '' $null $false $true}
 }
-function Paint-MenuRows([object[]]$Rows,[double]$X,[double]$Y,[double]$W,[string]$Prefix){
+function Paint-MenuRows([NotepadMenuRow[]]$Rows,[double]$X,[double]$Y,[double]$W,[string]$Prefix){
     $h=8.0;foreach($row in $Rows){$h+=$(if($row.Separator){7}else{28})}
-    $graphics.Fill($X,$Y,$W,$h,(Surface-Color 'bg-flyout' 0.35),8);$graphics.Stroke($X,$Y,$W,$h,(Color 'border-control'),8,1)
-    Node ($Prefix+'-background') $X $Y $W $h 'none'
+    # Opaque: a flyout covers what is under it (acrylic needs the composition renderer, not a translucent fill).
+    $graphics.Fill($X,$Y,$W,$h,(Color 'bg-flyout'),8);$graphics.Stroke($X,$Y,$W,$h,(Color 'border-control'),8,1)
+    Node ($Prefix+'-background') $X $Y $W $h ([FluentAction]::None)
     $ry=$Y+4;$rowIndex=0
     foreach($row in $Rows){
         if($row.Separator){$graphics.Fill(($X+10),($ry+3),($W-20),1,(Color 'border-subtle'),0);$ry+=7;continue}
-        $id=$Prefix+'-'+$row.Action+'-'+$rowIndex;$rowIndex++
+        $id=$Prefix+'-'+$rowIndex;$rowIndex++
         if(-not $row.Disabled){Node $id ($X+4) $ry ($W-8) 28 $row.Action $row.Data}
         if($ui.Hover -eq $id -and -not $row.Disabled){$graphics.Fill(($X+4),$ry,($W-8),28,(Color 'bg-flyout-item-hover'),4)}
         $tx=$X+14
-        if($row.ContainsKey('Checked')){if($row.Checked){Icon 'check' $tx ($ry+8) 12};$tx+=22}
+        if($null -ne $row.Checked){if($row.Checked){Icon 'check' $tx ($ry+8) 12};$tx+=22}
         Label $row.Text $tx ($ry+5) ($W-28) (Color $(if($row.Disabled){'text-disabled'}else{'text-primary'})) 13
         if($row.Shortcut){Label $row.Shortcut ($X+$W-113) ($ry+6) 96 (Color 'text-secondary') 12}
         if($row.Submenu){Icon 'chevronRight' ($X+$W-24) ($ry+9) 10 (Color 'text-secondary');if($ui.Submenu -eq $row.Submenu){Paint-MenuRows $row.Rows ($X+$W-1) ($ry-4) 220 ($Prefix+'-sub')}}
@@ -14618,29 +15232,29 @@ function Paint-MenuRows([object[]]$Rows,[double]$X,[double]$Y,[double]$W,[string
 }
 function Paint-Menus {
     if(-not $ui.Menu){return}
-    $rows=switch($ui.Menu){
-        'file'{@(@{Text='New tab';Action='newTab';Shortcut='Ctrl+N'},@{Text='New window';Action='newWindow';Shortcut='Ctrl+Shift+N'},@{Text='New Markdown tab';Action='newMarkdownTab'},@{Text='Open';Action='openFile';Shortcut='Ctrl+O'},@{Text='Recent';Action='submenu';Data='recent';Submenu='recent';Rows=@(@{Text='No recent files';Action='none';Disabled=$true})},@{Text='Save';Action='save';Shortcut='Ctrl+S'},@{Text='Save as';Action='saveAs';Shortcut='Ctrl+Shift+S'},@{Text='Save all';Action='saveAll';Shortcut='Ctrl+Alt+S'},@{Separator=$true},@{Text='Page setup';Action='pageSetup'},@{Text='Print';Action='print';Shortcut='Ctrl+P'},@{Separator=$true},@{Text='Close tab';Action='closeTab';Shortcut='Ctrl+W'},@{Text='Close window';Action='closeWindow';Shortcut='Ctrl+Shift+W'},@{Text='Exit';Action='exit'})}
-        'edit'{@(@{Text='Undo';Action='undo';Shortcut='Ctrl+Z'},@{Separator=$true},@{Text='Cut';Action='cut';Shortcut='Ctrl+X'},@{Text='Copy';Action='copy';Shortcut='Ctrl+C'},@{Text='Paste';Action='paste';Shortcut='Ctrl+V'},@{Text='Delete';Action='delete';Shortcut='Del'},@{Separator=$true},@{Text='Clear formatting';Action='clearFormatting'},@{Text='Find';Action='find';Shortcut='Ctrl+F'},@{Text='Find next';Action='findNext';Shortcut='F3'},@{Text='Find previous';Action='findPrevious';Shortcut='Shift+F3'},@{Text='Replace';Action='replace';Shortcut='Ctrl+H'},@{Text='Go to';Action='goTo';Shortcut='Ctrl+G'},@{Separator=$true},@{Text='Select all';Action='selectAll';Shortcut='Ctrl+A'},@{Text='Time/Date';Action='timeDate';Shortcut='F5'},@{Separator=$true},@{Text='Font';Action='openFontSettings'})}
-        'view'{@(@{Text='Zoom';Action='submenu';Data='zoom';Submenu='zoom';Rows=@(@{Text='Zoom in';Action='zoomIn';Shortcut='Ctrl+Plus'},@{Text='Zoom out';Action='zoomOut';Shortcut='Ctrl+Minus'},@{Text='Restore default zoom';Action='zoomReset';Shortcut='Ctrl+0'})},@{Text='Status bar';Action='toggleStatusBar';Checked=[bool]$settings.showStatusBar},@{Text='Word wrap';Action='toggleWordWrap';Checked=[bool]$settings.wordWrap},@{Text='Markdown';Action='submenu';Data='markdown';Submenu='markdown';Rows=@(@{Text='Preview Markdown';Action='toggleMarkdownPreview'})})}
-        'headings'{@(@{Text='Heading 1';Action='formatHeading';Data='# '},@{Text='Heading 2';Action='formatHeading';Data='## '},@{Text='Heading 3';Action='formatHeading';Data='### '},@{Text='Paragraph';Action='formatHeading';Data=''})}
-        'lists'{@(@{Text='Bulleted list';Action='formatList';Data='- '},@{Text='Numbered list';Action='formatList';Data='1. '},@{Text='Checklist';Action='formatList';Data='- [ ] '})}
-        'formatMore'{@(@{Text='Bold';Action='formatBold';Shortcut='Ctrl+B'},@{Text='Italic';Action='formatItalic';Shortcut='Ctrl+I'},@{Text='Strikethrough';Action='formatStrike';Shortcut='Ctrl+Shift+X'},@{Text='Insert link';Action='formatLink';Shortcut='Ctrl+K'},@{Separator=$true},@{Text='Clear formatting';Action='clearFormatting'},@{Text='Preview Markdown';Action='toggleMarkdownPreview'})}
-        'writing'{@(@{Text='Copy whole document';Action='copyDocument'},@{Text='Copy format settings';Action='openSettings'})}
+    [NotepadMenuRow[]]$rows=switch($ui.Menu){
+        'file'{[NotepadMenuRow[]]@(@{Text='New tab';Action=[FluentAction]::NewTab;Shortcut='Ctrl+N'},@{Text='New window';Action=[FluentAction]::NewActivity;Shortcut='Ctrl+Shift+N'},@{Text='New Markdown tab';Action=[FluentAction]::NewMarkdownTab},@{Text='Open';Action=[FluentAction]::OpenFile;Shortcut='Ctrl+O'},@{Text='Recent';Action=[FluentAction]::Submenu;Data='recent';Submenu='recent';Rows=@(@{Text='No recent files';Action=[FluentAction]::None;Disabled=$true})},@{Text='Save';Action=[FluentAction]::Save;Shortcut='Ctrl+S'},@{Text='Save as';Action=[FluentAction]::SaveAs;Shortcut='Ctrl+Shift+S'},@{Text='Save all';Action=[FluentAction]::SaveAll;Shortcut='Ctrl+Alt+S'},@{Separator=$true},@{Text='Page setup';Action=[FluentAction]::PageSetup},@{Text='Print';Action=[FluentAction]::Print;Shortcut='Ctrl+P'},@{Separator=$true},@{Text='Close tab';Action=[FluentAction]::CloseTab;Shortcut='Ctrl+W'},@{Text='Close window';Action=[FluentAction]::CloseWindow;Shortcut='Ctrl+Shift+W'},@{Text='Exit';Action=[FluentAction]::Exit})}
+        'edit'{[NotepadMenuRow[]]@(@{Text='Undo';Action=[FluentAction]::Undo;Shortcut='Ctrl+Z'},@{Separator=$true},@{Text='Cut';Action=[FluentAction]::Cut;Shortcut='Ctrl+X'},@{Text='Copy';Action=[FluentAction]::Copy;Shortcut='Ctrl+C'},@{Text='Paste';Action=[FluentAction]::Paste;Shortcut='Ctrl+V'},@{Text='Delete';Action=[FluentAction]::Delete;Shortcut='Del'},@{Separator=$true},@{Text='Clear formatting';Action=[FluentAction]::ClearFormatting},@{Text='Find';Action=[FluentAction]::Find;Shortcut='Ctrl+F'},@{Text='Find next';Action=[FluentAction]::FindNext;Shortcut='F3'},@{Text='Find previous';Action=[FluentAction]::FindPrevious;Shortcut='Shift+F3'},@{Text='Replace';Action=[FluentAction]::Replace;Shortcut='Ctrl+H'},@{Text='Go to';Action=[FluentAction]::GoTo;Shortcut='Ctrl+G'},@{Separator=$true},@{Text='Select all';Action=[FluentAction]::SelectAll;Shortcut='Ctrl+A'},@{Text='Time/Date';Action=[FluentAction]::TimeDate;Shortcut='F5'},@{Separator=$true},@{Text='Font';Action=[FluentAction]::OpenFontSettings})}
+        'view'{[NotepadMenuRow[]]@(@{Text='Zoom';Action=[FluentAction]::Submenu;Data='zoom';Submenu='zoom';Rows=@(@{Text='Zoom in';Action=[FluentAction]::ZoomIn;Shortcut='Ctrl+Plus'},@{Text='Zoom out';Action=[FluentAction]::ZoomOut;Shortcut='Ctrl+Minus'},@{Text='Restore default zoom';Action=[FluentAction]::ZoomReset;Shortcut='Ctrl+0'})},@{Text='Status bar';Action=[FluentAction]::ToggleStatusBar;Checked=[bool]$settings.showStatusBar},@{Text='Word wrap';Action=[FluentAction]::ToggleWordWrap;Checked=[bool]$settings.wordWrap},@{Text='Markdown';Action=[FluentAction]::Submenu;Data='markdown';Submenu='markdown';Rows=@(@{Text='Preview Markdown';Action=[FluentAction]::ToggleMarkdownPreview})})}
+        'headings'{[NotepadMenuRow[]]@(@{Text='Heading 1';Action=[FluentAction]::FormatHeading;Data='# '},@{Text='Heading 2';Action=[FluentAction]::FormatHeading;Data='## '},@{Text='Heading 3';Action=[FluentAction]::FormatHeading;Data='### '},@{Text='Paragraph';Action=[FluentAction]::FormatHeading;Data=''})}
+        'lists'{[NotepadMenuRow[]]@(@{Text='Bulleted list';Action=[FluentAction]::FormatList;Data='- '},@{Text='Numbered list';Action=[FluentAction]::FormatList;Data='1. '},@{Text='Checklist';Action=[FluentAction]::FormatList;Data='- [ ] '})}
+        'formatMore'{[NotepadMenuRow[]]@(@{Text='Bold';Action=[FluentAction]::FormatBold;Shortcut='Ctrl+B'},@{Text='Italic';Action=[FluentAction]::FormatItalic;Shortcut='Ctrl+I'},@{Text='Strikethrough';Action=[FluentAction]::FormatStrike;Shortcut='Ctrl+Shift+X'},@{Text='Insert link';Action=[FluentAction]::FormatLink;Shortcut='Ctrl+K'},@{Separator=$true},@{Text='Clear formatting';Action=[FluentAction]::ClearFormatting},@{Text='Preview Markdown';Action=[FluentAction]::ToggleMarkdownPreview})}
+        'writing'{[NotepadMenuRow[]]@(@{Text='Copy format settings';Action=[FluentAction]::OpenSettings})}
     }
-    $x=switch($ui.Menu){'file'{8};'edit'{54};'view'{100};'headings'{($ui.Width-248)/2};'lists'{($ui.Width-248)/2+44};'formatMore'{($ui.Width-248)/2+212};'writing'{$ui.Width-268}}
+    $x=switch($ui.Menu){'file'{8};'edit'{54};'view'{100};'headings'{($ui.Width-280)/2};'lists'{($ui.Width-280)/2+44};'formatMore'{($ui.Width-280)/2+212};'writing'{$ui.Width-268}}
     $x=[Math]::Clamp([double]$x,8,[Math]::Max(8,$ui.Width-268))
     Paint-MenuRows $rows $x 80 260 ('flyout-'+$ui.Menu)
 }
 function Select-Control([string]$Id,[string]$Key,[NotepadOption[]]$Options,[double]$X,[double]$Y,[double]$W){
     $text=[string]$settings.Get($Key);foreach($option in $Options){if($option.Value -eq [string]$settings.Get($Key)){$text=$option.Text;break}}
     $data=@{Id=$Id;Key=$Key;Options=$Options;Rect=@($X,$Y,$W,32)}
-    Button $Id $X $Y $W 32 'settingSelect' '' '' $data $false $true
+    Button $Id $X $Y $W 32 ([FluentAction]::SettingSelect) '' '' $data $false $true
     Label $text ($X+12) ($Y+7) ($W-36) (Color 'text-primary') 13
     Icon 'chevronDown' ($X+$W-22) ($Y+10) 12 '#9d9d9d'
 }
 function Toggle-Control([string]$Key,[double]$X,[double]$Y){
     $on=[bool]$settings.Get($Key);$id='toggle-setting-'+$Key
-    Node $id $X $Y 78 24 'toggleSetting' $Key
+    Node $id $X $Y 78 24 ([FluentAction]::ToggleSetting) $Key
     $track=if($on){Color 'accent-color'}elseif($ui.Theme -eq 'light'){'#e0e0e0'}else{'#333333'}
     $border=if($on){Color 'accent-color'}elseif($ui.Theme -eq 'light'){'#999999'}else{'#777777'}
     $graphics.Fill($X,($Y+2),40,20,$track,10);$graphics.Stroke($X,($Y+2),40,20,$border,10,1)
@@ -14649,33 +15263,35 @@ function Toggle-Control([string]$Key,[double]$X,[double]$Y){
     Label $(if($on){'On'}else{'Off'}) ($X+50) ($Y+4) 28 (Color 'text-primary') 13
 }
 function Paint-ColorControls([double]$X,[double]$Y,[double]$W){
-    $names=@('Black','Red','Green','Yellow','Blue','Purple','Cyan','White')
-    $roles=@(@('foreground','Foreground'),@('tabs','Tabs'),@('cursor','Cursor color'),@('selectionBackground','Selection background'),@('topLeft','Top left'),@('topRight','Top right'),@('bottomLeft','Bottom left'),@('bottomRight','Bottom right'))
+    [string[]]$names=@('Black','Red','Green','Yellow','Blue','Purple','Cyan','White')
+    [string[][]]$roles=@(@('foreground','Foreground'),@('tabs','Tabs'),@('cursor','Cursor color'),@('selectionBackground','Selection background'),@('topLeft','Top left'),@('topRight','Top right'),@('bottomLeft','Bottom left'),@('bottomRight','Bottom right'))
     for($i=0;$i -lt 8;$i++){
         $rowY=$Y+$i*40
         Label $names[$i] ($X+24) ($rowY+8) 72 (Color 'text-primary') 14
-        foreach($bright in [int[]]@(0,1)){$index=$i+8*$bright;$sx=$X+112+42*$bright;Node ('palette-'+$index) $sx $rowY 32 32 'editAnsi' $index;$graphics.Fill($sx,$rowY,32,32,$settings.ansiColors[$index],4);$graphics.Stroke($sx,$rowY,32,32,(Color 'border-control'),4,1)}
+        foreach($bright in [int[]]@(0,1)){$index=$i+8*$bright;$sx=$X+112+42*$bright;Node ('palette-'+$index) $sx $rowY 32 32 ([FluentAction]::EditAnsi) $index;$graphics.Fill($sx,$rowY,32,32,$settings.ansiColors[$index],4);$graphics.Stroke($sx,$rowY,32,32,(Color 'border-control'),4,1)}
         Label $roles[$i][1] ($X+$W/2) ($rowY+8) ($W/2-66) (Color 'text-primary') 14
-        $cx=$X+$W-56;Node ('color-'+$roles[$i][0]) $cx $rowY 32 32 'editColor' $roles[$i][0]
+        $cx=$X+$W-56;Node ('color-'+$roles[$i][0]) $cx $rowY 32 32 ([FluentAction]::EditColor) $roles[$i][0]
         $graphics.Fill($cx,$rowY,32,32,(Role-Color $roles[$i][0]),4);$graphics.Stroke($cx,$rowY,32,32,(Color 'border-control'),4,1)
     }
-    Button 'reset-colors' ($X+24) ($Y+330) 130 32 'resetColors' 'Reset colors' '' $null $false $true
+    Button 'reset-colors' ($X+24) ($Y+330) 130 32 ([FluentAction]::ResetColors) 'Reset colors' '' $null $false $true
 }
 function Paint-Settings {
     if(-not $ui.Settings){return}
-    $w=$ui.Width;$h=$ui.Height;if(-not $settings.gradientEnabled){$graphics.Fill(0,0,$w,$h,(Surface-Color 'bg-window'),0)};Node 'settings-view' 0 0 $w $h 'none' $null 'default'
+    $w=$ui.Width;$h=$ui.Height;if(-not $settings.gradientEnabled){$graphics.Fill(0,0,$w,$h,(Surface-Color 'bg-window'),0)};Node 'settings-view' 0 0 $w $h ([FluentAction]::None) $null 'default'
     $graphics.Fill(0,39.2,$w,0.8,(Color 'border-subtle'),0)
-    Button 'settings-btn-back' 8 4 32 32 'back' '' 'back';Paint-AppIcon 'settings-app-icon' 48 11 18;Label 'Notepad' 88 12 200 (Color 'text-primary') 12
-    Button 'settings-win-min' ($w-138) 0 46 40 'none' '' 'minimize' $null $false $false 10
-    Button 'settings-win-max' ($w-92) 0 46 40 'none' '' 'maximize' $null $false $false 10
-    Button 'settings-win-close' ($w-46) 0 46 40 'back' '' 'close' $null $false $false 10
+    # The title bar drags the window, as on the editor page; the buttons drawn after it take their own clicks.
+    Node 'titlebar-drag' 0 0 $w 40 ([FluentAction]::Drag) $null 'default'
+    Button 'settings-btn-back' 8 4 32 32 ([FluentAction]::Back) '' 'back';Paint-AppIcon 'settings-app-icon' 48 11 18;Label 'Notepad' 88 12 200 (Color 'text-primary') 12
+    Button 'settings-win-min' ($w-138) 0 46 40 ([FluentAction]::Minimize) '' 'minimize' $null $false $false 10
+    Button 'settings-win-max' ($w-92) 0 46 40 ([FluentAction]::Maximize) '' 'maximize' $null $false $false 10
+    Button 'settings-win-close' ($w-46) 0 46 40 ([FluentAction]::CloseWindow) '' 'close' $null $false $false 10
     $col=[Math]::Min(650,$w-118);$left=($w-$col)/2;$right=$left
     $y=74-$ui.SettingsScroll
     $graphics.Clip(0,40,($w-12),($h-40));$ui.HitClip=@(0,40,($w-12),($h-40))
     Label 'Settings' $left $y $col (Color 'text-primary') 28 'Segoe UI' 600
     $y+=91
     Label 'Appearance' $left $y $col (Color 'text-primary') 14 'Segoe UI' 600;$y+=24
-    $cards=@(
+    [NotepadSettingCard[]]$cards=@(
         @{Title='App theme';Subtitle='Select which app theme to display';Icon='theme';Key='theme';Select=@(@{Text='Dark';Value='dark'},@{Text='Light';Value='light'},@{Text='Use system setting';Value='system'});SelectWidth=170}
         # MansfieldPlumbing additions: native DWM material, geometry and whole-document clipboard.
         @{Title='Window backdrop';Subtitle='Choose the material behind the window';Icon='theme';Key='backdrop';Select=@(@{Text='Solid';Value='solid'},@{Text='Mica';Value='mica'},@{Text='Acrylic';Value='acrylic'},@{Text='Reverse Mica';Value='reverseMica'});SelectWidth=170}
@@ -14684,7 +15300,7 @@ function Paint-Settings {
         @{Title='Four-corner gradient';Subtitle='Blend the four corner colors across the background';Icon='theme';Key='gradientEnabled';Toggle=$true}
         @{Title='Colors';Icon='theme';Accordion='card-colors-setting'}
         @{Title='Corners';Subtitle='Choose curved or straight window and control corners';Icon='tabsApp';Key='cornerStyle';Select=@(@{Text='Curved';Value='curved'},@{Text='Straight';Value='straight'});SelectWidth=170}
-        @{Title='Window icon';Subtitle='Click the top-left icon to cycle system icons';Icon='app';Button='resetIcon';ButtonText='Reset icon'}
+        @{Title='Window icon';Subtitle='Click the top-left icon to cycle system icons';Icon='app';Button=[FluentAction]::ResetIcon;ButtonText='Reset icon'}
         @{Section='Copy'}
         @{Title='Copy document as .txt file';Subtitle='Off copies text. Both modes use the whole active document.';Icon='openFiles';Key='copyAsFile';Toggle=$true}
         @{Section='Text Formatting'}
@@ -14712,19 +15328,19 @@ function Paint-Settings {
         if($card.Button){Button ('setting-'+$card.Button) ($left+$col-146) ($y+18) 130 32 $card.Button $card.ButtonText '' $null $false $true}
         if($card.Slider){
             $sx=$left+$col-230;$sy=$y+34;$sw=170;$amount=[int]$settings.backgroundOpacity/100.0
-            $ui.OpacityTrack=@($sx,$sy,$sw,4);Node 'setting-background-opacity' $sx ($sy-12) $sw 28 'opacitySlider'
+            $ui.OpacityTrack=@($sx,$sy,$sw,4);Node 'setting-background-opacity' $sx ($sy-12) $sw 28 ([FluentAction]::OpacitySlider)
             $graphics.Fill($sx,$sy,$sw,4,(Color 'border-control'),2);$graphics.Fill($sx,$sy,($sw*$amount),4,(Color 'accent-color'),2)
             $graphics.Fill(($sx+$sw*$amount-8),($sy-6),16,16,(Color 'bg-control'),8);$graphics.Fill(($sx+$sw*$amount-4),($sy-2),8,8,(Color 'accent-color'),4)
             Label ([string]$settings.backgroundOpacity+'%') ($sx+$sw+10) ($sy-8) 48 (Color 'text-primary') 13
         }
         if($card.Accordion){
-            Node ('header-'+$card.Accordion) $left $y $col 51.6 'accordion' $card.Accordion
+            Node ('header-'+$card.Accordion) $left $y $col 51.6 ([FluentAction]::Accordion) $card.Accordion
             Icon 'chevronDown' ($left+$col-34) ($y+18.8) 14 (Color 'text-secondary') $(if($expanded){180}else{0})
             if($expanded){
                 $graphics.Fill(($left+16),($y+51.6),($col-32),0.8,(Color 'border-subtle'),0)
                 if($card.Accordion -eq 'card-font-setting'){
                     $fy=$y+68
-                    $fontOptions=@(@{Label='Family';Key='fontFamily';Options=@('Consolas','Cascadia Code','Segoe UI','Courier New');Width=130},@{Label='Style';Key='fontStyle';Options=@('Regular','Bold','Italic','Bold Italic');Width=112},@{Label='Size';Key='fontSize';Options=@('8','9','10','11','12','14','16','18','20','24','28','36');Width=68})
+                    [NotepadFontRow[]]$fontOptions=@(@{Label='Family';Key='fontFamily';Options=@('Consolas','Cascadia Code','Segoe UI','Courier New');Width=130},@{Label='Style';Key='fontStyle';Options=@('Regular','Bold','Italic','Bold Italic');Width=112},@{Label='Size';Key='fontSize';Options=@('8','9','10','11','12','14','16','18','20','24','28','36');Width=68})
                     foreach($row in $fontOptions){Label $row.Label ($left+24) ($fy+7) 150 (Color 'text-primary') 13;$options=[Collections.Generic.List[NotepadOption]]::new();foreach($choice in $row.Options){$options.Add([NotepadOption]@{Text=$choice;Value=$choice})};Select-Control ('setting-'+$row.Key) $row.Key $options.ToArray() ($left+$col-24-$row.Width) $fy $row.Width;$fy+=46}
                     $fy+=5;$graphics.Fill(($left+16),$fy,($col-32),70.125,$(if($ui.Theme -eq 'light'){'#f7f7f7'}else{'#202020'}),6);$graphics.Stroke(($left+16),$fy,($col-32),70.125,(Color 'border-subtle'),6,0.8)
                     $layout=$graphics.Layout('The sound of ocean waves calms my soul.',$settings.fontFamily,([int]$settings.fontSize*96/72),($col-64),$false,$(if($settings.fontStyle.Contains('Bold')){700}else{400}),$settings.fontStyle.Contains('Italic'),0)
@@ -14733,8 +15349,8 @@ function Paint-Settings {
                     Paint-ColorControls $left ($y+66) $col
                 }else{
                     $ry=$y+73
-                    foreach($radio in @(@('continueSession','Continue previous session'),@('newSession','Start new session and discard unsaved changes'))){
-                        Node ('radio-'+$radio[0]) ($left+24) $ry ($col-48) 26 'startup' $radio[0]
+                    foreach($radio in [string[][]]@(@('continueSession','Continue previous session'),@('newSession','Start new session and discard unsaved changes'))){
+                        Node ('radio-'+$radio[0]) ($left+24) $ry ($col-48) 26 ([FluentAction]::Startup) $radio[0]
                         $selected=$settings.startupOption -eq $radio[0];$graphics.Stroke(($left+24),($ry+2),18,18,$(if($selected){Color 'accent-color'}else{'#888888'}),9,$(if($selected){2}else{1}));if($selected){$graphics.Fill(($left+28),($ry+6),10,10,(Color 'accent-color'),5)}
                         Label $radio[1] ($left+54) ($ry+2) ($col-80) (Color 'text-primary') 13;$ry+=33
                     }
@@ -14748,9 +15364,10 @@ function Paint-Settings {
     Label 'Notepad-PS1 by MansfieldPlumbing' $left ($y+30) $col (Color 'text-primary') 13
     Label 'Built by MansfieldPlumbing · 2026' $left ($y+53) $col (Color 'text-secondary') 12
     $y+=86
-    foreach($link in @(@('MansfieldPlumbing / JS2PS','https://github.com/MansfieldPlumbing/JS2PS'),@('MansfieldPlumbing / QuickPS','https://github.com/MansfieldPlumbing/QuickPS'))){Label $link[0] $left $y $col (Color 'text-link') 13;Node ('link-'+$y) $left $y $col 20 'link' $link[1];$y+=27}
+    foreach($link in [string[][]]@(@('MansfieldPlumbing / JS2PS','https://github.com/MansfieldPlumbing/JS2PS'),@('MansfieldPlumbing / QuickPS','https://github.com/MansfieldPlumbing/QuickPS'))){Label $link[0] $left $y $col (Color 'text-link') 13;Node ('link-'+$y) $left $y $col 20 ([FluentAction]::Link) $link[1];$y+=27}
     $y+=24
     if($ui.AppearanceError){Label $ui.AppearanceError $left $y $col '#e57a88' 12;$y+=40}
+    if($ui.PersistError){Label $ui.PersistError $left $y $col '#e57a88' 12;$y+=40}
     $ui.SettingsExtent=$y+60+$ui.SettingsScroll-40
     $graphics.Unclip();$ui.HitClip=$null
     if($ui.SettingsExtent -gt $h-40){$track=$h-46;$thumb=[Math]::Max(24,$track*($h-40)/$ui.SettingsExtent);$ty=43+($track-$thumb)*$ui.SettingsScroll/[Math]::Max(1,$ui.SettingsExtent-$h+40);$graphics.Fill(($w-9),$ty,6,$thumb,'rgba(255,255,255,0.2)',3)}
@@ -14760,8 +15377,9 @@ function Paint-Dropdown {
     $drop=$ui.Dropdown;$r=$drop.Rect;$height=$drop.Options.Count*28+8;$y=$r[1]+$r[3]+2
     if($y+$height -gt $ui.Height-8){$y=[Math]::Max(42,$r[1]-$height-2)}
     [string]$current=if($drop.Key -eq 'pickerMode'){$ui.ColorPicker.Mode}else{$settings.Get($drop.Key)}
-    $rows=@(foreach($option in $drop.Options){@{Text=$option.Text;Action='chooseSetting';Data=@{Key=$drop.Key;Value=$option.Value};Checked=($current -eq $option.Value)}})
-    Paint-MenuRows $rows $r[0] $y ([Math]::Max(160,$r[2])) ('dropdown-'+$drop.Key)
+    $rows=[Collections.Generic.List[NotepadMenuRow]]::new()
+    foreach($option in $drop.Options){$rows.Add([NotepadMenuRow]@{Text=$option.Text;Action=[FluentAction]::ChooseSetting;Data=[NotepadSettingChoice]@{Key=$drop.Key;Value=$option.Value};Checked=($current -eq $option.Value)})}
+    Paint-MenuRows $rows.ToArray() $r[0] $y ([Math]::Max(160,$r[2])) ('dropdown-'+$drop.Key)
 }
 function Paint-Modal {
     if(-not $ui.Modal){return}
@@ -14771,7 +15389,7 @@ function Paint-Modal {
         $height=24+25.2+16+$messageHeight+16+34+24+8
         if($m.Input){$height+=54};if($null -ne $m.Markdown){$height+=[Math]::Min(380,[Math]::Max(60,($m.Markdown.Split("`n").Count*23+24)))}
         $height=[Math]::Min($height,$ui.Height-40);$x=($ui.Width-$width)/2;$y=($ui.Height-$height)/2
-        $graphics.Fill(0,0,$ui.Width,$ui.Height,'rgba(0,0,0,0.5)',0);Node 'notepad-modal' 0 0 $ui.Width $ui.Height 'none' $null 'default'
+        $graphics.Fill(0,0,$ui.Width,$ui.Height,'rgba(0,0,0,0.5)',0);Node 'notepad-modal' 0 0 $ui.Width $ui.Height ([FluentAction]::None) $null 'default'
         $graphics.Fill($x,$y,$width,$height,(Color 'bg-dialog'),8);$graphics.Stroke($x,$y,$width,$height,(Color 'border-control'),8,1)
         Label $m.Title ($x+24) ($y+24) $bodyWidth (Color 'text-primary') 18 'Segoe UI' 600
         $by=$y+65.2
@@ -14783,14 +15401,16 @@ function Paint-Modal {
             $my=$by+12
             foreach($line in $m.Markdown.Split("`n")){
                 $size=14;$weight=400;$content=$line
-                if($line -match '^(#{1,3}) (.*)$'){$size=switch($Matches[1].Length){1{28};2{21};3{16.38}};$weight=700;$content=$Matches[2]}
+                # A heading: one to three # and a space, then its text.
+                $hashes=0;while($hashes -lt $line.Length -and $line[$hashes] -eq '#'){$hashes++}
+                if($hashes -ge 1 -and $hashes -le 3 -and $hashes -lt $line.Length -and $line[$hashes] -eq ' '){$size=switch($hashes){1{28};2{21};3{16.38}};$weight=700;$content=$line.Substring($hashes+1)}
                 Label $content ($x+36) $my ($bodyWidth-24) (Color 'text-primary') $size 'Segoe UI' $weight;$my+=$size*1.4
             }
             $graphics.Unclip()
         }
         $total=0;foreach($button in $m.Buttons){$total+=[Math]::Max(66,$button.Text.Length*7+32)+8}
         $bx=$x+$width-24-$total+8;$buttonIndex=0
-        foreach($button in $m.Buttons){$bw=[Math]::Max(66,$button.Text.Length*7+32);Button ('modal-button-'+$buttonIndex) $bx ($y+$height-58) $bw 34 'modalAction' $button.Text '' $button ([bool]$button.Primary) $true;$bx+=$bw+8;$buttonIndex++}
+        foreach($button in $m.Buttons){$bw=[Math]::Max(66,$button.Text.Length*7+32);Button ('modal-button-'+$buttonIndex) $bx ($y+$height-58) $bw 34 ([FluentAction]::ModalAction) $button.Text '' $button ([bool]$button.Primary) $true;$bx+=$bw+8;$buttonIndex++}
     }finally{$graphics.ReleaseLayout($messageLayout)}
 }
 function Paint-CanvasColorPicker {
@@ -14802,20 +15422,20 @@ function Paint-CanvasColorPicker {
     $p.PanelRect=@($x,$y,$width,$height);$p.VisibleHeight=$height;$p.Scroll=[Math]::Clamp($p.Scroll,0,[Math]::Max(0,$naturalHeight-$height))
     $graphics.Fill(($x-2),($y+4),($width+4),($height+4),'rgba(0,0,0,0.22)',9)
     $graphics.Fill($x,$y,$width,$height,(Color 'bg-flyout'),8);$graphics.Stroke($x,$y,$width,$height,(Color 'border-control'),8,1)
-    Node 'picker-background' $x $y $width $height 'none' $null 'default'
+    Node 'picker-background' $x $y $width $height ([FluentAction]::None) $null 'default'
     $oldClip=$ui.HitClip;$ui.HitClip=@($x,$y,$width,$height);$graphics.Clip($x,$y,$width,$height)
     $oy=$y-$p.Scroll;$sx=$x+16;$sy=$oy+16;$size=256.0
     $p.SpectrumRect=@($sx,$sy,$size,$size)
-    $graphics.ColorSpectrum($sx,$sy,$size);Node 'picker-spectrum' $sx $sy $size $size 'pickerSpectrum'
+    $graphics.ColorSpectrum($sx,$sy,$size);Node 'picker-spectrum' $sx $sy $size $size ([FluentAction]::PickerSpectrum)
     $graphics.Fill(($sx+$size+12),$sy,44,$size,$p.Hex,4)
     $mx=$sx+$p.H/360*$size;$my=$sy+(1-$p.S)*$size
     $graphics.Circle($mx,$my,7,'#ffffff',2);$graphics.Circle($mx,$my,8,'rgba(0,0,0,0.65)',1)
     $vx=$x+16;$vy=$oy+300;$vw=$width-32;$p.ValueRect=@($vx,$vy,$vw,16)
     $pure=Convert-HsvToHex $p.H $p.S 1
     $graphics.FourCorner($vx,$vy,$vw,12,[string[]]@('#000000',$pure,'#000000',$pure),1)
-    Node 'picker-value' $vx ($vy-6) $vw 26 'pickerValue'
+    Node 'picker-value' $vx ($vy-6) $vw 26 ([FluentAction]::PickerValue)
     $graphics.Circle(($vx+$vw*$p.V),($vy+6),7,(Color 'bg-control'),0);$graphics.Circle(($vx+$vw*$p.V),($vy+6),5,'#ffffff',0)
-    $p.ModeRect=@(($x+16),($oy+328),120,36);Button 'picker-mode' ($x+16) ($oy+328) 120 36 'pickerMode' '' '' $null $false $true
+    $p.ModeRect=@(($x+16),($oy+328),120,36);Button 'picker-mode' ($x+16) ($oy+328) 120 36 ([FluentAction]::PickerMode) '' '' $null $false $true
     Label $p.Mode ($x+28) ($oy+337) 80 (Color 'text-primary') 16;Icon 'chevronDown' ($x+112) ($oy+341) 10
     InputBox 'picker-input-hex' $p.Inputs['hex']($x+196) ($oy+328) 132 '' 36 16
     [string[]]$labels=if($p.Mode -eq 'RGB'){@('Red','Green','Blue')}else{@('Hue','Saturation','Value')}
@@ -14845,9 +15465,30 @@ function Paint {
 function Hit([double]$X,[double]$Y){
     for($i=$ui.Hits.Count-1;$i -ge 0;$i--){$node=$ui.Hits[$i];$r=$node.Rect;if($node.Clip){$c=$node.Clip;if($X -lt $c[0] -or $Y -lt $c[1] -or $X -ge $c[0]+$c[2] -or $Y -ge $c[1]+$c[3]){continue}};if($X -ge $r[0] -and $Y -ge $r[1] -and $X -lt $r[0]+$r[2] -and $Y -lt $r[1]+$r[3]){return $node}}
 }
+# Kinetic selection: while a selection drag holds the pointer past the gate's top or bottom edge, the text keeps
+# scrolling, 4 lines a second at the edge and faster the further past it (about 40 at 100 px), and the selection
+# follows to the edge line. Called every pass of the main loop, since a still pointer sends no messages.
+function Step-DragScroll([datetime]$Instant){
+    $edgeTop=$ui.EditorRect[1];$edgeBottom=$edgeTop+$ui.EditorRect[3]
+    $past=if($ui.DragY -lt $edgeTop){$ui.DragY-$edgeTop}elseif($ui.DragY -gt $edgeBottom){$ui.DragY-$edgeBottom}else{0.0}
+    $stepSeconds=[Math]::Min(0.1,($Instant-$ui.DragTick).TotalSeconds);$ui.DragTick=$Instant
+    if($past -eq 0){return}
+    $tab=$model.Active();$tab.ScrollY=[Math]::Max(0,$tab.ScrollY+[Math]::Sign($past)*(4+[Math]::Abs($past)*0.36)*$stepSeconds)
+    Editor-Hit $ui.DragX ([Math]::Clamp($ui.DragY,$edgeTop+1,$edgeBottom-1)) $true
+    $ui.EnsureCaret=$false
+}
+
+# A point in the editor to a text position, through the line of the last frame's gate under it (the last line when
+# the point is below them all).
 function Editor-Hit([double]$X,[double]$Y,[bool]$Extend=$false){
-    $hit=$graphics.HitText($ui.EditorLayout,($X-$ui.EditorOrigin[0]),($Y-$ui.EditorOrigin[1]));$tab=$model.Active()
-    $anchor=if($Extend){$tab.Anchor}else{$hit.Position};$model.Select($anchor,$hit.Position);$ui.Focus='editor-area';Invalidate $true
+    $tab=$model.Active();$position=$tab.Focus
+    if($null -ne $ui.GateLines -and $ui.GateLines.Count){
+        [NotepadGateLine]$under=$ui.GateLines[$ui.GateLines.Count-1]
+        foreach($gateLine in $ui.GateLines){if($Y -lt $gateLine.Top+$gateLine.Height){$under=$gateLine;break}}
+        $hit=$graphics.HitText($under.Layout,($X-$ui.EditorOrigin[0]),[Math]::Max(0,$Y-$under.Top))
+        $position=$under.Start+[Math]::Min($hit.Position,$under.Length)
+    }
+    $anchor=if($Extend){$tab.Anchor}else{$position};$model.Select($anchor,$position);$ui.Focus='editor-area';Invalidate $true
 }
 function Key-Input([NotepadWindowEvent]$Event){
     $key=[int]$Event.W;$ctrl=$Event.Ctrl;$shift=$Event.Shift
@@ -14863,8 +15504,8 @@ function Key-Input([NotepadWindowEvent]$Event){
     if($ui.Focus -in @('find-query-input','replace-query-input','dialog-input') -or ($ui.ColorPicker -and $ui.Focus.StartsWith('picker-input-'))){
         $value=Input-Value $ui.Focus
         if($ctrl -and $key -eq 65){$ui.InputAnchor=0;$ui.InputFocus=$value.Length}
-        elseif($ctrl -and $key -eq 86){Input-Insert $services.ReadClipboard()}
-        elseif($ctrl -and $key -in @(67,88)){$start=[Math]::Min($ui.InputAnchor,$ui.InputFocus);$len=[Math]::Abs($ui.InputFocus-$ui.InputAnchor);$services.WriteClipboard($value.Substring($start,$len));if($key -eq 88){Input-Insert ''}}
+        elseif($ctrl -and $key -eq 86){Input-Insert ([Win32Clipboard]::ReadText($window.Handle()))}
+        elseif($ctrl -and $key -in @(67,88)){$start=[Math]::Min($ui.InputAnchor,$ui.InputFocus);$len=[Math]::Abs($ui.InputFocus-$ui.InputAnchor);[Win32Clipboard]::WriteText($window.Handle(),$value.Substring($start,$len));if($key -eq 88){Input-Insert ''}}
         elseif($key -in @(8,46)){
             if($ui.InputAnchor -eq $ui.InputFocus){if($key -eq 8 -and $ui.InputFocus -gt 0){$ui.InputAnchor--}elseif($key -eq 46 -and $ui.InputFocus -lt $value.Length){$ui.InputAnchor++}}
             Input-Insert ''
@@ -14875,20 +15516,34 @@ function Key-Input([NotepadWindowEvent]$Event){
         Invalidate $true;return
     }
     if($ctrl){
-        if($settings.formatting -and $key -in @(66,73,75) -or ($ctrl -and $shift -and $key -eq 88)){$action=switch($key){66{'formatBold'};73{'formatItalic'};75{'formatLink'};88{'formatStrike'}};Command $action;return}
-        $action=switch($key){78{if($shift){'newWindow'}else{'newTab'}};79{'openFile'};83{if($Event.Alt){'saveAll'}elseif($shift){'saveAs'}else{'save'}};87{if($shift){'closeWindow'}else{'closeTab'}};70{'find'};72{'replace'};71{'goTo'};80{'print'};65{'selectAll'};67{'copy'};88{'cut'};86{'paste'};90{if($shift){'redo'}else{'undo'}};89{'redo'};187{'zoomIn'};107{'zoomIn'};189{'zoomOut'};109{'zoomOut'};48{'zoomReset'}}
+        if($settings.formatting -and $key -in @(66,73,75) -or ($ctrl -and $shift -and $key -eq 88)){$action=switch($key){66{[FluentAction]::FormatBold};73{[FluentAction]::FormatItalic};75{[FluentAction]::FormatLink};88{[FluentAction]::FormatStrike}};Command $action;return}
+        $action=switch($key){78{if($shift){[FluentAction]::NewActivity}else{[FluentAction]::NewTab}};79{[FluentAction]::OpenFile};83{if($Event.Alt){[FluentAction]::SaveAll}elseif($shift){[FluentAction]::SaveAs}else{[FluentAction]::Save}};87{if($shift){[FluentAction]::CloseWindow}else{[FluentAction]::CloseTab}};70{[FluentAction]::Find};72{[FluentAction]::Replace};71{[FluentAction]::GoTo};80{[FluentAction]::Print};65{[FluentAction]::SelectAll};67{[FluentAction]::Copy};88{[FluentAction]::Cut};86{[FluentAction]::Paste};90{if($shift){[FluentAction]::Redo}else{[FluentAction]::Undo}};89{[FluentAction]::Redo};187{[FluentAction]::ZoomIn};107{[FluentAction]::ZoomIn};189{[FluentAction]::ZoomOut};109{[FluentAction]::ZoomOut};48{[FluentAction]::ZoomReset}}
         if($action){Command $action;return}
     }
-    if($key -eq 114){Command $(if($shift){'findPrevious'}else{'findNext'});return}
-    if($key -eq 116){Command 'timeDate';return}
+    if($key -eq 114){Command $(if($shift){[FluentAction]::FindPrevious}else{[FluentAction]::FindNext});return}
+    if($key -eq 116){Command ([FluentAction]::TimeDate);return}
     if($ui.Focus -ne 'editor-area' -or $ui.Settings){return}
     switch($key){
         8{$model.Delete($true)};46{$model.Delete($false)}
         37{$model.Move('left',$shift,$ctrl)};39{$model.Move('right',$shift,$ctrl)}
         36{$model.Move('home',$shift,$ctrl)};35{$model.Move('end',$shift,$ctrl)}
         {$_ -in @(38,40,33,34)}{
-            $tab=$model.Active();$caret=$graphics.Caret($ui.EditorLayout,$tab.Focus,$false);$distance=if($key -in @(33,34)){$ui.EditorRect[3]-28}else{$caret.Height};$dy=if($key -in @(38,33)){-$distance}else{$distance}
-            $hit=$graphics.HitText($ui.EditorLayout,$caret.X,($caret.Y+$caret.Height/2+$dy));$model.Select($(if($shift){$tab.Anchor}else{$hit.Position}),$hit.Position)
+            # Up and Down move a wrapped row within the line, then into the neighbouring line; Page Up and Down move
+            # the caret and the gate by the gate's height in lines. Each lays out only the lines it touches.
+            $tab=$model.Active();Update-LineStarts $tab;$starts=$ui.LineStarts
+            $line=Get-LineIndex $tab.Focus;$layout=Get-LineLayout (Get-LineText $line)
+            $caret=$graphics.Caret($layout,[uint32]($tab.Focus-$starts[$line]),$false);$position=$tab.Focus
+            if($key -in @(33,34)){
+                $step=[Math]::Max(1,$(if($null -ne $ui.GateLines){$ui.GateLines.Count}else{1})-1);if($key -eq 33){$step=-$step}
+                $target=[Math]::Clamp($line+$step,0,$starts.Length-1);$tab.ScrollY=[Math]::Clamp($tab.ScrollY+$step,0,$starts.Length-1)
+                $hit=$graphics.HitText((Get-LineLayout (Get-LineText $target)),$caret.X,1);$position=$starts[$target]+$hit.Position
+            }else{
+                $rowY=$caret.Y+$caret.Height/2+$(if($key -eq 38){-$caret.Height}else{$caret.Height})
+                if($rowY -ge 0 -and $rowY -lt $graphics.Metrics($layout).Height){$hit=$graphics.HitText($layout,$caret.X,$rowY);$position=$starts[$line]+$hit.Position}
+                elseif($key -eq 38 -and $line -gt 0){$above=Get-LineLayout (Get-LineText ($line-1));$hit=$graphics.HitText($above,$caret.X,($graphics.Metrics($above).Height-1));$position=$starts[$line-1]+$hit.Position}
+                elseif($key -eq 40 -and $line+1 -lt $starts.Length){$hit=$graphics.HitText((Get-LineLayout (Get-LineText ($line+1))),$caret.X,1);$position=$starts[$line+1]+$hit.Position}
+            }
+            $model.Select($(if($shift){$tab.Anchor}else{$position}),$position)
         }
     }
     Invalidate $true
@@ -14924,21 +15579,22 @@ function Handle-Event([NotepadWindowEvent]$Event){
         $delta=[int](($Event.W -shr 16)-band 0xffff);if($delta -ge 32768){$delta-=65536}
         if($ui.ColorPicker){$ui.ColorPicker.Scroll=[Math]::Clamp($ui.ColorPicker.Scroll-$delta/120*48,0,[Math]::Max(0,528-$ui.ColorPicker.VisibleHeight));Invalidate}
         elseif($Event.Ctrl -and $Event.Shift){$settings.backgroundOpacity=[Math]::Clamp([int]$settings.backgroundOpacity+$(if($delta -gt 0){5}else{-5}),0,100);Persist;Invalidate}
-        elseif($Event.Ctrl){Command $(if($delta -gt 0){'zoomIn'}else{'zoomOut'})}
+        elseif($Event.Ctrl){Command $(if($delta -gt 0){[FluentAction]::ZoomIn}else{[FluentAction]::ZoomOut})}
         elseif($ui.Settings){$ui.SettingsScroll=[Math]::Clamp($ui.SettingsScroll-$delta/120*72,0,[Math]::Max(0,$ui.SettingsExtent-$ui.Height+40));Invalidate}
-        elseif(-not $ui.Modal){$tab=$model.Active();$tab.ScrollY=[Math]::Max(0,$tab.ScrollY-$delta/120*64);$ui.EnsureCaret=$false;Invalidate}
+        elseif(-not $ui.Modal){$tab=$model.Active();$tab.ScrollY=[Math]::Max(0,$tab.ScrollY-$delta/120*3);$ui.EnsureCaret=$false;Invalidate}
         $ui.ScrollSequence++;Invalidate;return
     }
     [NotepadHitNode]$hit=Hit $x $y;$id=if($hit){$hit.Id}else{''}
     if($msg -eq 0x200){
         if($ui.ColorDrag){Set-ColorPickerPoint $ui.ColorDrag $x $y;return}
+        if($ui.ScrollDrag){Set-ScrollFromPoint $y;return}
         if($ui.SliderDrag){Set-OpacityFromPoint $x;return}
         if($ui.Hover -ne $id){$ui.Hover=$id;$ui.HoverSince=[DateTime]::UtcNow;$ui.TooltipShown=$false;Invalidate
-            if($hit -and $hit.Action -eq 'submenu'){$ui.Submenu=$hit.Data;Invalidate}
+            if($hit -and $hit.Action -eq [FluentAction]::Submenu){$ui.Submenu=$hit.Data;Invalidate}
             if($ui.Menu -and $id.StartsWith('menu-btn-')){$ui.Menu=$hit.Data;$ui.Submenu='';Invalidate}
         }
         $window.Cursor($(if($hit){$hit.Cursor}else{'default'}))
-        if($ui.Drag){Editor-Hit $x $y $true}
+        if($ui.Drag){$ui.DragX=$x;$ui.DragY=$y;Editor-Hit $x $y $true}
         return
     }
     if($msg -in @(0x201,0x203)){
@@ -14946,22 +15602,28 @@ function Handle-Event([NotepadWindowEvent]$Event){
         if($ui.Dropdown -and -not $id.StartsWith('dropdown-')){$ui.Dropdown=$null;Invalidate;return}
         if($ui.Menu -and -not $id.StartsWith('flyout-') -and -not $id.StartsWith('menu-btn-')){$ui.Menu='';$ui.Submenu='';Invalidate}
         $ui.Pressed=$id;Invalidate
-        if($hit -and $hit.Action -in @('pickerSpectrum','pickerValue')){$ui.ColorDrag=if($hit.Action -eq 'pickerSpectrum'){'spectrum'}else{'value'};$window.Capture($true);Set-ColorPickerPoint $ui.ColorDrag $x $y;return}
-        if($hit -and $hit.Action -eq 'opacitySlider'){$ui.SliderDrag=$true;$ui.Focus='opacity-slider';$window.Capture($true);Set-OpacityFromPoint $x;return}
-        if($hit -and $hit.Action -eq 'editor'){
+        if($hit -and $hit.Action -in @([FluentAction]::PickerSpectrum,[FluentAction]::PickerValue)){$ui.ColorDrag=if($hit.Action -eq [FluentAction]::PickerSpectrum){'spectrum'}else{'value'};$window.Capture($true);Set-ColorPickerPoint $ui.ColorDrag $x $y;return}
+        if($hit -and $hit.Action -eq [FluentAction]::Scrollbar -and $ui.ScrollTrack){
+            $scrollTrack=$ui.ScrollTrack;$thumbTop=$scrollTrack[0]+($scrollTrack[1]-$scrollTrack[2])*$model.Active().ScrollY/$scrollTrack[3]
+            $ui.ScrollGrab=if($y -ge $thumbTop -and $y -lt $thumbTop+$scrollTrack[2]){$y-$thumbTop}else{$scrollTrack[2]/2}
+            $ui.ScrollDrag=$true;$window.Capture($true);Set-ScrollFromPoint $y;return
+        }
+        if($hit -and $hit.Action -eq [FluentAction]::OpacitySlider){$ui.SliderDrag=$true;$ui.Focus='opacity-slider';$window.Capture($true);Set-OpacityFromPoint $x;return}
+        if($hit -and $hit.Action -eq [FluentAction]::Editor){
             Editor-Hit $x $y $Event.Shift
-            if($msg -eq 0x203){$tab=$model.Active();$pos=$tab.Focus;$start=$pos;$end=$pos;while($start -gt 0 -and -not [char]::IsWhiteSpace($tab.Text[$start-1])){$start--};while($end -lt $tab.Text.Length -and -not [char]::IsWhiteSpace($tab.Text[$end])){$end++};$model.Select($start,$end)}
-            $ui.Drag=$true;$window.Capture($true)
-        }elseif($hit -and $hit.Action -eq 'drag'){$window.Caption('drag')}
+            if($msg -eq 0x203){$tab=$model.Active();$pos=$tab.Focus;$start=$pos;$end=$pos;while($start -gt 0 -and -not [char]::IsWhiteSpace($tab.At($start-1))){$start--};while($end -lt $tab.Document.Length -and -not [char]::IsWhiteSpace($tab.At($end))){$end++};$model.Select($start,$end)}
+            $ui.Drag=$true;$ui.DragX=$x;$ui.DragY=$y;$ui.DragTick=[DateTime]::UtcNow;$window.Capture($true)
+        }elseif($hit -and $hit.Action -eq [FluentAction]::Drag){$window.Caption([FluentWindowDecoration]::Drag)}
         return
     }
     if($msg -eq 0x202){
         if($ui.ColorDrag){Set-ColorPickerPoint $ui.ColorDrag $x $y;$ui.ColorDrag='';$ui.Pressed='';$window.Capture($false);$ui.ClickSequence++;Persist;Invalidate;return}
+        if($ui.ScrollDrag){$ui.ScrollDrag=$false;$ui.Pressed='';$window.Capture($false);Invalidate;return}
         if($ui.SliderDrag){Set-OpacityFromPoint $x;$ui.SliderDrag=$false;$ui.Pressed='';$window.Capture($false);$ui.ClickSequence++;Persist;Invalidate;return}
         if($ui.Drag){$ui.Drag=$false;$window.Capture($false)}
-        if($hit -and $id -eq $ui.Pressed -and $hit.Action -notin @('editor','drag')){
-            if($hit.Action -eq 'modalAction'){[NotepadModalButton]$button=$hit.Data;$value=$ui.Modal.Value;$ui.Modal=$null;Command $button.Action $(if($button.Action -in @('gotoConfirm','insertLink')){$value}else{$button.Data})}
-            else{if($id.StartsWith('flyout-') -and $hit.Action -ne 'submenu'){$ui.Menu='';$ui.Submenu=''};Command $hit.Action $hit.Data}
+        if($hit -and $id -eq $ui.Pressed -and $hit.Action -notin @([FluentAction]::Editor,[FluentAction]::Drag)){
+            if($hit.Action -eq [FluentAction]::ModalAction){[NotepadModalButton]$button=$hit.Data;$value=$ui.Modal.Value;$ui.Modal=$null;Command $button.Action $(if($button.Action -in @([FluentAction]::GotoConfirm,[FluentAction]::InsertLink)){$value}else{$button.Data})}
+            else{if($id.StartsWith('flyout-') -and $hit.Action -ne [FluentAction]::Submenu){$ui.Menu='';$ui.Submenu=''};Command $hit.Action $hit.Data}
         }
         $ui.Pressed='';$ui.ClickSequence++;Invalidate
     }
@@ -14972,7 +15634,7 @@ try{
     $window=Invoke-Window.Windows -Width $Width -Height $Height
     $info=$window.Info();$ui.Dpi=$info.Dpi;$ui.Width=$info.Width*96/$info.Dpi;$ui.Height=$info.Height*96/$info.Dpi
     $graphics=Invoke-Graphics.Windows -Hwnd $window.Handle() -Width $info.Width -Height $info.Height -Dpi $info.Dpi
-    $services=Invoke-Services.Windows -Native $native -Hwnd $window.Handle()
+    
     Apply-WindowAppearance
     Apply-WindowIcon
     if(-not $NoAnimation){$ui.BackdropActive=$false}
@@ -14987,9 +15649,10 @@ try{
     while($ui.Running -and $window.Info().Alive){
         foreach($event in @($window.Drain())){Handle-Event $event}
         $now=[DateTime]::UtcNow
+        if($ui.Drag -and $ui.EditorRect){Step-DragScroll $now}
         if($ui.Hover -eq 'btn-copy-document' -and -not $ui.TooltipShown -and ($now-$ui.HoverSince).TotalMilliseconds -ge 450){$ui.TooltipShown=$true;Invalidate}
         if($ui.EntranceStatus -eq 'Animating'){
-            $elapsed=($now-$ui.EntranceStart).TotalMilliseconds;$progress=[Math]::Clamp($elapsed/$ui.Entrance.DurationMs,0.0,1.0)
+          [double]$elapsed=($now-$ui.EntranceStart).TotalMilliseconds;[double]$progress=[Math]::Clamp($elapsed/$ui.Entrance.DurationMs,0.0,1.0)
             $eased=if($progress -ge 1){1.0}else{Entrance-Easing $progress}
             $sample=$window.Entrance($eased);$sample.ElapsedMs=$elapsed;$sample.TimeProgress=$progress
             $ui.EntranceSamples.Add($sample)
@@ -14999,12 +15662,12 @@ try{
         if($ui.Dirty -and -not $ui.Minimized -and $ui.Width -gt 0 -and $ui.Height -gt 0 -and $ui.EntranceStatus -ne 'Animating'){Paint}
         if(($now-$ui.LastSession).TotalSeconds -ge 2){Persist;$ui.LastSession=$now}
         if($RunSeconds -gt 0 -and ($now-$start).TotalSeconds -ge $RunSeconds){$ui.Running=$false}
-        Start-Sleep -Milliseconds 8
+        [Threading.Thread]::Sleep(8)
     }
     Persist
 }catch{
-    $_|Out-String|Set-Content (Join-Path $PSScriptRoot 'artifacts\last-error.txt');throw
+    throw
 }finally{
     Write-ApplicationDiagnostic
-    if($graphics){$graphics.Dispose()};if($window){$window.Dispose()};$native.Dispose()
+    if($graphics){$graphics.Dispose()};if($window){$window.Dispose()}
 }
