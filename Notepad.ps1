@@ -33,8 +33,9 @@ class NotepadTab {
     [int]$Focus
     [double]$ScrollX
     [double]$ScrollY
-    [Collections.Generic.Stack[NotepadSnapshot]]$Undo = [Collections.Generic.Stack[NotepadSnapshot]]::new()
-    [Collections.Generic.Stack[NotepadSnapshot]]$Redo = [Collections.Generic.Stack[NotepadSnapshot]]::new()
+    # Undo and redo history, the most recent last.
+    [Collections.Generic.List[NotepadSnapshot]]$Undo = [Collections.Generic.List[NotepadSnapshot]]::new()
+    [Collections.Generic.List[NotepadSnapshot]]$Redo = [Collections.Generic.List[NotepadSnapshot]]::new()
     [datetime]$LastEdit = [datetime]::MinValue
 }
 
@@ -146,7 +147,7 @@ class NotepadModel {
         $tab = $this.Active()
         $start = [Math]::Min($tab.Anchor, $tab.Focus)
         $end = [Math]::Max($tab.Anchor, $tab.Focus)
-        if (-not $Coalesce -or ([DateTime]::UtcNow - $tab.LastEdit).TotalMilliseconds -gt 700 -or $start -ne $end) { $tab.Undo.Push($this.Snapshot($tab)) }
+        if (-not $Coalesce -or ([DateTime]::UtcNow - $tab.LastEdit).TotalMilliseconds -gt 700 -or $start -ne $end) { $tab.Undo.Add($this.Snapshot($tab)) }
         $tab.Redo.Clear()
         $Text = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
         $tab.Text = $tab.Text.Substring(0, $start) + $Text + $tab.Text.Substring($end)
@@ -187,8 +188,9 @@ class NotepadModel {
         $to = $tab.Redo
         if ($Redo) { $from = $tab.Redo; $to = $tab.Undo }
         if (-not $from.Count) { return }
-        $to.Push($this.Snapshot($tab))
-        $saved = $from.Pop()
+        $to.Add($this.Snapshot($tab))
+        $saved = $from[$from.Count - 1]
+        $from.RemoveAt($from.Count - 1)
         $tab.Text = $saved.Text
         $tab.Anchor = $saved.Anchor
         $tab.Focus = $saved.Focus
@@ -1075,6 +1077,184 @@ class NotepadRect {
     [single]$Height
 }
 
+# Typed vector geometry, drawn by NotepadGraphics. A segment continues a figure from where the last one ended, in
+# absolute coordinates: a line to (X, Y); a cubic Bézier through (X1, Y1) and (X2, Y2) to (X, Y); a quadratic
+# Bézier through (X1, Y1) to (X, Y); an elliptical arc to (X, Y) with radii (X1, Y1), rotated by Rotation degrees,
+# the large arc or the small, clockwise or not.
+enum NotepadSegmentKind { Line; Cubic; Quadratic; Arc }
+class NotepadSegment {
+    [NotepadSegmentKind]$Kind
+    [single]$X1
+    [single]$Y1
+    [single]$X2
+    [single]$Y2
+    [single]$X
+    [single]$Y
+    [single]$Rotation
+    [bool]$Large
+    [bool]$Clockwise
+    static [NotepadSegment] Line([single]$X, [single]$Y) {
+        $segment = [NotepadSegment]::new(); $segment.Kind = [NotepadSegmentKind]::Line; $segment.X = $X; $segment.Y = $Y
+        return $segment
+    }
+    static [NotepadSegment] Cubic([single]$X1, [single]$Y1, [single]$X2, [single]$Y2, [single]$X, [single]$Y) {
+        $segment = [NotepadSegment]::new(); $segment.Kind = [NotepadSegmentKind]::Cubic
+        $segment.X1 = $X1; $segment.Y1 = $Y1; $segment.X2 = $X2; $segment.Y2 = $Y2; $segment.X = $X; $segment.Y = $Y
+        return $segment
+    }
+    static [NotepadSegment] Quadratic([single]$X1, [single]$Y1, [single]$X, [single]$Y) {
+        $segment = [NotepadSegment]::new(); $segment.Kind = [NotepadSegmentKind]::Quadratic
+        $segment.X1 = $X1; $segment.Y1 = $Y1; $segment.X = $X; $segment.Y = $Y
+        return $segment
+    }
+    static [NotepadSegment] Arc([single]$X, [single]$Y, [single]$RadiusX, [single]$RadiusY, [single]$Rotation, [bool]$Large, [bool]$Clockwise) {
+        $segment = [NotepadSegment]::new(); $segment.Kind = [NotepadSegmentKind]::Arc
+        $segment.X = $X; $segment.Y = $Y; $segment.X1 = $RadiusX; $segment.Y1 = $RadiusY
+        $segment.Rotation = $Rotation; $segment.Large = $Large; $segment.Clockwise = $Clockwise
+        return $segment
+    }
+}
+# A figure: a start point and the segments that follow it, closed back to the start or left open.
+class NotepadFigure {
+    [single]$StartX
+    [single]$StartY
+    [bool]$Closed
+    [NotepadSegment[]]$Segments
+    NotepadFigure([single]$StartX, [single]$StartY, [bool]$Closed, [NotepadSegment[]]$Segments) {
+        $this.StartX = $StartX; $this.StartY = $StartY; $this.Closed = $Closed; $this.Segments = $Segments
+    }
+}
+# A filled shape: its figures, filled nonzero; its colour ('' for the colour it is drawn in) and opacity.
+class NotepadShape {
+    [string]$Fill
+    [single]$Opacity
+    [NotepadFigure[]]$Figures
+    NotepadShape([string]$Fill, [single]$Opacity, [NotepadFigure[]]$Figures) { $this.Fill = $Fill; $this.Opacity = $Opacity; $this.Figures = $Figures }
+}
+# An icon: the size its shapes are drawn in, scaled to the size asked for.
+class NotepadIcon {
+    [single]$Width
+    [single]$Height
+    [NotepadShape[]]$Shapes
+    NotepadIcon([single]$Width, [single]$Height, [NotepadShape[]]$Shapes) { $this.Width = $Width; $this.Height = $Height; $this.Shapes = $Shapes }
+}
+# Notepad's icons as typed geometry: each a size and filled shapes of figures in absolute coordinates. Converted once
+# from the design's SVG path data by the path interpretation NotepadGraphics used (relative coordinates, H, V, S, T
+# and degenerate arcs resolved as it resolved them); a shape's empty fill takes the colour the icon is drawn in.
+class NotepadIcons {
+    static [Collections.Generic.Dictionary[string,NotepadIcon]] All() {
+        $icons = [Collections.Generic.Dictionary[string,NotepadIcon]]::new([StringComparer]::Ordinal)
+        $icons['app'] = [NotepadIcon]::new(24, 24, [NotepadShape[]]@(
+            [NotepadShape]::new('#0078d4', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(4, 2.5, $true, [NotepadSegment[]]@([NotepadSegment]::Cubic(4, 1.67, 4.67, 1, 5.5, 1), [NotepadSegment]::Line(18.5, 1), [NotepadSegment]::Cubic(19.33, 1, 20, 1.67, 20, 2.5), [NotepadSegment]::Line(20, 21.5), [NotepadSegment]::Cubic(20, 22.33, 19.33, 23, 18.5, 23), [NotepadSegment]::Line(5.5, 23), [NotepadSegment]::Cubic(4.67, 23, 4, 22.33, 4, 21.5), [NotepadSegment]::Line(4, 2.5))))),
+            [NotepadShape]::new('#60cdff', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(7, 6, $true, [NotepadSegment[]]@([NotepadSegment]::Line(17, 6), [NotepadSegment]::Line(17, 8), [NotepadSegment]::Line(7, 8))),
+                [NotepadFigure]::new(7, 10, $true, [NotepadSegment[]]@([NotepadSegment]::Line(17, 10), [NotepadSegment]::Line(17, 12), [NotepadSegment]::Line(7, 12))),
+                [NotepadFigure]::new(7, 14, $true, [NotepadSegment[]]@([NotepadSegment]::Line(13, 14), [NotepadSegment]::Line(13, 16), [NotepadSegment]::Line(7, 16))))),
+            [NotepadShape]::new('#ffffff', 0.8, [NotepadFigure[]]@(
+                [NotepadFigure]::new(7, 18, $true, [NotepadSegment[]]@([NotepadSegment]::Line(17, 18), [NotepadSegment]::Line(17, 19.5), [NotepadSegment]::Line(7, 19.5)))))))
+        $icons['minimize'] = [NotepadIcon]::new(10, 10, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(0, 5, $true, [NotepadSegment[]]@([NotepadSegment]::Line(10, 5), [NotepadSegment]::Line(10, 6), [NotepadSegment]::Line(0, 6)))))))
+        $icons['maximize'] = [NotepadIcon]::new(10, 10, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(1, 1, $true, [NotepadSegment[]]@([NotepadSegment]::Line(9, 1), [NotepadSegment]::Line(9, 9), [NotepadSegment]::Line(1, 9), [NotepadSegment]::Line(1, 1))),
+                [NotepadFigure]::new(2, 2, $true, [NotepadSegment[]]@([NotepadSegment]::Line(2, 8), [NotepadSegment]::Line(8, 8), [NotepadSegment]::Line(8, 2), [NotepadSegment]::Line(2, 2)))))))
+        $icons['restore'] = [NotepadIcon]::new(10, 10, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(3, 1, $true, [NotepadSegment[]]@([NotepadSegment]::Line(9, 1), [NotepadSegment]::Line(9, 7), [NotepadSegment]::Line(8, 7), [NotepadSegment]::Line(8, 2), [NotepadSegment]::Line(3, 2), [NotepadSegment]::Line(3, 1))),
+                [NotepadFigure]::new(1, 3, $true, [NotepadSegment[]]@([NotepadSegment]::Line(7, 3), [NotepadSegment]::Line(7, 9), [NotepadSegment]::Line(1, 9), [NotepadSegment]::Line(1, 3))),
+                [NotepadFigure]::new(2, 4, $true, [NotepadSegment[]]@([NotepadSegment]::Line(2, 8), [NotepadSegment]::Line(6, 8), [NotepadSegment]::Line(6, 4), [NotepadSegment]::Line(2, 4)))))))
+        $icons['close'] = [NotepadIcon]::new(10, 10, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(1.4, 0.7, $true, [NotepadSegment[]]@([NotepadSegment]::Line(5, 4.3), [NotepadSegment]::Line(8.6, 0.7), [NotepadSegment]::Line(9.3, 1.4), [NotepadSegment]::Line(5.7, 5), [NotepadSegment]::Line(9.3, 8.6), [NotepadSegment]::Line(8.6, 9.3), [NotepadSegment]::Line(5, 5.7), [NotepadSegment]::Line(1.4, 9.3), [NotepadSegment]::Line(0.7, 8.6), [NotepadSegment]::Line(4.3, 5), [NotepadSegment]::Line(0.7, 1.4)))))))
+        $icons['plus'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(8, 2, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(8.75, 2.75, 0.75, 0.75, 0, $False, $True), [NotepadSegment]::Line(8.75, 7.25), [NotepadSegment]::Line(13.25, 7.25), [NotepadSegment]::Arc(13.25, 8.75, 0.75, 0.75, 0, $False, $True), [NotepadSegment]::Line(8.75, 8.75), [NotepadSegment]::Line(8.75, 13.25), [NotepadSegment]::Arc(7.25, 13.25, 0.75, 0.75, 0, $False, $True), [NotepadSegment]::Line(7.25, 8.75), [NotepadSegment]::Line(2.75, 8.75), [NotepadSegment]::Arc(2.75, 7.25, 0.75, 0.75, 0, $False, $True), [NotepadSegment]::Line(7.25, 7.25), [NotepadSegment]::Line(7.25, 2.75), [NotepadSegment]::Arc(8, 2, 0.75, 0.75, 0, $False, $True)))))))
+        $icons['back'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(13.5, 7.25, $true, [NotepadSegment[]]@([NotepadSegment]::Line(4.86, 7.25), [NotepadSegment]::Line(8.83, 3.28), [NotepadSegment]::Arc(7.77, 2.2199999999999998, 0.75, 0.75, 0, $False, $False), [NotepadSegment]::Line(2.5199999999999996, 7.47), [NotepadSegment]::Arc(2.5199999999999996, 8.53, 0.75, 0.75, 0, $False, $False), [NotepadSegment]::Line(7.77, 13.78), [NotepadSegment]::Arc(8.83, 12.719999999999999, 0.75, 0.75, 0, $True, $False), [NotepadSegment]::Line(4.86, 8.75), [NotepadSegment]::Line(13.5, 8.75), [NotepadSegment]::Arc(13.5, 7.25, 0.75, 0.75, 0, $False, $False)))))))
+        $icons['gear'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(7.07, 1, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(6.09, 1.8, 1, 1, 0, $False, $False), [NotepadSegment]::Line(5.82, 3.14), [NotepadSegment]::Arc(4.54, 3.67, 5.03, 5.03, 0, $False, $False), [NotepadSegment]::Line(3.31, 3.05), [NotepadSegment]::Arc(2.0700000000000003, 3.36, 1, 1, 0, $False, $False), [NotepadSegment]::Line(1.13, 5.01), [NotepadSegment]::Arc(1.2799999999999998, 6.279999999999999, 1, 1, 0, $False, $False), [NotepadSegment]::Line(2.32, 7.159999999999999), [NotepadSegment]::Cubic(2.28, 7.4399999999999995, 2.25, 7.719999999999999, 2.25, 7.999999999999999), [NotepadSegment]::Cubic(2.25, 8.28, 2.28, 8.559999999999999, 2.32, 8.84), [NotepadSegment]::Line(1.2799999999999998, 9.72), [NotepadSegment]::Arc(1.13, 10.99, 1, 1, 0, $False, $False), [NotepadSegment]::Line(2.37, 12.64), [NotepadSegment]::Arc(3.6100000000000003, 12.950000000000001, 1, 1, 0, $False, $False), [NotepadSegment]::Line(4.84, 12.330000000000002), [NotepadSegment]::Cubic(5.24, 12.560000000000002, 5.67, 12.740000000000002, 6.12, 12.860000000000001), [NotepadSegment]::Line(6.390000000000001, 14.200000000000001), [NotepadSegment]::Arc(7.370000000000001, 15.000000000000002, 1, 1, 0, $False, $False), [NotepadSegment]::Line(9.430000000000001, 15.000000000000002), [NotepadSegment]::Arc(10.410000000000002, 14.200000000000001, 1, 1, 0, $False, $False), [NotepadSegment]::Line(10.680000000000001, 12.860000000000001), [NotepadSegment]::Cubic(11.13, 12.740000000000002, 11.560000000000002, 12.56, 11.96, 12.330000000000002), [NotepadSegment]::Line(13.190000000000001, 12.950000000000001), [NotepadSegment]::Arc(14.430000000000001, 12.64, 1, 1, 0, $False, $False), [NotepadSegment]::Line(15.670000000000002, 10.99), [NotepadSegment]::Arc(15.520000000000001, 9.72, 1, 1, 0, $False, $False), [NotepadSegment]::Line(14.48, 8.84), [NotepadSegment]::Cubic(14.52, 8.56, 14.55, 8.28, 14.55, 8), [NotepadSegment]::Cubic(14.55, 7.720000000000001, 14.520000000000001, 7.4399999999999995, 14.48, 7.16), [NotepadSegment]::Line(15.52, 6.28), [NotepadSegment]::Arc(15.67, 5.01, 1, 1, 0, $False, $False), [NotepadSegment]::Line(13.87, 3.36), [NotepadSegment]::Arc(12.629999999999999, 3.05, 1, 1, 0, $False, $False), [NotepadSegment]::Line(11.399999999999999, 3.67), [NotepadSegment]::Arc(10.12, 3.1399999999999997, 5.03, 5.03, 0, $False, $False), [NotepadSegment]::Line(9.85, 1.7999999999999996), [NotepadSegment]::Arc(8.87, 0.9999999999999996, 1, 1, 0, $False, $False), [NotepadSegment]::Line(7.07, 0.9999999999999996))),
+                [NotepadFigure]::new(8, 5.5, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(8, 10.5, 2.5, 2.5, 0, $True, $True), [NotepadSegment]::Arc(8, 5.5, 2.5, 2.5, 0, $False, $True)))))))
+        $icons['megaphone'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(13, 2.5, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(11.94, 1.8199999999999998, 0.75, 0.75, 0, $False, $False), [NotepadSegment]::Line(4.62, 5.08), [NotepadSegment]::Arc(2, 7.75, 2.75, 2.75, 0, $False, $False), [NotepadSegment]::Line(2, 8.25), [NotepadSegment]::Cubic(2, 9.45, 2.7800000000000002, 10.47, 3.88, 10.83), [NotepadSegment]::Line(3.25, 13.030000000000001), [NotepadSegment]::Arc(4.2, 13.96, 0.75, 0.75, 0, $False, $False), [NotepadSegment]::Line(7.07, 13), [NotepadSegment]::Line(7.550000000000001, 12.84), [NotepadSegment]::Arc(8.020000000000001, 12.39, 0.75, 0.75, 0, $False, $False), [NotepadSegment]::Line(8.650000000000002, 10.5), [NotepadSegment]::Line(11.940000000000001, 10.5), [NotepadSegment]::Line(12.000000000000002, 10.51), [NotepadSegment]::Arc(12.800000000000002, 9.85, 0.75, 0.75, 0, $False, $False), [NotepadSegment]::Line(13.000000000000002, 8.459999999999999), [NotepadSegment]::Arc(15, 5.5, 2.99, 2.99, 0, $False, $False), [NotepadSegment]::Line(15, 5), [NotepadSegment]::Arc(13, 2.5, 2.5, 2.5, 0, $False, $False))),
+                [NotepadFigure]::new(14, 5.5, $true, [NotepadSegment[]]@([NotepadSegment]::Cubic(14, 6.33, 13.33, 7, 12.5, 7), [NotepadSegment]::Line(12, 7), [NotepadSegment]::Line(12, 4), [NotepadSegment]::Line(12.5, 4), [NotepadSegment]::Cubic(13.33, 4, 14, 4.67, 14, 5.5)))))))
+        $icons['check'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(13.78, 4.22, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(13.78, 5.279999999999999, 0.75, 0.75, 0, $False, $True), [NotepadSegment]::Line(6.529999999999999, 12.53), [NotepadSegment]::Arc(5.469999999999999, 12.53, 0.75, 0.75, 0, $False, $True), [NotepadSegment]::Line(2.22, 9.28), [NotepadSegment]::Arc(3.2800000000000002, 8.219999999999999, 0.75, 0.75, 0, $False, $True), [NotepadSegment]::Line(6, 10.94), [NotepadSegment]::Line(12.719999999999999, 4.22), [NotepadSegment]::Arc(13.78, 4.22, 0.75, 0.75, 0, $False, $True)))))))
+        $icons['chevronDown'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(3.2, 5.2, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(4.26, 5.2, 0.75, 0.75, 0, $False, $True), [NotepadSegment]::Line(8, 8.94), [NotepadSegment]::Line(11.74, 5.199999999999999), [NotepadSegment]::Arc(12.8, 6.26, 0.75, 0.75, 0, $True, $True), [NotepadSegment]::Line(8.530000000000001, 10.53), [NotepadSegment]::Arc(7.470000000000001, 10.53, 0.75, 0.75, 0, $False, $True), [NotepadSegment]::Line(3.2, 6.26), [NotepadSegment]::Arc(3.2, 5.199999999999999, 0.75, 0.75, 0, $False, $True)))))))
+        $icons['chevronRight'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(5.2, 3.2, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(6.26, 3.2, 0.75, 0.75, 0, $False, $True), [NotepadSegment]::Line(10.53, 7.47), [NotepadSegment]::Arc(10.53, 8.53, 0.75, 0.75, 0, $False, $True), [NotepadSegment]::Line(6.26, 12.799999999999999), [NotepadSegment]::Arc(5.199999999999999, 11.739999999999998, 0.75, 0.75, 0, $False, $True), [NotepadSegment]::Line(8.94, 8), [NotepadSegment]::Line(5.2, 4.26), [NotepadSegment]::Arc(5.2, 3.1999999999999997, 0.75, 0.75, 0, $False, $True)))))))
+        $icons['theme'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(8, 1, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(8, 15, 7, 7, 0, $True, $False), [NotepadSegment]::Arc(8, 1, 7, 7, 0, $False, $False))),
+                [NotepadFigure]::new(8, 2.5, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(8, 13.5, 5.5, 5.5, 0, $True, $True), [NotepadSegment]::Arc(8, 2.5, 5.5, 5.5, 0, $False, $True))),
+                [NotepadFigure]::new(7.25, 4.5, $true, [NotepadSegment[]]@([NotepadSegment]::Line(7.25, 8.5), [NotepadSegment]::Cubic(7.25, 8.7, 7.33, 8.89, 7.47, 9.03), [NotepadSegment]::Line(9.969999999999999, 11.53), [NotepadSegment]::Line(11.03, 10.469999999999999), [NotepadSegment]::Line(8.75, 8.19), [NotepadSegment]::Line(8.75, 4.5), [NotepadSegment]::Line(7.25, 4.5)))))))
+        $icons['font'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(3.5, 13, $true, [NotepadSegment[]]@([NotepadSegment]::Line(5.3, 13), [NotepadSegment]::Line(6.4, 10), [NotepadSegment]::Line(9.600000000000001, 10), [NotepadSegment]::Line(10.700000000000001, 13), [NotepadSegment]::Line(12.500000000000002, 13), [NotepadSegment]::Line(8.8, 2.5), [NotepadSegment]::Line(7.2, 2.5), [NotepadSegment]::Line(3.5, 13))),
+                [NotepadFigure]::new(6.9, 8.5, $true, [NotepadSegment[]]@([NotepadSegment]::Line(8, 5.3), [NotepadSegment]::Line(9.1, 8.5), [NotepadSegment]::Line(6.9, 8.5)))))))
+        $icons['wordWrap'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(2, 3.5, $true, [NotepadSegment[]]@([NotepadSegment]::Line(14, 3.5), [NotepadSegment]::Line(14, 5), [NotepadSegment]::Line(2, 5), [NotepadSegment]::Line(2, 3.5))),
+                [NotepadFigure]::new(2, 7.5, $true, [NotepadSegment[]]@([NotepadSegment]::Line(11, 7.5), [NotepadSegment]::Arc(11, 12.5, 2.5, 2.5, 0, $True, $True), [NotepadSegment]::Line(8.5, 12.5), [NotepadSegment]::Line(8.5, 11), [NotepadSegment]::Line(11, 11), [NotepadSegment]::Arc(11, 9, 1, 1, 0, $True, $False), [NotepadSegment]::Line(2, 9), [NotepadSegment]::Line(2, 7.5))),
+                [NotepadFigure]::new(2, 11.5, $true, [NotepadSegment[]]@([NotepadSegment]::Line(6.5, 11.5), [NotepadSegment]::Line(6.5, 13), [NotepadSegment]::Line(2, 13), [NotepadSegment]::Line(2, 11.5))))),
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(8, 10.5, $true, [NotepadSegment[]]@([NotepadSegment]::Line(5.5, 12.5), [NotepadSegment]::Line(8, 14.5), [NotepadSegment]::Line(8, 10.5)))))))
+        $icons['formatting'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(12.8, 1.2, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(11.4, 1.2, 1, 1, 0, $False, $False), [NotepadSegment]::Line(7.5, 5.1), [NotepadSegment]::Line(10.9, 8.5), [NotepadSegment]::Line(14.8, 4.6), [NotepadSegment]::Arc(14.8, 3.1999999999999997, 1, 1, 0, $False, $False), [NotepadSegment]::Line(12.8, 1.1999999999999997))),
+                [NotepadFigure]::new(6.8, 5.8, $true, [NotepadSegment[]]@([NotepadSegment]::Line(2.2, 10.4), [NotepadSegment]::Cubic(2, 10.6, 1.9000000000000001, 10.9, 1.9000000000000001, 11.200000000000001), [NotepadSegment]::Line(1.9000000000000001, 13.5), [NotepadSegment]::Cubic(1.9000000000000001, 13.8, 2.1, 14, 2.4000000000000004, 14), [NotepadSegment]::Line(4.7, 14), [NotepadSegment]::Cubic(5, 14, 5.3, 13.9, 5.5, 13.7), [NotepadSegment]::Line(10.1, 9.1), [NotepadSegment]::Line(6.8999999999999995, 5.8)))))))
+        $icons['openFiles'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(3, 2, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(1, 4, 2, 2, 0, $False, $False), [NotepadSegment]::Line(1, 12), [NotepadSegment]::Arc(3, 14, 2, 2, 0, $False, $False), [NotepadSegment]::Line(11, 14), [NotepadSegment]::Arc(13, 12, 2, 2, 0, $False, $False), [NotepadSegment]::Line(13, 9.5), [NotepadSegment]::Line(11.5, 9.5), [NotepadSegment]::Line(11.5, 12), [NotepadSegment]::Arc(11, 12.5, 0.5, 0.5, 0, $False, $True), [NotepadSegment]::Line(3, 12.5), [NotepadSegment]::Arc(2.5, 12, 0.5, 0.5, 0, $False, $True), [NotepadSegment]::Line(2.5, 4), [NotepadSegment]::Arc(3, 3.5, 0.5, 0.5, 0, $False, $True), [NotepadSegment]::Line(5.5, 3.5), [NotepadSegment]::Line(5.5, 2), [NotepadSegment]::Line(3, 2))),
+                [NotepadFigure]::new(10, 2, $true, [NotepadSegment[]]@([NotepadSegment]::Line(10, 3.5), [NotepadSegment]::Line(12.44, 3.5), [NotepadSegment]::Line(6.72, 9.22), [NotepadSegment]::Line(7.779999999999999, 10.280000000000001), [NotepadSegment]::Line(13.5, 4.56), [NotepadSegment]::Line(13.5, 7), [NotepadSegment]::Line(15, 7), [NotepadSegment]::Line(15, 2), [NotepadSegment]::Line(10, 2)))))))
+        $icons['tabsApp'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(2, 3, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(1, 4, 1, 1, 0, $False, $False), [NotepadSegment]::Line(1, 12), [NotepadSegment]::Arc(2, 13, 1, 1, 0, $False, $False), [NotepadSegment]::Line(14, 13), [NotepadSegment]::Arc(15, 12, 1, 1, 0, $False, $False), [NotepadSegment]::Line(15, 4), [NotepadSegment]::Arc(14, 3, 1, 1, 0, $False, $False), [NotepadSegment]::Line(2, 3))),
+                [NotepadFigure]::new(2, 4.5, $true, [NotepadSegment[]]@([NotepadSegment]::Line(14, 4.5), [NotepadSegment]::Line(14, 5.5), [NotepadSegment]::Line(2, 5.5), [NotepadSegment]::Line(2, 4.5))),
+                [NotepadFigure]::new(2, 7, $true, [NotepadSegment[]]@([NotepadSegment]::Line(14, 7), [NotepadSegment]::Line(14, 13), [NotepadSegment]::Line(2, 13), [NotepadSegment]::Line(2, 7)))))))
+        $icons['recentFiles'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(8, 1, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(8, 15, 7, 7, 0, $True, $False), [NotepadSegment]::Arc(8, 1, 7, 7, 0, $False, $False))),
+                [NotepadFigure]::new(8, 2.5, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(8, 13.5, 5.5, 5.5, 0, $True, $True), [NotepadSegment]::Arc(8, 2.5, 5.5, 5.5, 0, $False, $True))),
+                [NotepadFigure]::new(7.25, 4.5, $true, [NotepadSegment[]]@([NotepadSegment]::Line(7.25, 8.5), [NotepadSegment]::Cubic(7.25, 8.7, 7.33, 8.89, 7.47, 9.03), [NotepadSegment]::Line(9.969999999999999, 11.53), [NotepadSegment]::Line(11.03, 10.469999999999999), [NotepadSegment]::Line(8.75, 8.19), [NotepadSegment]::Line(8.75, 4.5), [NotepadSegment]::Line(7.25, 4.5)))))))
+        $icons['spellCheck'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(2.5, 9, $true, [NotepadSegment[]]@([NotepadSegment]::Line(3.6, 9), [NotepadSegment]::Line(4.2, 7.2), [NotepadSegment]::Line(6.2, 7.2), [NotepadSegment]::Line(6.8, 9), [NotepadSegment]::Line(7.9, 9), [NotepadSegment]::Line(5.6, 2.5), [NotepadSegment]::Line(4.3, 2.5), [NotepadSegment]::Line(2.5, 9))),
+                [NotepadFigure]::new(4.5, 6.3, $true, [NotepadSegment[]]@([NotepadSegment]::Line(5.2, 4.199999999999999), [NotepadSegment]::Line(5.9, 6.299999999999999), [NotepadSegment]::Line(4.5, 6.299999999999999))),
+                [NotepadFigure]::new(10.7, 9, $true, [NotepadSegment[]]@([NotepadSegment]::Line(12.299999999999999, 9), [NotepadSegment]::Cubic(13.399999999999999, 9, 14.1, 8.3, 14.1, 7.3), [NotepadSegment]::Cubic(14.1, 6.7, 13.799999999999999, 6.199999999999999, 13.2, 6), [NotepadSegment]::Cubic(13.6, 5.8, 13.899999999999999, 5.4, 13.899999999999999, 4.8), [NotepadSegment]::Cubic(13.899999999999999, 3.9, 13.2, 3.1999999999999997, 12.2, 3.1999999999999997), [NotepadSegment]::Line(10.7, 3.1999999999999997), [NotepadSegment]::Line(10.7, 9))),
+                [NotepadFigure]::new(11.7, 3.4000000000000004, $true, [NotepadSegment[]]@([NotepadSegment]::Line(12.299999999999999, 3.4000000000000004), [NotepadSegment]::Cubic(12.7, 3.4000000000000004, 12.999999999999998, 3.7, 12.999999999999998, 4.1000000000000005), [NotepadSegment]::Cubic(12.999999999999998, 4.500000000000001, 12.699999999999998, 4.800000000000001, 12.299999999999999, 4.800000000000001), [NotepadSegment]::Line(11.7, 4.800000000000001), [NotepadSegment]::Line(11.7, 3.4))),
+                [NotepadFigure]::new(11.7, 5.7, $true, [NotepadSegment[]]@([NotepadSegment]::Line(12.399999999999999, 5.7), [NotepadSegment]::Cubic(12.899999999999999, 5.7, 13.2, 6, 13.2, 6.5), [NotepadSegment]::Cubic(13.2, 7, 12.899999999999999, 7.3, 12.399999999999999, 7.3), [NotepadSegment]::Line(11.7, 7.3), [NotepadSegment]::Line(11.7, 5.7))),
+                [NotepadFigure]::new(10.8, 11.2, $true, [NotepadSegment[]]@([NotepadSegment]::Line(8.200000000000001, 13.799999999999999), [NotepadSegment]::Line(7.100000000000001, 12.7), [NotepadSegment]::Line(6.400000000000001, 13.399999999999999), [NotepadSegment]::Line(8.200000000000001, 15.2), [NotepadSegment]::Line(11.5, 11.899999999999999), [NotepadSegment]::Line(10.8, 11.2)))))))
+        $icons['search'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(11.74, 10.68, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(10.68, 11.74, 6, 6, 0, $True, $False), [NotepadSegment]::Line(14.15, 15.21), [NotepadSegment]::Arc(15.21, 14.15, 0.75, 0.75, 0, $False, $False), [NotepadSegment]::Line(11.74, 10.68))),
+                [NotepadFigure]::new(11, 6.5, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(2, 6.5, 4.5, 4.5, 0, $True, $True), [NotepadSegment]::Arc(11, 6.5, 4.5, 4.5, 0, $False, $True)))))))
+        $icons['arrowUp'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(8, 3.2, $true, [NotepadSegment[]]@([NotepadSegment]::Line(12.27, 7.47), [NotepadSegment]::Arc(11.209999999999999, 8.53, 0.75, 0.75, 0, $False, $True), [NotepadSegment]::Line(8, 5.31), [NotepadSegment]::Line(4.79, 8.53), [NotepadSegment]::Arc(3.73, 7.469999999999999, 0.75, 0.75, 0, $True, $True), [NotepadSegment]::Line(8, 3.2)))))))
+        $icons['arrowDown'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(8, 12.8, $true, [NotepadSegment[]]@([NotepadSegment]::Line(3.73, 8.53), [NotepadSegment]::Arc(4.79, 7.469999999999999, 0.75, 0.75, 0, $False, $True), [NotepadSegment]::Line(8, 10.69), [NotepadSegment]::Line(11.21, 7.469999999999999), [NotepadSegment]::Arc(12.270000000000001, 8.53, 0.75, 0.75, 0, $True, $True), [NotepadSegment]::Line(8, 12.8)))))))
+        $icons['caseSensitive'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(3.2, 11.5, $true, [NotepadSegment[]]@([NotepadSegment]::Line(4.5, 11.5), [NotepadSegment]::Line(5.3, 9.3), [NotepadSegment]::Line(7.699999999999999, 9.3), [NotepadSegment]::Line(8.5, 11.5), [NotepadSegment]::Line(9.8, 11.5), [NotepadSegment]::Line(6.8, 3.5), [NotepadSegment]::Line(5.2, 3.5), [NotepadSegment]::Line(3.2, 11.5))),
+                [NotepadFigure]::new(5.7, 8.2, $true, [NotepadSegment[]]@([NotepadSegment]::Line(6.5, 5.8999999999999995), [NotepadSegment]::Line(7.3, 8.2), [NotepadSegment]::Line(5.7, 8.2))),
+                [NotepadFigure]::new(12.5, 11.5, $true, [NotepadSegment[]]@([NotepadSegment]::Line(13.7, 11.5), [NotepadSegment]::Line(13.7, 7), [NotepadSegment]::Cubic(13.7, 6.1, 13.1, 5.5, 12.2, 5.5), [NotepadSegment]::Cubic(11.299999999999999, 5.5, 10.7, 6.1, 10.7, 7), [NotepadSegment]::Line(10.7, 11.5), [NotepadSegment]::Line(11.899999999999999, 11.5), [NotepadSegment]::Line(11.899999999999999, 10.4), [NotepadSegment]::Cubic(12.099999999999998, 10.8, 12.499999999999998, 11, 12.899999999999999, 11), [NotepadSegment]::Cubic(13.599999999999998, 11, 13.999999999999998, 10.6, 13.999999999999998, 9.9), [NotepadSegment]::Line(13.999999999999998, 7.5), [NotepadSegment]::Line(12.499999999999998, 7.5), [NotepadSegment]::Line(12.499999999999998, 9.9), [NotepadSegment]::Cubic(12.499999999999998, 10.200000000000001, 12.699999999999998, 10.4, 12.999999999999998, 10.4), [NotepadSegment]::Cubic(13.299999999999999, 10.4, 13.499999999999998, 10.200000000000001, 13.499999999999998, 9.9), [NotepadSegment]::Line(13.499999999999998, 8.5), [NotepadSegment]::Line(12.299999999999999, 8.5), [NotepadSegment]::Line(12.299999999999999, 7), [NotepadSegment]::Cubic(12.299999999999999, 6.7, 12.499999999999998, 6.5, 12.799999999999999, 6.5), [NotepadSegment]::Cubic(13.1, 6.5, 13.299999999999999, 6.7, 13.299999999999999, 7), [NotepadSegment]::Line(13.299999999999999, 11.5)))))))
+        $icons['wrapAround'] = [NotepadIcon]::new(16, 16, [NotepadShape[]]@(
+            [NotepadShape]::new('', 1, [NotepadFigure[]]@(
+                [NotepadFigure]::new(2.5, 8.5, $true, [NotepadSegment[]]@([NotepadSegment]::Arc(4.1, 4.6, 5.5, 5.5, 0, $True, $False), [NotepadSegment]::Line(2, 4.6), [NotepadSegment]::Line(2, 3), [NotepadSegment]::Line(6, 3), [NotepadSegment]::Line(6, 7), [NotepadSegment]::Line(4.5, 7), [NotepadSegment]::Line(4.5, 5.5), [NotepadSegment]::Arc(3.3, 8.3, 4, 4, 0, $True, $True), [NotepadSegment]::Line(2, 8.3), [NotepadSegment]::Line(2, 8.5)))))))
+        return $icons
+    }
+}
+
 # Direct2D and DirectWrite through their COM interfaces: slots checked against Windows SDK 10.0.26100.0. Each COM
 # method is a pointer stub called with the slot's address and the object; each export is a library import. Every COM
 # object and temporary allocation has an explicit owner.
@@ -1082,7 +1262,7 @@ class NotepadGraphics {
     hidden [IntPtr]$scratch
     hidden [Collections.Generic.Dictionary[string,IntPtr]]$brushes = [Collections.Generic.Dictionary[string,IntPtr]]::new([StringComparer]::OrdinalIgnoreCase)
     hidden [Collections.Generic.Dictionary[string,IntPtr]]$formats = [Collections.Generic.Dictionary[string,IntPtr]]::new([StringComparer]::OrdinalIgnoreCase)
-    hidden [Collections.Generic.Dictionary[string,IntPtr]]$geometries = [Collections.Generic.Dictionary[string,IntPtr]]::new([StringComparer]::OrdinalIgnoreCase)
+    hidden [Collections.Generic.Dictionary[NotepadShape,IntPtr]]$geometries = [Collections.Generic.Dictionary[NotepadShape,IntPtr]]::new()
     hidden [Collections.Generic.Dictionary[string,IntPtr]]$bitmaps = [Collections.Generic.Dictionary[string,IntPtr]]::new([StringComparer]::OrdinalIgnoreCase)
     hidden [Collections.Generic.Dictionary[string,IntPtr]]$gradientBrushes = [Collections.Generic.Dictionary[string,IntPtr]]::new([StringComparer]::OrdinalIgnoreCase)
     hidden [Collections.Generic.HashSet[IntPtr]]$layouts = [Collections.Generic.HashSet[IntPtr]]::new()
@@ -1251,7 +1431,14 @@ class NotepadGraphics {
         $cached = [IntPtr]::Zero
         if ($this.brushes.TryGetValue($Color, [ref]$cached)) { return $cached }
         $rgba = [single[]]@(0, 0, 0, 1)
-        $rgb = [regex]::Match($Color, '^rgba?\((.+)\)$')
+        # rgb(...) or rgba(...): the text between the parentheses, at least one character and no line break.
+        [string]$channels = ''
+        $open = 0
+        if ($Color.StartsWith('rgba(', [StringComparison]::Ordinal)) { $open = 5 } elseif ($Color.StartsWith('rgb(', [StringComparison]::Ordinal)) { $open = 4 }
+        if ($open -gt 0 -and $Color.Length -gt $open + 1 -and $Color.EndsWith(')', [StringComparison]::Ordinal)) {
+            $channels = $Color.Substring($open, $Color.Length - $open - 1)
+            if ($channels.Contains("`n")) { $channels = '' }
+        }
         if ($Color.StartsWith('#')) {
             $hex = $Color.Substring(1)
             if ($hex.Length -eq 3) { $hex = [string]::new([char[]]@($hex[0], $hex[0], $hex[1], $hex[1], $hex[2], $hex[2])) }
@@ -1259,8 +1446,8 @@ class NotepadGraphics {
             $rgba[1] = [Convert]::ToInt32($hex.Substring(2, 2), 16) / 255.0
             $rgba[2] = [Convert]::ToInt32($hex.Substring(4, 2), 16) / 255.0
         }
-        elseif ($rgb.Success) {
-            $parts = $rgb.Groups[1].Value.Split(',')
+        elseif ($channels.Length -gt 0) {
+            $parts = $channels.Split(',')
             for ($i = 0; $i -lt 3; $i++) { $rgba[$i] = [single]::Parse($parts[$i], [Globalization.CultureInfo]::InvariantCulture) / 255 }
             if ($parts.Count -eq 4) { $rgba[3] = [single]::Parse($parts[3], [Globalization.CultureInfo]::InvariantCulture) }
         }
@@ -1481,103 +1668,58 @@ class NotepadGraphics {
     }
 
     # SVG endpoint arcs map directly to D2D1_ARC_SEGMENT; no raster fallback.
-    hidden [IntPtr] Path([string]$Data) {
+    # A shape's Direct2D path geometry, built once per shape: its figures filled nonzero (D2D1_FILL_MODE_WINDING),
+    # each begun filled and ended closed or open.
+    hidden [IntPtr] Geometry([NotepadShape]$Shape) {
         $cached = [IntPtr]::Zero
-        if ($this.geometries.TryGetValue($Data, [ref]$cached)) { return $cached }
+        if ($this.geometries.TryGetValue($Shape, [ref]$cached)) { return $cached }
         [NotepadGraphics]::Check([NotepadGraphics]::CreatePathGeometry([NotepadGraphics]::Slot($this.factory, 10), $this.factory, $this.scratch))
         $geometry = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch)
         [NotepadGraphics]::Check([NotepadGraphics]::OpenSink([NotepadGraphics]::Slot($geometry, 17), $geometry, $this.scratch))
         $sink = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch)
-        $items = [regex]::Matches($Data, '[a-zA-Z]|[-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?')
-        $index = 0; $command = ''; $x = 0.0; $y = 0.0; $sx = 0.0; $sy = 0.0; $cx = 0.0; $cy = 0.0; $previous = ''; $figure = $false
         $line = [NotepadGraphics]::Slot($sink, 10)
         try {
-            # SVG nonzero is D2D1_FILL_MODE_WINDING.
             [NotepadGraphics]::SetFillMode([NotepadGraphics]::Slot($sink, 3), $sink, 1)
-            while ($index -lt $items.Count) {
-                if ($items[$index].Value -cmatch '^[a-zA-Z]$') { $command = $items[$index].Value; $index++ }
-                $upper = $command.ToUpperInvariant(); $relative = $command -cmatch '^[a-z]$'
-                if ($upper -eq 'Z') {
-                    if ($figure) { [NotepadGraphics]::EndFigure([NotepadGraphics]::Slot($sink, 8), $sink, 1); $figure = $false }
-                    $x = $sx; $y = $sy; $previous = 'Z'; continue
-                }
-                $arity = 0
-                switch ($upper) { 'M' { $arity = 2 } 'L' { $arity = 2 } 'H' { $arity = 1 } 'V' { $arity = 1 } 'C' { $arity = 6 } 'S' { $arity = 4 } 'Q' { $arity = 4 } 'T' { $arity = 2 } 'A' { $arity = 7 } default { throw ('Unsupported SVG command ' + $command) } }
-                if ($index + $arity -gt $items.Count) { throw 'Incomplete SVG path' }
-                $v = [double[]]::new($arity)
-                for ($i = 0; $i -lt $arity; $i++) { $v[$i] = [double]::Parse($items[$index].Value, [Globalization.CultureInfo]::InvariantCulture); $index++ }
-                $baseX = 0.0; $baseY = 0.0
-                if ($relative) { $baseX = $x; $baseY = $y }
-                switch ($upper) {
-                    'M' {
-                        if ($figure) { [NotepadGraphics]::EndFigure([NotepadGraphics]::Slot($sink, 8), $sink, 0) }
-                        $x = $v[0] + $baseX; $y = $v[1] + $baseY; $sx = $x; $sy = $y
-                        [NotepadGraphics]::BeginFigure([NotepadGraphics]::Slot($sink, 5), $sink, [NotepadGraphics]::Point($x, $y), 0); $figure = $true
-                        if ($relative) { $command = 'l' } else { $command = 'L' }
-                    }
-                    'L' { $x = $v[0] + $baseX; $y = $v[1] + $baseY; [NotepadGraphics]::AddLine($line, $sink, [NotepadGraphics]::Point($x, $y)) }
-                    'H' { $x = $v[0] + $baseX; [NotepadGraphics]::AddLine($line, $sink, [NotepadGraphics]::Point($x, $y)) }
-                    'V' { $y = $v[0] + $baseY; [NotepadGraphics]::AddLine($line, $sink, [NotepadGraphics]::Point($x, $y)) }
-                    'C' {
-                        $this.Floats([single[]]@(($v[0] + $baseX), ($v[1] + $baseY), ($v[2] + $baseX), ($v[3] + $baseY), ($v[4] + $baseX), ($v[5] + $baseY)))
+            foreach ($figure in $Shape.Figures) {
+                [NotepadGraphics]::BeginFigure([NotepadGraphics]::Slot($sink, 5), $sink, [NotepadGraphics]::Point($figure.StartX, $figure.StartY), 0)
+                foreach ($segment in $figure.Segments) {
+                    if ($segment.Kind -eq [NotepadSegmentKind]::Line) { [NotepadGraphics]::AddLine($line, $sink, [NotepadGraphics]::Point($segment.X, $segment.Y)) }
+                    elseif ($segment.Kind -eq [NotepadSegmentKind]::Cubic) {
+                        $this.Floats([single[]]@($segment.X1, $segment.Y1, $segment.X2, $segment.Y2, $segment.X, $segment.Y))
                         [NotepadGraphics]::AddSegment([NotepadGraphics]::Slot($sink, 11), $sink, $this.scratch)
-                        $cx = $v[2] + $baseX; $cy = $v[3] + $baseY; $x = $v[4] + $baseX; $y = $v[5] + $baseY
                     }
-                    'S' {
-                        $c1x = $x; $c1y = $y
-                        if ($previous -eq 'C' -or $previous -eq 'S') { $c1x = 2 * $x - $cx; $c1y = 2 * $y - $cy }
-                        $this.Floats([single[]]@($c1x, $c1y, ($v[0] + $baseX), ($v[1] + $baseY), ($v[2] + $baseX), ($v[3] + $baseY)))
-                        [NotepadGraphics]::AddSegment([NotepadGraphics]::Slot($sink, 11), $sink, $this.scratch)
-                        $cx = $v[0] + $baseX; $cy = $v[1] + $baseY; $x = $v[2] + $baseX; $y = $v[3] + $baseY
+                    elseif ($segment.Kind -eq [NotepadSegmentKind]::Quadratic) {
+                        $this.Floats([single[]]@($segment.X1, $segment.Y1, $segment.X, $segment.Y))
+                        [NotepadGraphics]::AddSegment([NotepadGraphics]::Slot($sink, 12), $sink, $this.scratch)
                     }
-                    'Q' {
-                        $cx = $v[0] + $baseX; $cy = $v[1] + $baseY; $x = $v[2] + $baseX; $y = $v[3] + $baseY
-                        $this.Floats([single[]]@($cx, $cy, $x, $y)); [NotepadGraphics]::AddSegment([NotepadGraphics]::Slot($sink, 12), $sink, $this.scratch)
-                    }
-                    'T' {
-                        $qx = $x; $qy = $y
-                        if ($previous -eq 'Q' -or $previous -eq 'T') { $qx = 2 * $x - $cx; $qy = 2 * $y - $cy }
-                        $x = $v[0] + $baseX; $y = $v[1] + $baseY
-                        $this.Floats([single[]]@($qx, $qy, $x, $y)); [NotepadGraphics]::AddSegment([NotepadGraphics]::Slot($sink, 12), $sink, $this.scratch); $cx = $qx; $cy = $qy
-                    }
-                    'A' {
-                        $x = $v[5] + $baseX; $y = $v[6] + $baseY
-                        if ($v[0] -eq 0 -or $v[1] -eq 0) { [NotepadGraphics]::AddLine($line, $sink, [NotepadGraphics]::Point($x, $y)) }
-                        else {
-                            $this.Floats([single[]]@($x, $y, [Math]::Abs($v[0]), [Math]::Abs($v[1]), $v[2]))
-                            [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 20, [int]$v[4]); [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 24, [int]$v[3])
-                            [NotepadGraphics]::AddSegment([NotepadGraphics]::Slot($sink, 14), $sink, $this.scratch)
-                        }
+                    else {
+                        # D2D1_ARC_SEGMENT: point, size, rotation, then the sweep direction and the arc size.
+                        $this.Floats([single[]]@($segment.X, $segment.Y, $segment.X1, $segment.Y1, $segment.Rotation))
+                        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 20, $(if ($segment.Clockwise) { 1 } else { 0 }))
+                        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 24, $(if ($segment.Large) { 1 } else { 0 }))
+                        [NotepadGraphics]::AddSegment([NotepadGraphics]::Slot($sink, 14), $sink, $this.scratch)
                     }
                 }
-                $previous = $upper
+                [NotepadGraphics]::EndFigure([NotepadGraphics]::Slot($sink, 8), $sink, $(if ($figure.Closed) { 1 } else { 0 }))
             }
-            if ($figure) { [NotepadGraphics]::EndFigure([NotepadGraphics]::Slot($sink, 8), $sink, 0) }
             [NotepadGraphics]::Check([NotepadGraphics]::CloseSink([NotepadGraphics]::Slot($sink, 9), $sink))
-            $this.geometries[$Data] = $geometry
+            $this.geometries[$Shape] = $geometry
             return $geometry
         }
         catch { [NotepadGraphics]::ReleaseCom($geometry); throw }
         finally { [NotepadGraphics]::ReleaseCom($sink) }
     }
-    [void] Icon([string]$Svg, [single]$X, [single]$Y, [single]$Size, [string]$Color) { $this.Icon($Svg, $X, $Y, $Size, $Color, 0) }
-    [void] Icon([string]$Svg, [single]$X, [single]$Y, [single]$Size, [string]$Color, [double]$Rotation) {
-        $document = [Xml.XmlDocument]::new()
-        $document.LoadXml($Svg)
-        $root = $document.DocumentElement
-        $view = [double[]]($root.GetAttribute('viewBox').Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
-        $scale = $Size / $view[2]
-        foreach ($node in $root.ChildNodes) {
-            if ($node -isnot [Xml.XmlElement]) { continue }
-            [Xml.XmlElement] $element = $node
-            if ($element.LocalName -ne 'path') { continue }
-            $geometry = $this.Path($element.GetAttribute('d'))
+    [void] Icon([NotepadIcon]$Icon, [single]$X, [single]$Y, [single]$Size, [string]$Color) { $this.Icon($Icon, $X, $Y, $Size, $Color, 0) }
+    # Draws an icon at (X, Y), Size wide, its shapes without a colour of their own in Color; turned 180 degrees when
+    # asked.
+    [void] Icon([NotepadIcon]$Icon, [single]$X, [single]$Y, [single]$Size, [string]$Color, [double]$Rotation) {
+        $scale = $Size / $Icon.Width
+        foreach ($shape in $Icon.Shapes) {
+            $geometry = $this.Geometry($shape)
             $fill = $Color
-            if ($element.HasAttribute('fill')) { $fill = $element.GetAttribute('fill') }
+            if ($shape.Fill.Length -gt 0) { $fill = $shape.Fill }
             $brush = $this.Brush($fill)
-            $opacity = 1.0
-            if ($element.HasAttribute('opacity')) { $opacity = [double]::Parse($element.GetAttribute('opacity'), [Globalization.CultureInfo]::InvariantCulture) }
-            [NotepadGraphics]::SetOpacity([NotepadGraphics]::Slot($brush, 4), $brush, [single]$opacity)
+            [NotepadGraphics]::SetOpacity([NotepadGraphics]::Slot($brush, 4), $brush, $shape.Opacity)
             if ($Rotation -eq 180) { $this.Floats([single[]]@(-$scale, 0, 0, -$scale, ($X + $Size), ($Y + $Size))) } else { $this.Floats([single[]]@($scale, 0, 0, $scale, $X, $Y)) }
             [NotepadGraphics]::SetTransform([NotepadGraphics]::Slot($this.target, 30), $this.target, $this.scratch)
             [NotepadGraphics]::FillGeometry([NotepadGraphics]::Slot($this.target, 23), $this.target, $geometry, $brush, [IntPtr]::Zero)
@@ -11460,7 +11602,7 @@ try{
     $graphics.Fill(0,78,960,434,'#282828',0)
     $graphics.Text('Notepad • direct PowerShell',40,12,500,'#ffffff',13,'Segoe UI',400)
     $i=0
-    foreach($svg in $design.Icons.Values){$graphics.Icon($svg,(20+($i%12)*52),(100+[Math]::Floor($i/12)*52),20,'#ffffff',0);$i++}
+    foreach($icon in [NotepadIcons]::All().Values){$graphics.Icon($icon,(20+($i%12)*52),(100+[Math]::Floor($i/12)*52),20,'#ffffff',0);$i++}
     $layout=$graphics.Layout("Alpha`tβeta`nSecond line 😀",'Consolas',([single](11*96/72)),500,$true,400,$false,([single](11*96/72*1.45)))
     $metrics=$graphics.Metrics($layout)
     $graphics.DrawLayout($layout,20,300,'#ffffff')
@@ -11475,7 +11617,7 @@ try{
     @{Metrics=$metrics;Caret=$caret;Hit=$hit;Selection=$selection;IconCount=$i}|ConvertTo-Json -Depth 8|Set-Content "$root\artifacts\graphics-smoke.json"
     $until=[DateTime]::UtcNow.AddSeconds($Seconds)
     while([DateTime]::UtcNow -lt $until){$null=@($window.Drain());Start-Sleep -Milliseconds 15}
-    'PASS: native window, Direct2D, DirectWrite, SVG paths, caret/hit-test and selection.'
+    'PASS: native window, Direct2D, DirectWrite, vector icons, caret/hit-test and selection.'
 }finally{if($graphics){$graphics.Dispose()};if($window){$window.Dispose()};$native.Dispose()}
 }
 
@@ -13854,6 +13996,8 @@ class NotepadSettings {
     }
 }
 $design=Invoke-Design
+# Notepad's icons, typed geometry built once.
+[Collections.Generic.Dictionary[string,NotepadIcon]]$icons=[NotepadIcons]::All()
 [NotepadSettings]$settings=[NotepadSettings]::new()
 foreach($key in $design.DefaultSettings.Keys){$settings.Set($key,$design.DefaultSettings[$key])}
 $settings.backdrop='solid';$settings.entranceAnimation='fade';$settings.cornerStyle='curved';$settings.copyAsFile=$false
@@ -14119,7 +14263,7 @@ function Label([string]$Text,[double]$X,[double]$Y,[double]$W,[string]$Color,[do
     if(-not $ui.TextCache.ContainsKey($key)){$ui.TextCache[$key]=$graphics.Layout($Text,$Family,[single]$Size,[single][Math]::Max(1,$W),$false,$Weight,$false,0)}
     $graphics.DrawLayout($ui.TextCache[$key],[single]$X,[single]$Y,$Color)
 }
-function Icon([string]$Name,[double]$X,[double]$Y,[double]$Size,[string]$Fill='',[double]$Rotation=0){if(-not $Fill){$Fill=Color 'text-primary'};$graphics.Icon($design.Icons[$Name],[single]$X,[single]$Y,[single]$Size,$Fill,$Rotation)}
+function Icon([string]$Name,[double]$X,[double]$Y,[double]$Size,[string]$Fill='',[double]$Rotation=0){if(-not $Fill){$Fill=Color 'text-primary'};$graphics.Icon($icons[$Name],[single]$X,[single]$Y,[single]$Size,$Fill,$Rotation)}
 function Button([string]$Id,[double]$X,[double]$Y,[double]$W,[double]$H,[string]$Action,[string]$Text='',[string]$Icon='',[object]$Data=$null,[bool]$Primary=$false,[bool]$Border=$false,[double]$IconSize=16){
     Node $Id $X $Y $W $H $Action $Data
     $hover=$ui.Hover -eq $Id;$pressed=$ui.Pressed -eq $Id
