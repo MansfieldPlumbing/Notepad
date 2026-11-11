@@ -31,6 +31,8 @@ class NotepadTab {
     [double]$ScrollX
     [double]$ScrollY
     [datetime]$LastEdit = [datetime]::MinValue
+    # Where the last typed text ended: typing joins the previous undo group only when it continues from there.
+    [int]$LastEditEnd = -1
     # Modified is measured against the document's journal position at the last open or save, and the line ending
     # then. SavedKnown is false when that saved state is unknown: a file tab restored modified from a session, or an
     # untitled tab created with text.
@@ -76,6 +78,10 @@ class NotepadFind {
     [bool]$Wrap = $true
     [NotepadMatch[]]$Matches = [NotepadMatch[]]::new(0)
     [int]$Index = -1
+    # Matches are kept current while the Find bar is open; after an edit with it closed they are stale until the next
+    # search needs them, so typing never searches the whole document.
+    [bool]$Open = $false
+    [bool]$Stale = $false
 }
 
 class NotepadModelState {
@@ -172,14 +178,22 @@ class NotepadModel {
         $end = [Math]::Max($tab.Anchor, $tab.Focus)
         $Text = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
         if ($Text.Length -eq 0 -and $start -eq $end) { return }
-        if (-not $Coalesce -or ([DateTime]::UtcNow - $tab.LastEdit).TotalMilliseconds -gt 700 -or $start -ne $end) { $tab.Document.BeginGroup() }
+        # A new undo group unless this continues typing: within 700 ms, nothing selected, and right where the last
+        # typed text ended (a click elsewhere starts a new group).
+        if (-not $Coalesce -or ([DateTime]::UtcNow - $tab.LastEdit).TotalMilliseconds -gt 700 -or $start -ne $end -or $start -ne $tab.LastEditEnd) { $tab.Document.BeginGroup() }
         $tab.Document.Replace($start, $end - $start, $Text)
         $tab.Focus = $start + $Text.Length
         $tab.Anchor = $tab.Focus
+        $tab.LastEditEnd = $tab.Focus
         $tab.RefreshModified()
         $tab.Revision = $tab.Revision + 1
         $tab.LastEdit = [DateTime]::UtcNow
-        $this.Find()
+        $this.RefreshFind()
+    }
+
+    # After an edit: search again while the Find bar is open; otherwise mark the matches stale for the next search.
+    hidden [void] RefreshFind() {
+        if ($this.modelState.Find.Open) { $this.Find() } else { $this.modelState.Find.Stale = $true }
     }
 
     # The next grapheme boundary before or after a position, read from a window of 32 characters on each side of it
@@ -218,10 +232,11 @@ class NotepadModel {
         if ($caret -lt 0) { return }
         $tab.Anchor = $caret
         $tab.Focus = $caret
+        $tab.LastEditEnd = -1
         $tab.RefreshModified()
         $tab.Revision = $tab.Revision + 1
         $tab.LastEdit = [DateTime]::MinValue
-        $this.Find()
+        $this.RefreshFind()
     }
 
     [void] Move([string]$Direction) { $this.Move($Direction, $false, $false) }
@@ -284,6 +299,7 @@ class NotepadModel {
         $find = $this.modelState.Find
         $find.Matches = [NotepadMatch[]]::new(0)
         $find.Index = -1
+        $find.Stale = $false
         if (-not $find.Query) { return }
         $comparison = [StringComparison]::OrdinalIgnoreCase
         if ($find.MatchCase) { $comparison = [StringComparison]::Ordinal }
@@ -309,7 +325,7 @@ class NotepadModel {
     [void] SelectMatch() { $this.SelectMatch(0) }
     [void] SelectMatch([int]$Step) {
         $find = $this.modelState.Find
-        if (-not $find.Matches.Count) { $this.Find() }
+        if ($find.Stale -or -not $find.Matches.Count) { $this.Find() }
         if (-not $find.Matches.Count) { return }
         $next = $find.Index + $Step
         if ($find.Wrap) { $next = ($next + $find.Matches.Count) % $find.Matches.Count }
@@ -12078,12 +12094,19 @@ class NotepadDocument {
         return $this.Added[$index]
     }
 
+    # The next line break in a buffer at or after start and before end; -1 when there is none. Uses the runtime's
+    # vectorized search over the buffer rather than reading one character at a time.
+    [int] NextBreak([int] $buffer, [int] $start, [int] $end) {
+        if ($start -ge $end) { return -1 }
+        if ($buffer -eq 0) { return [Array]::IndexOf($this.Original, [char]10, $start, $end - $start) }
+        return [Array]::IndexOf($this.Added, [char]10, $start, $end - $start)
+    }
+
     [int] CountBreaks([int] $buffer, [int] $start, [int] $length) {
         [int] $count = 0
         [int] $end = $start + $length
-        for ([int] $i = $start; $i -lt $end; $i++) {
-            if ($this.CharAt($buffer, $i) -eq [char]10) { $count = $count + 1 }
-        }
+        [int] $at = $this.NextBreak($buffer, $start, $end)
+        while ($at -ge 0) { $count = $count + 1; $at = $this.NextBreak($buffer, $at + 1, $end) }
         return $count
     }
 
@@ -12229,9 +12252,8 @@ class NotepadDocument {
             [NotepadPiece] $piece = $this.Pieces[$index]
             if ($piece.LineBreaks -gt 0) {
                 [int] $end = $piece.Start + $piece.Length
-                for ([int] $i = $piece.Start; $i -lt $end; $i++) {
-                    if ($this.CharAt($piece.Buffer, $i) -eq [char]10) { $starts.Add($offset + ($i - $piece.Start) + 1) }
-                }
+                [int] $at = $this.NextBreak($piece.Buffer, $piece.Start, $end)
+                while ($at -ge 0) { $starts.Add($offset + ($at - $piece.Start) + 1); $at = $this.NextBreak($piece.Buffer, $at + 1, $end) }
             }
             $offset = $offset + $piece.Length
         }
@@ -12255,11 +12277,11 @@ class NotepadDocument {
             [NotepadPiece] $piece = $this.Pieces[$index]
             if ($seen + $piece.LineBreaks -ge $line) {
                 [int] $end = $piece.Start + $piece.Length
-                for ([int] $i = $piece.Start; $i -lt $end; $i++) {
-                    if ($this.CharAt($piece.Buffer, $i) -eq [char]10) {
-                        $seen = $seen + 1
-                        if ($seen -eq $line) { return $offset + ($i - $piece.Start) + 1 }
-                    }
+                [int] $at = $this.NextBreak($piece.Buffer, $piece.Start, $end)
+                while ($at -ge 0) {
+                    $seen = $seen + 1
+                    if ($seen -eq $line) { return $offset + ($at - $piece.Start) + 1 }
+                    $at = $this.NextBreak($piece.Buffer, $at + 1, $end)
                 }
             }
             $seen = $seen + $piece.LineBreaks
@@ -12275,10 +12297,7 @@ class NotepadDocument {
             [NotepadPiece] $piece = $this.Pieces[$index]
             if ($position -lt $offset + $piece.Length) {
                 [int] $end = $piece.Start + ($position - $offset)
-                for ([int] $i = $piece.Start; $i -lt $end; $i++) {
-                    if ($this.CharAt($piece.Buffer, $i) -eq [char]10) { $line = $line + 1 }
-                }
-                return $line
+                return $line + $this.CountBreaks($piece.Buffer, $piece.Start, $end - $piece.Start)
             }
             $line = $line + $piece.LineBreaks
             $offset = $offset + $piece.Length
@@ -14900,7 +14919,7 @@ function Command([FluentAction]$Action,[object]$Data=$null){
         ([FluentAction]::TimeDate){$now=[DateTime]::Now;$model.Insert(($now.ToString('t')+' '+$now.ToString('M/d/yyyy',[Globalization.CultureInfo]::InvariantCulture)),$false)}
         ([FluentAction]::Find) {Open-Find $false}
         ([FluentAction]::Replace){Open-Find $true}
-        ([FluentAction]::CloseFind){$ui.Find=$false;$ui.Focus='editor-area'}
+        ([FluentAction]::CloseFind){$ui.Find=$false;$state.Find.Open=$false;$ui.Focus='editor-area'}
         ([FluentAction]::FindNext){$model.SelectMatch(1)}
         ([FluentAction]::FindPrevious){$model.SelectMatch(-1)}
         ([FluentAction]::FindCase){$state.Find.MatchCase=-not $state.Find.MatchCase;$model.Find();$model.SelectMatch(0)}
@@ -15014,7 +15033,7 @@ function Format-Lines([string]$Prefix){
     $model.Select($lineStart,$lineEnd);$model.Insert($text,$false);$model.Select($lineStart,($lineStart+$text.Length));$tab.Markdown=$true;$ui.Focus='editor-area'
 }
 function Open-Find([bool]$Replace){
-    $ui.Find=$true;$ui.Replace=$Replace;$ui.Menu='';$tab=$model.Active();$selected=$tab.Slice([Math]::Min($tab.Anchor,$tab.Focus),[Math]::Abs($tab.Focus-$tab.Anchor))
+    $ui.Find=$true;$state.Find.Open=$true;$ui.Replace=$Replace;$ui.Menu='';$tab=$model.Active();$selected=$tab.Slice([Math]::Min($tab.Anchor,$tab.Focus),[Math]::Abs($tab.Focus-$tab.Anchor))
     if($selected -and -not $selected.Contains("`n")){$state.Find.Query=$selected}
     $model.Find();$model.SelectMatch(0);Focus-Input 'find-query-input'
 }
@@ -15492,7 +15511,7 @@ function Editor-Hit([double]$X,[double]$Y,[bool]$Extend=$false){
 }
 function Key-Input([NotepadWindowEvent]$Event){
     $key=[int]$Event.W;$ctrl=$Event.Ctrl;$shift=$Event.Shift
-    if($key -eq 27){if($ui.Dropdown){$ui.Dropdown=$null}elseif($ui.ColorPicker){$ui.ColorPicker=$null;$ui.Focus='settings';Persist}elseif($ui.Modal){$ui.Modal=$null;$ui.Focus='editor-area'}elseif($ui.Menu){$ui.Menu='';$ui.Submenu=''}elseif($ui.Find){$ui.Find=$false;$ui.Focus='editor-area'}elseif($ui.Settings){$ui.Settings=$false;$ui.Focus='editor-area'};Invalidate;return}
+    if($key -eq 27){if($ui.Dropdown){$ui.Dropdown=$null}elseif($ui.ColorPicker){$ui.ColorPicker=$null;$ui.Focus='settings';Persist}elseif($ui.Modal){$ui.Modal=$null;$ui.Focus='editor-area'}elseif($ui.Menu){$ui.Menu='';$ui.Submenu=''}elseif($ui.Find){$ui.Find=$false;$state.Find.Open=$false;$ui.Focus='editor-area'}elseif($ui.Settings){$ui.Settings=$false;$ui.Focus='editor-area'};Invalidate;return}
     if($ui.ColorPicker -and $key -eq 9){$fields=@('picker-input-hex','picker-input-c0','picker-input-c1','picker-input-c2');$index=[array]::IndexOf($fields,$ui.Focus);$index=($index+$(if($shift){3}else{1}))%4;Focus-Input $fields[$index];Invalidate;return}
     if($ui.Focus -eq 'opacity-slider' -and $key -in @(37,39,36,35,33,34)){
         $settings.backgroundOpacity=switch($key){36{0};35{100};37{[Math]::Max(0,[int]$settings.backgroundOpacity-1)};39{[Math]::Min(100,[int]$settings.backgroundOpacity+1)};33{[Math]::Min(100,[int]$settings.backgroundOpacity+10)};34{[Math]::Max(0,[int]$settings.backgroundOpacity-10)}}
@@ -15546,7 +15565,8 @@ function Key-Input([NotepadWindowEvent]$Event){
             $model.Select($(if($shift){$tab.Anchor}else{$position}),$position)
         }
     }
-    Invalidate $true
+    # Only a key that edits or moves the caret brings the caret into view; Shift, Ctrl, Alt and the like only repaint.
+    Invalidate ($key -in @(8,46,37,39,36,35,38,40,33,34))
 }
 function Handle-Event([NotepadWindowEvent]$Event){
     if($Event.Kind -eq 'minimized'){$ui.Minimized=$true;Write-ApplicationDiagnostic;return}
