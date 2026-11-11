@@ -14880,11 +14880,14 @@ function Role-Color([string]$Role){
     if($settings.colors[$Role]){return $settings.colors[$Role]}
     switch($Role){'foreground'{Color 'text-primary'};'tabs'{Color 'bg-tab-active'};'cursor'{Color 'text-primary'};'selectionBackground'{Color 'selection-bg'};default{'#272727'}}
 }
-function Surface-Color([string]$Name,[double]$Opacity=-1){
-    $color=Color $Name
-    if(-not $ui.BackdropActive){return $color}
+function Surface-Color([string]$Name,[double]$Opacity=-1){return Surface-Hex (Color $Name) $Opacity}
+
+# A #RRGGBB colour as a surface over the window's material: opaque on a solid window; with a backdrop, at the given
+# opacity, or the background opacity setting when none is given.
+function Surface-Hex([string]$Color,[double]$Opacity=-1){
+    if(-not $ui.BackdropActive){return $Color}
     if($Opacity -lt 0){$Opacity=[int]$settings.backgroundOpacity/100.0}
-    $hex=$color.TrimStart('#');if($hex.Length -ne 6){return $color}
+    $hex=$Color.TrimStart('#');if($hex.Length -ne 6){return $Color}
     $alpha=[Math]::Clamp($Opacity,0.0,1.0).ToString('0.###',[Globalization.CultureInfo]::InvariantCulture)
     'rgba('+[Convert]::ToInt32($hex.Substring(0,2),16)+','+[Convert]::ToInt32($hex.Substring(2,2),16)+','+[Convert]::ToInt32($hex.Substring(4,2),16)+','+$alpha+')'
 }
@@ -15269,8 +15272,11 @@ function Paint-Chrome {
     foreach($document in $state.Tabs){
         $id='tab-'+$document.Id;$active=$document.Id -eq $state.ActiveId;$hover=$ui.Hover.StartsWith($id)
         $tw=240
-        $bg=if($active){Role-Color 'tabs'}elseif($hover){Surface-Color 'bg-tab-hover'}else{'transparent'}
-        if($bg -ne 'transparent'){$graphics.Fill($x,5.2,$tw,34,$bg,7);$graphics.Fill($x,32,($tw),7.2,$bg,0)}
+        # Every tab is translucent: the active one is a surface over the material like the ribbon it sits on, the
+        # others a darker film (22% black) over whatever is beneath, solid or material. One shape per tab, rounded at
+        # the top and cut square at the bottom by a clip, so a translucent fill never overlaps itself.
+        $bg=if($active){Surface-Hex (Role-Color 'tabs')}elseif($hover){Surface-Color 'bg-tab-hover'}else{'rgba(0,0,0,0.22)'}
+        $graphics.Clip($x,5.2,$tw,34);$graphics.Fill($x,5.2,$tw,41,$bg,7);$graphics.Unclip()
         if($active){$graphics.Stroke($x,5.2,$tw,34,(Color 'border-subtle'),7,0.8)}
         Node $id $x 5.2 $tw 34 ([FluentAction]::SwitchTab) $document.Id
         $graphics.Clip(($x+12),8,($tw-44),28);Label $document.Caption() ($x+12) 14 ($tw-44) (Color $(if($active -or $hover){'text-primary'}else{'text-secondary'})) 12;$graphics.Unclip()
