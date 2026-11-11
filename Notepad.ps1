@@ -14388,6 +14388,8 @@ class NotepadSettings {
     [bool]$copyAsFile
     [int]$backgroundOpacity
     [bool]$gradientEnabled
+    # How strongly the four-corner gradient shows, 0 to 100, on every backdrop.
+    [int]$gradientStrength
     [Collections.Generic.Dictionary[string,string]]$colors
     [string[]]$ansiColors
     [string]$windowIcon
@@ -14401,7 +14403,7 @@ class NotepadSettings {
     }
 
     [string[]] SettingNames() {
-        return [string[]]@('theme','fontFamily','fontStyle','fontSize','wordWrap','formatting','openingFiles','startupOption','recentFilesEnabled','spellCheck','showStatusBar','zoom','backdrop','cornerStyle','copyAsFile','backgroundOpacity','gradientEnabled','colors','ansiColors','windowIcon','entranceAnimation')
+        return [string[]]@('theme','fontFamily','fontStyle','fontSize','wordWrap','formatting','openingFiles','startupOption','recentFilesEnabled','spellCheck','showStatusBar','zoom','backdrop','cornerStyle','copyAsFile','backgroundOpacity','gradientEnabled','gradientStrength','colors','ansiColors','windowIcon','entranceAnimation')
     }
 
     [object] Get([string]$Name) {
@@ -14423,6 +14425,7 @@ class NotepadSettings {
             'copyAsFile' { return $this.copyAsFile }
             'backgroundOpacity' { return $this.backgroundOpacity }
             'gradientEnabled' { return $this.gradientEnabled }
+            'gradientStrength' { return $this.gradientStrength }
             'colors' { return $this.colors }
             'ansiColors' { return $this.ansiColors }
             'windowIcon' { return $this.windowIcon }
@@ -14450,6 +14453,7 @@ class NotepadSettings {
             'copyAsFile' { $this.copyAsFile = $Value; return }
             'backgroundOpacity' { $this.backgroundOpacity = $Value; return }
             'gradientEnabled' { $this.gradientEnabled = $Value; return }
+            'gradientStrength' { $this.gradientStrength = $Value; return }
             'colors' { $this.colors = [NotepadSettings]::ColorTable($Value); return }
             'ansiColors' { $this.ansiColors = $Value; return }
             'windowIcon' { $this.windowIcon = $Value; return }
@@ -14549,7 +14553,7 @@ class NotepadSettings {
 $settings.theme='dark';$settings.fontFamily='Consolas';$settings.fontStyle='Regular';$settings.fontSize='11';$settings.wordWrap=$true;$settings.formatting=$true
 $settings.openingFiles='newTab';$settings.startupOption='continueSession';$settings.recentFilesEnabled=$false;$settings.spellCheck=$true;$settings.showStatusBar=$true;$settings.zoom=100
 $settings.backdrop='solid';$settings.entranceAnimation='fade';$settings.cornerStyle='curved';$settings.copyAsFile=$false
-$settings.backgroundOpacity=85;$settings.gradientEnabled=$false
+$settings.backgroundOpacity=85;$settings.gradientEnabled=$false;$settings.gradientStrength=30
 $settings.colors=[NotepadSettings]::ColorTable(@{foreground='';tabs='';cursor='';selectionBackground='';topLeft='#272727';topRight='#272727';bottomLeft='#272727';bottomRight='#272727'})
 $settings.ansiColors=@('#0C0C0C','#C50F1F','#13A10E','#C19C00','#0037DA','#881798','#3A96DD','#CCCCCC','#767676','#E74856','#16C60C','#F9F1A5','#3B78FF','#B4009E','#61D6D6','#F2F2F2')
 $settings.windowIcon='default'
@@ -14761,6 +14765,9 @@ class NotepadUi {
     [Nullable[bool]]$TooltipShown
     [Nullable[bool]]$Minimized
     [Nullable[bool]]$SliderDrag
+    # The settings slider being dragged or focused (its setting's key), and each slider's track as last painted.
+    [string]$SliderKey = 'backgroundOpacity'
+    [Collections.Generic.Dictionary[string,double[]]]$SliderTracks
     # The editor scrollbar while it is dragged: the pointer's offset into the thumb, and the track as last painted
     # (top, length, thumb length, largest scroll offset), empty when there is no scrollbar.
     [bool]$ScrollDrag
@@ -14887,9 +14894,11 @@ function Set-ScrollFromPoint([double]$Y){
     $tab.ScrollY=[Math]::Clamp(($Y-$ui.ScrollGrab-$scrollTrack[0])/[Math]::Max(1,$scrollTrack[1]-$scrollTrack[2])*$scrollTrack[3],0,$scrollTrack[3]);$ui.EnsureCaret=$false
     Invalidate
 }
-function Set-OpacityFromPoint([double]$X){
-    if(-not $ui.OpacityTrack){return}
-    $settings.backgroundOpacity=[int][Math]::Clamp([Math]::Round(($X-$ui.OpacityTrack[0])/$ui.OpacityTrack[2]*100),0,100)
+# Sets the slider's setting ($ui.SliderKey) from a point on its track as last painted.
+function Set-SliderFromPoint([double]$X){
+    if($null -eq $ui.SliderTracks -or -not $ui.SliderTracks.ContainsKey($ui.SliderKey)){return}
+    $track=$ui.SliderTracks[$ui.SliderKey]
+    $settings.Set($ui.SliderKey,[int][Math]::Clamp([Math]::Round(($X-$track[0])/$track[2]*100),0,100))
     Invalidate
 }
 function Persist {
@@ -15419,8 +15428,9 @@ function Paint-Settings {
         # MansfieldPlumbing additions: native DWM material, geometry and whole-document clipboard.
         @{Title='Window backdrop';Subtitle='Choose the material behind the window';Icon='theme';Key='backdrop';Select=@(@{Text='Solid';Value='solid'},@{Text='Mica';Value='mica'},@{Text='Acrylic';Value='acrylic'},@{Text='Reverse Mica';Value='reverseMica'});SelectWidth=170}
         @{Title='Opening animation';Subtitle='How the window appears when Notepad starts';Icon='theme';Key='entranceAnimation';Select=@(@{Text='Fade in';Value='fade'},@{Text='Slide in';Value='slide'});SelectWidth=170}
-        @{Title='Background opacity';Subtitle='100% is opaque. Reduce to reveal the material.';Icon='theme';Slider=$true}
+        @{Title='Background opacity';Subtitle='100% is opaque. Reduce to reveal the material.';Icon='theme';Key='backgroundOpacity';Slider=$true}
         @{Title='Four-corner gradient';Subtitle='Blend the four corner colors across the background';Icon='theme';Key='gradientEnabled';Toggle=$true}
+        @{Title='Gradient strength';Subtitle='How strongly the four corner colors show, on any backdrop';Icon='theme';Key='gradientStrength';Slider=$true}
         @{Title='Colors';Icon='theme';Accordion='card-colors-setting'}
         @{Title='Corners';Subtitle='Choose curved or straight window and control corners';Icon='tabsApp';Key='cornerStyle';Select=@(@{Text='Curved';Value='curved'},@{Text='Straight';Value='straight'});SelectWidth=170}
         @{Title='Window icon';Subtitle='Click the top-left icon to cycle system icons';Icon='app';Button=[FluentAction]::ResetIcon;ButtonText='Reset icon'}
@@ -15450,11 +15460,16 @@ function Paint-Settings {
         if($card.Toggle){Toggle-Control $card.Key ($left+$col-94) ($y+($height-24)/2)}
         if($card.Button){Button ('setting-'+$card.Button) ($left+$col-146) ($y+18) 130 32 $card.Button $card.ButtonText '' $null $false $true}
         if($card.Slider){
-            $sx=$left+$col-230;$sy=$y+34;$sw=170;$amount=[int]$settings.backgroundOpacity/100.0
-            $ui.OpacityTrack=@($sx,$sy,$sw,4);Node 'setting-background-opacity' $sx ($sy-12) $sw 28 ([FluentAction]::OpacitySlider)
+            # A slider for the card's setting (0 to 100). Its node id is the key spelled with hyphens
+            # (backgroundOpacity is setting-background-opacity) and carries the key for the input handlers.
+            $sx=$left+$col-230;$sy=$y+34;$sw=170;$sliderValue=[int]$settings.Get($card.Key);$amount=$sliderValue/100.0
+            if($null -eq $ui.SliderTracks){$ui.SliderTracks=[Collections.Generic.Dictionary[string,double[]]]::new()}
+            $ui.SliderTracks[$card.Key]=@($sx,$sy,$sw,4)
+            $sliderId=[Text.StringBuilder]::new('setting-');foreach($letter in $card.Key.ToCharArray()){if([char]::IsUpper($letter)){$null=$sliderId.Append('-').Append([char]::ToLowerInvariant($letter))}else{$null=$sliderId.Append($letter)}}
+            Node $sliderId.ToString() $sx ($sy-12) $sw 28 ([FluentAction]::OpacitySlider) $card.Key
             $graphics.Fill($sx,$sy,$sw,4,(Color 'border-control'),2);$graphics.Fill($sx,$sy,($sw*$amount),4,(Color 'accent-color'),2)
             $graphics.Fill(($sx+$sw*$amount-8),($sy-6),16,16,(Color 'bg-control'),8);$graphics.Fill(($sx+$sw*$amount-4),($sy-2),8,8,(Color 'accent-color'),4)
-            Label ([string]$settings.backgroundOpacity+'%') ($sx+$sw+10) ($sy-8) 48 (Color 'text-primary') 13
+            Label ([string]$sliderValue+'%') ($sx+$sw+10) ($sy-8) 48 (Color 'text-primary') 13
         }
         if($card.Accordion){
             Node ('header-'+$card.Accordion) $left $y $col 51.6 ([FluentAction]::Accordion) $card.Accordion
@@ -15577,7 +15592,7 @@ function Paint-Tooltip {
 function Paint {
     $ui.NextHits=[Collections.Generic.List[NotepadHitNode]]::new()
     $graphics.Begin((Color 'bg-window'),$(if($ui.BackdropActive){[single]0}else{[single]1}))
-    if($settings.gradientEnabled){$graphics.FourCorner(0,0,$ui.Width,$ui.Height,[string[]]@($settings.colors.topLeft,$settings.colors.topRight,$settings.colors.bottomLeft,$settings.colors.bottomRight),[single]$(if($ui.BackdropActive){[int]$settings.backgroundOpacity/100.0}else{1.0}))}
+    if($settings.gradientEnabled){$graphics.FourCorner(0,0,$ui.Width,$ui.Height,[string[]]@($settings.colors.topLeft,$settings.colors.topRight,$settings.colors.bottomLeft,$settings.colors.bottomRight),[single]([int]$settings.gradientStrength/100.0))}
     if($ui.Settings){Paint-Settings}else{Paint-Editor;Paint-Chrome;Paint-Find;Paint-Menus}
     Paint-CanvasColorPicker;Paint-Dropdown;Paint-Tooltip;Paint-Modal
     $graphics.End()
@@ -15618,7 +15633,9 @@ function Key-Input([NotepadWindowEvent]$Event){
     if($key -eq 27){if($ui.Dropdown){$ui.Dropdown=$null}elseif($ui.ColorPicker){$ui.ColorPicker=$null;$ui.Focus='settings';Persist}elseif($ui.Modal){$ui.Modal=$null;$ui.Focus='editor-area'}elseif($ui.Menu){$ui.Menu='';$ui.Submenu=''}elseif($ui.Find){$ui.Find=$false;$state.Find.Open=$false;$ui.Focus='editor-area'}elseif($ui.Settings){$ui.Settings=$false;$ui.Focus='editor-area'};Invalidate;return}
     if($ui.ColorPicker -and $key -eq 9){$fields=@('picker-input-hex','picker-input-c0','picker-input-c1','picker-input-c2');$index=[array]::IndexOf($fields,$ui.Focus);$index=($index+$(if($shift){3}else{1}))%4;Focus-Input $fields[$index];Invalidate;return}
     if($ui.Focus -eq 'opacity-slider' -and $key -in @(37,39,36,35,33,34)){
-        $settings.backgroundOpacity=switch($key){36{0};35{100};37{[Math]::Max(0,[int]$settings.backgroundOpacity-1)};39{[Math]::Min(100,[int]$settings.backgroundOpacity+1)};33{[Math]::Min(100,[int]$settings.backgroundOpacity+10)};34{[Math]::Max(0,[int]$settings.backgroundOpacity-10)}}
+        # The focused slider's setting: Home 0, End 100, arrows by 1, Page Up and Down by 10.
+        $sliderValue=[int]$settings.Get($ui.SliderKey)
+        $settings.Set($ui.SliderKey,[int]$(switch($key){36{0};35{100};37{[Math]::Max(0,$sliderValue-1)};39{[Math]::Min(100,$sliderValue+1)};33{[Math]::Min(100,$sliderValue+10)};34{[Math]::Max(0,$sliderValue-10)}}))
         Persist;Invalidate;return
     }
     if($ui.Modal -and $ui.Focus -ne 'dialog-input'){
@@ -15713,7 +15730,7 @@ function Handle-Event([NotepadWindowEvent]$Event){
     if($msg -eq 0x200){
         if($ui.ColorDrag){Set-ColorPickerPoint $ui.ColorDrag $x $y;return}
         if($ui.ScrollDrag){Set-ScrollFromPoint $y;return}
-        if($ui.SliderDrag){Set-OpacityFromPoint $x;return}
+        if($ui.SliderDrag){Set-SliderFromPoint $x;return}
         if($ui.Hover -ne $id){$ui.Hover=$id;$ui.HoverSince=[DateTime]::UtcNow;$ui.TooltipShown=$false;Invalidate
             if($hit -and $hit.Action -eq [FluentAction]::Submenu){$ui.Submenu=$hit.Data;Invalidate}
             if($ui.Menu -and $id.StartsWith('menu-btn-')){$ui.Menu=$hit.Data;$ui.Submenu='';Invalidate}
@@ -15733,7 +15750,7 @@ function Handle-Event([NotepadWindowEvent]$Event){
             $ui.ScrollGrab=if($y -ge $thumbTop -and $y -lt $thumbTop+$scrollTrack[2]){$y-$thumbTop}else{$scrollTrack[2]/2}
             $ui.ScrollDrag=$true;$window.Capture($true);Set-ScrollFromPoint $y;return
         }
-        if($hit -and $hit.Action -eq [FluentAction]::OpacitySlider){$ui.SliderDrag=$true;$ui.Focus='opacity-slider';$window.Capture($true);Set-OpacityFromPoint $x;return}
+        if($hit -and $hit.Action -eq [FluentAction]::OpacitySlider){$ui.SliderDrag=$true;$ui.SliderKey=[string]$hit.Data;$ui.Focus='opacity-slider';$window.Capture($true);Set-SliderFromPoint $x;return}
         if($hit -and $hit.Action -eq [FluentAction]::Editor){
             Editor-Hit $x $y $Event.Shift
             if($msg -eq 0x203){$tab=$model.Active();$pos=$tab.Focus;$start=$pos;$end=$pos;while($start -gt 0 -and -not [char]::IsWhiteSpace($tab.At($start-1))){$start--};while($end -lt $tab.Document.Length -and -not [char]::IsWhiteSpace($tab.At($end))){$end++};$model.Select($start,$end)}
@@ -15744,7 +15761,7 @@ function Handle-Event([NotepadWindowEvent]$Event){
     if($msg -eq 0x202){
         if($ui.ColorDrag){Set-ColorPickerPoint $ui.ColorDrag $x $y;$ui.ColorDrag='';$ui.Pressed='';$window.Capture($false);$ui.ClickSequence++;Persist;Invalidate;return}
         if($ui.ScrollDrag){$ui.ScrollDrag=$false;$ui.Pressed='';$window.Capture($false);Invalidate;return}
-        if($ui.SliderDrag){Set-OpacityFromPoint $x;$ui.SliderDrag=$false;$ui.Pressed='';$window.Capture($false);$ui.ClickSequence++;Persist;Invalidate;return}
+        if($ui.SliderDrag){Set-SliderFromPoint $x;$ui.SliderDrag=$false;$ui.Pressed='';$window.Capture($false);$ui.ClickSequence++;Persist;Invalidate;return}
         if($ui.Drag){$ui.Drag=$false;$window.Capture($false)}
         if($hit -and $id -eq $ui.Pressed -and $hit.Action -notin @([FluentAction]::Editor,[FluentAction]::Drag)){
             if($hit.Action -eq [FluentAction]::ModalAction){[NotepadModalButton]$button=$hit.Data;$value=$ui.Modal.Value;$ui.Modal=$null;Command $button.Action $(if($button.Action -in @([FluentAction]::GotoConfirm,[FluentAction]::InsertLink)){$value}else{$button.Data})}
