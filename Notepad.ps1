@@ -15761,7 +15761,10 @@ function Handle-Event([NotepadWindowEvent]$Event){
             Editor-Hit $x $y $Event.Shift
             if($msg -eq 0x203){$tab=$model.Active();$pos=$tab.Focus;$start=$pos;$end=$pos;while($start -gt 0 -and -not [char]::IsWhiteSpace($tab.At($start-1))){$start--};while($end -lt $tab.Document.Length -and -not [char]::IsWhiteSpace($tab.At($end))){$end++};$model.Select($start,$end)}
             $ui.Drag=$true;$ui.DragX=$x;$ui.DragY=$y;$ui.DragTick=[DateTime]::UtcNow;$window.Capture($true)
-        }elseif($hit -and $hit.Action -eq [FluentAction]::Drag){$window.Caption([FluentWindowDecoration]::Drag)}
+        }elseif($hit -and $hit.Action -eq [FluentAction]::Drag){
+            # A double-click on the title bar maximizes or restores, as on any Windows title bar; a single press drags.
+            if($msg -eq 0x203){$window.Caption([FluentWindowDecoration]::Maximize)}else{$window.Caption([FluentWindowDecoration]::Drag)}
+        }
         return
     }
     if($msg -eq 0x202){
