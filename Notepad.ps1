@@ -756,6 +756,32 @@ class NotepadEntranceRestore {
     [long]$ObservedStyle
 }
 
+# Where the window was left: its restored rectangle in workspace coordinates (physical pixels, at the DPI of the
+# monitor it was on) and whether it was maximized. Kept in window.bin beside the session.
+class NotepadPlacement {
+    [int]$Left
+    [int]$Top
+    [int]$Right
+    [int]$Bottom
+    [bool]$Maximized
+
+    [void] Write([IO.BinaryWriter]$Writer) {
+        $Writer.Write([int]1)
+        $Writer.Write($this.Left); $Writer.Write($this.Top); $Writer.Write($this.Right); $Writer.Write($this.Bottom)
+        $Writer.Write($this.Maximized)
+    }
+
+    # A placement Write wrote; one with no area is invalid.
+    static [NotepadPlacement] Read([IO.BinaryReader]$Reader) {
+        if ($Reader.ReadInt32() -ne 1) { throw 'Invalid window placement' }
+        $placement = [NotepadPlacement]::new()
+        $placement.Left = $Reader.ReadInt32(); $placement.Top = $Reader.ReadInt32(); $placement.Right = $Reader.ReadInt32(); $placement.Bottom = $Reader.ReadInt32()
+        $placement.Maximized = $Reader.ReadBoolean()
+        if ($placement.Right -le $placement.Left -or $placement.Bottom -le $placement.Top) { throw 'Invalid window placement' }
+        return $placement
+    }
+}
+
 # A top-level window with Notepad's own caption: its window procedure, its message queue as events, its backdrop and
 # its entrance. Win32 BOOL results are [int].
 class NotepadWindow {
@@ -792,6 +818,9 @@ class NotepadWindow {
     hidden [int]$entranceY
     hidden [int]$entranceFrom
     hidden [IntPtr]$entranceStyle
+    # Set while Place moves the window to where it was saved, so the DPI change that move causes keeps the saved size.
+    hidden [bool]$placing = $false
+    hidden [bool]$maximizeOnShow = $false
 
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
     static [IntPtr] DefWindowProcW([IntPtr]$hwnd, [uint]$message, [IntPtr]$w, [IntPtr]$l) { throw 'native' }
@@ -875,6 +904,10 @@ class NotepadWindow {
     static [int] DestroyWindow([IntPtr]$hwnd) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
     static [int] UnregisterClassW([IntPtr]$class, [IntPtr]$instance) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] GetWindowPlacement([IntPtr]$hwnd, [IntPtr]$placement) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] SetWindowPlacement([IntPtr]$hwnd, [IntPtr]$placement) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('advapi32.dll')]
     static [int] RegGetValueW([IntPtr]$key, [IntPtr]$subKey, [IntPtr]$value, [uint]$flags, [IntPtr]$type, [IntPtr]$data, [IntPtr]$size) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('kernel32.dll')]
@@ -918,6 +951,29 @@ class NotepadWindow {
             $status = [NotepadWindow]::RegGetValueW([IntPtr][long]-2147483647, $subKey, $name, [uint]0x10, [IntPtr]::Zero, $data, [IntPtr]::Add($data, 4))
             if ($status -ne 0) { return 1.0 }
             return [Math]::Clamp([Runtime.InteropServices.Marshal]::ReadInt32($data, 0), 100, 225) / 100.0
+        }
+        finally {
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($data)
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($name)
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($subKey)
+        }
+    }
+
+    # Windows' accent family: HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Accent AccentPalette, eight
+    # 4-byte RGBA entries of which the first seven are Light3, Light2, Light1, the accent, Dark1, Dark2 and Dark3.
+    # Empty when the value cannot be read.
+    static [FluentColor[]] AccentPalette() {
+        $subKey = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('Software\Microsoft\Windows\CurrentVersion\Explorer\Accent')
+        $name = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('AccentPalette')
+        $data = [Runtime.InteropServices.Marshal]::AllocHGlobal(40)
+        try {
+            [Runtime.InteropServices.Marshal]::WriteInt32($data, 36, 32)
+            # RRF_RT_REG_BINARY is 0x08.
+            $status = [NotepadWindow]::RegGetValueW([IntPtr][long]-2147483647, $subKey, $name, [uint]0x08, [IntPtr]::Zero, $data, [IntPtr]::Add($data, 36))
+            if ($status -ne 0 -or [Runtime.InteropServices.Marshal]::ReadInt32($data, 36) -lt 28) { return [FluentColor[]]@() }
+            $shades = [FluentColor[]]::new(7)
+            for ($i = 0; $i -lt 7; $i++) { $shades[$i] = [FluentColor]::new([Runtime.InteropServices.Marshal]::ReadByte($data, 4 * $i), [Runtime.InteropServices.Marshal]::ReadByte($data, 4 * $i + 1), [Runtime.InteropServices.Marshal]::ReadByte($data, 4 * $i + 2)) }
+            return $shades
         }
         finally {
             [Runtime.InteropServices.Marshal]::FreeHGlobal($data)
@@ -1063,13 +1119,15 @@ class NotepadWindow {
                 return [IntPtr]1
             }
             if ($Message -eq 0x02E0) {
-                # WM_DPICHANGED lParam points to an ephemeral suggested RECT.
-                $x = [Runtime.InteropServices.Marshal]::ReadInt32($LParam); $y = [Runtime.InteropServices.Marshal]::ReadInt32($LParam, 4)
+                # WM_DPICHANGED lParam points to an ephemeral suggested RECT. A saved placement was measured at its
+                # own monitor's DPI, so while Place puts it back the suggested (rescaled) rectangle is not taken.
+                if ($this.placing) { $this.Enqueue('resize'); return [IntPtr]::Zero }
+                $x =[Runtime.InteropServices.Marshal]::ReadInt32($LParam); $y = [Runtime.InteropServices.Marshal]::ReadInt32($LParam, 4)
                 $w = [Runtime.InteropServices.Marshal]::ReadInt32($LParam, 8) - $x; $h = [Runtime.InteropServices.Marshal]::ReadInt32($LParam, 12) - $y
                 $null = [NotepadWindow]::SetWindowPos($Handle, [IntPtr]::Zero, $x, $y, $w, $h, [uint]0x14)
                 $this.Enqueue('resize'); return [IntPtr]::Zero
             }
-            if ($Message -eq 0x0200 -or $Message -eq 0x0201 -or $Message -eq 0x0202 -or $Message -eq 0x0203 -or $Message -eq 0x020A -or $Message -eq 0x0100 -or $Message -eq 0x0102 -or $Message -eq 0x0104) {
+            if ($Message -eq 0x0200 -or $Message -eq 0x0201 -or $Message -eq 0x0202 -or $Message -eq 0x0203 -or $Message -eq 0x0204 -or $Message -eq 0x0205 -or $Message -eq 0x020A -or $Message -eq 0x0100 -or $Message -eq 0x0102 -or $Message -eq 0x0104) {
                 $event = [NotepadWindowEvent]::new()
                 $event.Kind = 'input'; $event.Message = $Message; $event.W = $WParam.ToInt64(); $event.L = $LParam.ToInt64()
                 $event.Ctrl = ([NotepadWindow]::GetKeyState(0x11) -band 0x8000) -ne 0
@@ -1120,7 +1178,35 @@ class NotepadWindow {
         $info.Alive = $this.alive; $info.Focused = $this.focused; $info.Minimized = $this.minimized
         return $info
     }
-    [void] Show() { $null = [NotepadWindow]::ShowWindow($this.hwnd, 5) }
+    # Shown maximized when the placement Place restored was maximized.
+    [void] Show() { $null = [NotepadWindow]::ShowWindow($this.hwnd, $(if ($this.maximizeOnShow) { 3 } else { 5 })) }
+    # Where the window is: GetWindowPlacement's restored rectangle (workspace coordinates, physical pixels) and whether
+    # it is maximized, or was maximized before it was minimized (WPF_RESTORETOMAXIMIZED).
+    [NotepadPlacement] Placement() {
+        for ($i = 0; $i -lt 44; $i++) { [Runtime.InteropServices.Marshal]::WriteByte($this.scratch, $i, 0) }
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 0, 44)
+        if ([NotepadWindow]::GetWindowPlacement($this.hwnd, $this.scratch) -eq 0) { throw 'GetWindowPlacement failed' }
+        $show = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 8)
+        $flags = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 4)
+        $placement = [NotepadPlacement]::new()
+        $placement.Left = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 28); $placement.Top = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 32)
+        $placement.Right = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 36); $placement.Bottom = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 40)
+        $placement.Maximized = $show -eq 3 -or ($show -eq 2 -and ($flags -band 2) -ne 0)
+        return $placement
+    }
+    # Puts the still hidden window where -Stored says (SW_HIDE, so nothing shows before the first frame); Show then
+    # maximizes it if it was maximized. SetWindowPlacement moves a rectangle that would be entirely off every monitor
+    # back onto one, so a placement saved on a monitor since removed still opens visible.
+    [void] Place([NotepadPlacement]$Stored) {
+        for ($i = 0; $i -lt 44; $i++) { [Runtime.InteropServices.Marshal]::WriteByte($this.scratch, $i, 0) }
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 0, 44)
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 28, $Stored.Left); [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 32, $Stored.Top)
+        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 36, $Stored.Right); [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 40, $Stored.Bottom)
+        $this.placing = $true
+        try { if ([NotepadWindow]::SetWindowPlacement($this.hwnd, $this.scratch) -eq 0) { throw 'SetWindowPlacement failed' } }
+        finally { $this.placing = $false }
+        $this.maximizeOnShow = $Stored.Maximized
+    }
     [NotepadAppearance] Appearance([string]$Material, [bool]$Dark, [bool]$Curved) {
         # MansfieldPlumbing feature addition; same DWM mechanism as QuickPS Backdrop.ps1.
         $value = [Runtime.InteropServices.Marshal]::AllocHGlobal(16)
@@ -14255,6 +14341,11 @@ class FluentColor {
     FluentColor([byte]$Red, [byte]$Green, [byte]$Blue) { $this.Red = $Red; $this.Green = $Green; $this.Blue = $Blue; $this.Alpha = 1.0 }
     FluentColor([byte]$Red, [byte]$Green, [byte]$Blue, [double]$Opacity) { $this.Red = $Red; $this.Green = $Green; $this.Blue = $Blue; $this.Alpha = $Opacity }
 
+    # This colour moved -Portion (0 to 1) of the way to -Goal, opaque.
+    [FluentColor] Toward([FluentColor]$Goal, [double]$Portion) {
+        return [FluentColor]::new([byte][Math]::Round($this.Red + ($Goal.Red - $this.Red) * $Portion), [byte][Math]::Round($this.Green + ($Goal.Green - $this.Green) * $Portion), [byte][Math]::Round($this.Blue + ($Goal.Blue - $this.Blue) * $Portion))
+    }
+
     # As CSS writes it: #rrggbb when opaque, rgba(r, g, b, a) otherwise.
     [string] CssText() {
         $culture = [Globalization.CultureInfo]::InvariantCulture
@@ -14334,6 +14425,21 @@ class FluentTheme {
         $theme.SelectionBg = [FluentColor]::new(0x99, 0xc9, 0xff)
         $theme.SelectionText = [FluentColor]::new(0x00, 0x00, 0x00)
         return $theme
+    }
+
+    # Takes the accent, its hover and pressed states, the selection, links and the focus border from Windows' accent
+    # family (-Family: Light3, Light2, Light1, accent, Dark1, Dark2, Dark3). A dark theme draws on the light shades and
+    # a light theme on the dark ones, so the accent keeps its contrast with the surface. No shades: unchanged.
+    [void] UseAccent([FluentColor[]]$Family, [bool]$Light) {
+        if ($Family.Length -lt 7) { return }
+        if ($Light) {
+            $this.AccentColor = $Family[4]; $this.AccentHover = $Family[4].Toward($Family[3], 0.5); $this.AccentActive = $Family[5]
+            $this.SelectionBg = $Family[0]; $this.TextLink = $Family[4]; $this.BorderActive = $Family[4]
+        }
+        else {
+            $this.AccentColor = $Family[2]; $this.AccentHover = $Family[2].Toward($Family[1], 0.2); $this.AccentActive = $Family[3]
+            $this.SelectionBg = $Family[4]; $this.TextLink = $Family[1]; $this.BorderActive = $Family[1]
+        }
     }
 
     # The colours by CSS custom property name, as CSS text; case-insensitive keys.
@@ -14562,6 +14668,12 @@ $store=[IO.Path]::Join([Environment]::GetFolderPath('LocalApplicationData'),'Not
 [NotepadSettings]$defaultSettings=$settings.Copy()
 [string]$configPath=[IO.Path]::Join($PSScriptRoot,'config.ini')
 $sessionPath=[IO.Path]::Join($store,'session.bin')
+# Where the window was left, beside the session.
+$placementPath=[IO.Path]::Join($store,'window.bin')
+[NotepadPlacement]$placement=$null
+if(-not $NoSession -and [IO.Path]::Exists($placementPath)){
+    try{$placementReader=[IO.BinaryReader]::new([IO.File]::OpenRead($placementPath));try{$placement=[NotepadPlacement]::Read($placementReader)}finally{$placementReader.Dispose()}}catch{}
+}
 if(-not $NoSession -and [IO.Path]::Exists($configPath)){
     try{$configReader=[IO.StreamReader]::new($configPath);try{$settings.ReadIni($configReader)}finally{$configReader.Dispose()}}catch{}
 }
@@ -14839,7 +14951,9 @@ function Entrance-Easing([double]$Progress){
 function Resolve-Theme {
     $theme=$settings.theme
     if($theme -eq 'system'){$theme=if([NotepadWindow]::AppsUseLightTheme()){'light'}else{'dark'}}
-    [FluentTheme]$themeColors=if($theme -eq 'light'){[FluentTheme]::Light()}elseif($theme -eq 'dark'){[FluentTheme]::Dark()}else{[FluentTheme]::new()}
+    [bool]$lightTheme=$theme -eq 'light'
+    [FluentTheme]$themeColors=if($lightTheme){[FluentTheme]::Light()}elseif($theme -eq 'dark'){[FluentTheme]::Dark()}else{[FluentTheme]::new()}
+    $themeColors.UseAccent([NotepadWindow]::AccentPalette(),$lightTheme)
     $script:palette=$themeColors.Tokens()
     $ui.Theme=$theme;$ui.Dirty=$true
 }
@@ -14904,8 +15018,23 @@ function Set-SliderFromPoint([double]$X){
     $settings.Set($ui.SliderKey,[int][Math]::Clamp([Math]::Round(($X-$track[0])/$track[2]*100),0,100))
     Invalidate
 }
+# The window icon -Step places along the icon catalog (1 forward, -1 back), wrapping at either end; an icon not in the
+# catalog steps to its first or last entry. Saved at once.
+function Step-WindowIcon([int]$Step){
+    Initialize-IconCatalog;$count=$ui.IconCatalog.Count;$index=-1
+    for($i=0;$i -lt $count;$i++){if($ui.IconCatalog[$i].Key -eq $settings.windowIcon){$index=$i;break}}
+    $next=if($index -lt 0){if($Step -gt 0){0}else{$count-1}}else{(($index+$Step)%$count+$count)%$count}
+    $settings.windowIcon=$ui.IconCatalog[$next].Key;Apply-WindowIcon;Persist;Invalidate
+}
 function Persist {
     if($NoSession){return}
+    if($window -and $window.Info().Alive){
+        $null=[IO.Directory]::CreateDirectory($store)
+        $temporary=$placementPath+'.tmp'
+        $placementWriter=[IO.BinaryWriter]::new([IO.File]::Create($temporary))
+        try{$window.Placement().Write($placementWriter)}finally{$placementWriter.Dispose()}
+        [IO.File]::Move($temporary,$placementPath,$true)
+    }
     # Each file is written beside its destination and moved over it, so a reader never sees half a file.
     $temporary=$configPath+'.tmp'
     try{
@@ -15015,7 +15144,7 @@ function Command([FluentAction]$Action,[object]$Data=$null){
         ([FluentAction]::CopyDocument){try{if($settings.copyAsFile){[Win32Clipboard]::WriteFile($window.Handle(),$tab.Content(),$tab.Title)}else{[Win32Clipboard]::WriteText($window.Handle(),$tab.Content())}}catch{Open-Modal 'Copy document' $_.Exception.Message @(@{Text='Close';Action=[FluentAction]::Dismiss;Primary=$true})}}
         ([FluentAction]::EditColor){Open-CanvasColorPicker $Data -1}
         ([FluentAction]::EditAnsi){Open-CanvasColorPicker '' ([int]$Data)}
-        ([FluentAction]::CycleIcon){Initialize-IconCatalog;$index=-1;for($i=0;$i -lt $ui.IconCatalog.Count;$i++){if($ui.IconCatalog[$i].Key -eq $settings.windowIcon){$index=$i;break}};$settings.windowIcon=$ui.IconCatalog[($index+1)%$ui.IconCatalog.Count].Key;Apply-WindowIcon}
+        ([FluentAction]::CycleIcon){Step-WindowIcon 1}
         ([FluentAction]::ResetIcon){$settings.windowIcon='default';Apply-WindowIcon}
         ([FluentAction]::ResetColors){$settings.colors=[NotepadSettings]::ColorTable(@{foreground='';tabs='';cursor='';selectionBackground='';topLeft='#272727';topRight='#272727';bottomLeft='#272727';bottomRight='#272727'});$settings.gradientEnabled=$false}
         ([FluentAction]::FormatBold){Format-Selection '**'}
@@ -15699,7 +15828,7 @@ function Handle-Event([NotepadWindowEvent]$Event){
     if($Event.Kind -eq 'minimized'){$ui.Minimized=$true;Write-ApplicationDiagnostic;return}
     if($Event.Kind -eq 'close'){Request-Close;return}
     if($Event.Kind -eq 'paint'){Invalidate;return}
-    if($Event.Kind -eq 'settingChange'){$ui.TextScale=[NotepadWindow]::TextScaleFactor();Invalidate;return}
+    if($Event.Kind -eq 'settingChange'){$ui.TextScale=[NotepadWindow]::TextScaleFactor();Resolve-Theme;Apply-WindowAppearance;Invalidate;return}
     if($Event.Kind -in @('focus','blur')){$ui.Focused=$Event.Kind -eq 'focus';Invalidate;return}
     if($Event.Kind -eq 'resize'){
         $info=$window.Info()
@@ -15733,6 +15862,9 @@ function Handle-Event([NotepadWindowEvent]$Event){
         $ui.ScrollSequence++;Invalidate;return
     }
     [NotepadHitNode]$hit=Hit $x $y;$id=if($hit){$hit.Id}else{''}
+    # The right button acts on release: on the window icon it steps the icon back.
+    if($msg -eq 0x204){return}
+    if($msg -eq 0x205){if($hit -and $hit.Action -eq [FluentAction]::CycleIcon){Step-WindowIcon -1};return}
     if($msg -eq 0x200){
         if($ui.ColorDrag){Set-ColorPickerPoint $ui.ColorDrag $x $y;return}
         if($ui.ScrollDrag){Set-ScrollFromPoint $y;return}
@@ -15783,19 +15915,22 @@ function Handle-Event([NotepadWindowEvent]$Event){
 Resolve-Theme
 try{
     $window=Invoke-Window.Windows -Width $Width -Height $Height
+    if($placement){$window.Place($placement)}
+    # A window opening maximized fills its monitor at once; the entrance moves a restored window.
+    [bool]$animateEntrance=-not $NoAnimation -and -not ($placement -and $placement.Maximized)
     $info=$window.Info();$ui.Dpi=$info.Dpi;$ui.Width=$info.Width*96/$info.Dpi;$ui.Height=$info.Height*96/$info.Dpi;$ui.TextScale=[NotepadWindow]::TextScaleFactor()
     $graphics=Invoke-Graphics.Windows -Hwnd $window.Handle() -Width $info.Width -Height $info.Height -Dpi $info.Dpi
     
     Apply-WindowAppearance
     Apply-WindowIcon
-    if(-not $NoAnimation){$ui.BackdropActive=$false}
-    if(-not $NoAnimation){$ui.Entrance=$window.BeginEntrance(($settings.entranceAnimation -eq 'slide'));$initialEntrance=$window.Entrance(0);$null=Entrance-Easing 0.5}
+    if($animateEntrance){$ui.BackdropActive=$false}
+    if($animateEntrance){$ui.Entrance=$window.BeginEntrance(($settings.entranceAnimation -eq 'slide'));$initialEntrance=$window.Entrance(0);$null=Entrance-Easing 0.5}
     # Paint the entire first frame before the HWND becomes visible.
     Paint
     # A hidden PowerShell host can override the first ShowWindow call through STARTUPINFO.
     $window.Show();$window.Show();$start=[DateTime]::UtcNow
     foreach($event in @($window.Drain())){Handle-Event $event}
-    if(-not $NoAnimation){$ui.EntranceStatus='Animating';$ui.EntranceStart=[DateTime]::UtcNow;$initialEntrance.ElapsedMs=0;$initialEntrance.TimeProgress=0;$ui.EntranceSamples.Add($initialEntrance)}
+    if($animateEntrance){$ui.EntranceStatus='Animating';$ui.EntranceStart=[DateTime]::UtcNow;$initialEntrance.ElapsedMs=0;$initialEntrance.TimeProgress=0;$ui.EntranceSamples.Add($initialEntrance)}
     else{$ui.EntranceStatus='Skipped'}
     while($ui.Running -and $window.Info().Alive){
         foreach($event in @($window.Drain())){Handle-Event $event}
