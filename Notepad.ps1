@@ -904,6 +904,28 @@ class NotepadWindow {
         }
     }
 
+    # Windows' text size setting (Settings > Accessibility > Text size) as a factor: HKCU\Software\Microsoft\Accessibility
+    # TextScaleFactor, a percentage from 100 to 225, as WinUI applies it to interface text. 1 when it is not set or
+    # cannot be read.
+    static [double] TextScaleFactor() {
+        $subKey = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('Software\Microsoft\Accessibility')
+        $name = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('TextScaleFactor')
+        $data = [Runtime.InteropServices.Marshal]::AllocHGlobal(8)
+        try {
+            [Runtime.InteropServices.Marshal]::WriteInt32($data, 0, 100)
+            [Runtime.InteropServices.Marshal]::WriteInt32($data, 4, 4)
+            # HKEY_CURRENT_USER is 0x80000001 sign-extended; RRF_RT_REG_DWORD is 0x10.
+            $status = [NotepadWindow]::RegGetValueW([IntPtr][long]-2147483647, $subKey, $name, [uint]0x10, [IntPtr]::Zero, $data, [IntPtr]::Add($data, 4))
+            if ($status -ne 0) { return 1.0 }
+            return [Math]::Clamp([Runtime.InteropServices.Marshal]::ReadInt32($data, 0), 100, 225) / 100.0
+        }
+        finally {
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($data)
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($name)
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($subKey)
+        }
+    }
+
     # Starts a program from its command line (its quoted path first, then its arguments), without waiting for it.
     static [void] StartProgram([string]$CommandLine) {
         # STARTUPINFOW is 104 bytes and PROCESS_INFORMATION 24 on a 64-bit process.
@@ -1001,6 +1023,7 @@ class NotepadWindow {
             if ($Message -eq 0x8001) { if ($WParam.ToInt64() -ne 0) { $null = [NotepadWindow]::SetCapture($Handle) } else { $null = [NotepadWindow]::ReleaseCapture() }; return [IntPtr]::Zero }
             if ($Message -eq 0x8002) { $null = [NotepadWindow]::DestroyWindow($Handle); [NotepadWindow]::PostQuitMessage(0); return [IntPtr]::Zero }
             if ($Message -eq 0x0083) { return [IntPtr]::Zero } # WM_NCCALCSIZE: full client chrome.
+            if ($Message -eq 0x001A) { $this.Enqueue('settingChange') } # WM_SETTINGCHANGE: text size or theme may have changed.
             if ($Message -eq 0x0014) { return [IntPtr]1 } # suppress GDI background erase.
             if ($Message -eq 0x0024) { # WM_GETMINMAXINFO: keep the native toolbar and settings usable.
                 $scale = [Math]::Max(96, [NotepadWindow]::GetDpiForWindow($Handle)) / 96.0
@@ -14754,6 +14777,9 @@ class NotepadUi {
     [double]$DragX
     [double]$DragY
     [datetime]$DragTick
+    # Windows' text size as a factor on interface text (not the editor's own font), read at start and when Windows
+    # reports a setting change.
+    [double]$TextScale = 1.0
     [NotepadColorPicker]$ColorPicker
     [string]$ColorDrag
     [string]$Theme
@@ -14888,7 +14914,17 @@ function Node([string]$Id,[double]$X,[double]$Y,[double]$W,[double]$H,[FluentAct
     $node=$ui.Nodes[$Id];$node.Rect=@($X,$Y,$W,$H);$node.Action=$Action;$node.Data=$Data;$node.Cursor=$Cursor;$node.Generation=$ui.Generation+1;$node.Clip=$ui.HitClip
     $ui.NextHits.Add($node.Copy())
 }
+# The width a label's text takes at a base size, scaled by Windows' text size as Label scales it.
+function Measure-LabelWidth([string]$Text,[double]$Size=13){
+    $scaled=$Size*$ui.TextScale;$key="measure|$Text|$scaled"
+    if(-not $ui.TextCache.ContainsKey($key)){$ui.TextCache[$key]=$graphics.Layout($Text,'Segoe UI',[single]$scaled,[single]1000,$false,400,$false,0)}
+    return [double]$graphics.Metrics($ui.TextCache[$key]).Width
+}
+
 function Label([string]$Text,[double]$X,[double]$Y,[double]$W,[string]$Color,[double]$Size=13,[string]$Family='Segoe UI',[int]$Weight=400){
+    # Interface text follows Windows' text size, as WinUI's does. Text grown by the setting moves up by half its added
+    # line height (about 1.33 of the size), so it stays centred on the place laid out for the base size.
+    $grown=$Size*($ui.TextScale-1);$Size=$Size+$grown;$Y=$Y-$grown*0.665
     $key="$Text|$W|$Size|$Family|$Weight"
     if(-not $ui.TextCache.ContainsKey($key)){$ui.TextCache[$key]=$graphics.Layout($Text,$Family,[single]$Size,[single][Math]::Max(1,$W),$false,$Weight,$false,0)}
     $graphics.DrawLayout($ui.TextCache[$key],[single]$X,[single]$Y,$Color)
@@ -14904,7 +14940,7 @@ function Button([string]$Id,[double]$X,[double]$Y,[double]$W,[double]$H,[FluentA
     if($bg -ne 'transparent'){$graphics.Fill($X,$Y,$W,$H,$bg,4)}
     if($Border -and -not $Primary){$graphics.Stroke($X,$Y,$W,$H,(Color 'border-control'),4,1)}
     if($Icon){Icon $Icon ($X+($W-$IconSize)/2) ($Y+($H-$IconSize)/2) $IconSize $fg}
-    if($Text){$layout=$graphics.Layout($Text,'Segoe UI',13,$W,$false,400,$false,0);try{$m=$graphics.Metrics($layout);$graphics.DrawLayout($layout,($X+($W-$m.Width)/2),($Y+($H-$m.Height)/2),$fg)}finally{$graphics.ReleaseLayout($layout)}}
+    if($Text){$layout=$graphics.Layout($Text,'Segoe UI',(13*$ui.TextScale),$W,$false,400,$false,0);try{$m=$graphics.Metrics($layout);$graphics.DrawLayout($layout,($X+($W-$m.Width)/2),($Y+($H-$m.Height)/2),$fg)}finally{$graphics.ReleaseLayout($layout)}}
 }
 function InputBox([string]$Id,[string]$Value,[double]$X,[double]$Y,[double]$W,[string]$Placeholder='',[double]$H=30,[double]$FontSize=13){
     Node $Id $X $Y $W $H ([FluentAction]::FocusInput) $Id 'text'
@@ -14912,7 +14948,7 @@ function InputBox([string]$Id,[string]$Value,[double]$X,[double]$Y,[double]$W,[s
     $focused=$ui.Focus -eq $Id
     if($focused){$graphics.Fill(($X+1),($Y+$H-2),($W-2),2,(Color 'accent-color'),0)}
     $graphics.Clip(($X+7),($Y+2),($W-14),($H-4))
-    $layout=$graphics.Layout($Value,'Segoe UI',$FontSize,100000,$false,400,$false,0)
+    $layout=$graphics.Layout($Value,'Segoe UI',($FontSize*$ui.TextScale),100000,$false,400,$false,0)
     try{
         $metrics=$graphics.Metrics($layout);$originY=$Y+($H-$metrics.Height)/2
         $offset=0.0
@@ -15275,7 +15311,11 @@ function Paint-Chrome {
         Label $cursor 26 ($y+6) 170 (Color 'text-secondary') 12
         $graphics.Fill(126,($y+7),0.8,14,(Color 'border-subtle'),0);Label $count 137 ($y+6) 200 (Color 'text-secondary') 12
         [NotepadStatusItem[]]$items=@(@{Id='sb-doc-type';Text=$(if($tab.Markdown){'Markdown'}else{'Plain text'});Width=100;Action=[FluentAction]::None},@{Id='sb-zoom-level';Text=([string]$settings.zoom+'%');Width=70;Action=[FluentAction]::ZoomReset},@{Id='sb-line-ending';Text=$tab.LineEnding;Width=114;Action=[FluentAction]::LineEnding},@{Id='sb-encoding';Text=$tab.Encoding;Width=74;Action=[FluentAction]::None})
-        $sx=$w-374
+        # Each item is at least its base width and wide enough for its text at Windows' text size; the row ends 16 px
+        # from the right edge.
+        foreach($item in $items){$item.Width=[Math]::Max($item.Width,(Measure-LabelWidth $item.Text 12)+20)}
+        $itemsWidth=0.0;foreach($item in $items){$itemsWidth+=$item.Width}
+        $sx=$w-16-$itemsWidth
         foreach($item in $items){Node $item.Id $sx $y $item.Width 28 $item.Action;if($ui.Hover -eq $item.Id){$graphics.Fill($sx,$y,$item.Width,28,(Color 'bg-control-hover'),0)};Label $item.Text ($sx+10) ($y+6) ($item.Width-20) (Color 'text-secondary') 12;$sx+=$item.Width;$graphics.Fill($sx,($y+7),0.8,14,(Color 'border-subtle'),0)}
     }
 }
@@ -15467,7 +15507,7 @@ function Paint-Dropdown {
 function Paint-Modal {
     if(-not $ui.Modal){return}
     $m=$ui.Modal;$width=[Math]::Min(440,$ui.Width*0.9);$bodyWidth=$width-48
-    $messageLayout=$graphics.Layout($m.Message,'Segoe UI',13,$bodyWidth,$true,400,$false,19.5)
+    $messageLayout=$graphics.Layout($m.Message,'Segoe UI',(13*$ui.TextScale),$bodyWidth,$true,400,$false,(19.5*$ui.TextScale))
     try{$messageHeight=if($m.Message){($graphics.Metrics($messageLayout)).Height}else{0}
         $height=24+25.2+16+$messageHeight+16+34+24+8
         if($m.Input){$height+=54};if($null -ne $m.Markdown){$height+=[Math]::Min(380,[Math]::Max(60,($m.Markdown.Split("`n").Count*23+24)))}
@@ -15636,6 +15676,7 @@ function Handle-Event([NotepadWindowEvent]$Event){
     if($Event.Kind -eq 'minimized'){$ui.Minimized=$true;Write-ApplicationDiagnostic;return}
     if($Event.Kind -eq 'close'){Request-Close;return}
     if($Event.Kind -eq 'paint'){Invalidate;return}
+    if($Event.Kind -eq 'settingChange'){$ui.TextScale=[NotepadWindow]::TextScaleFactor();Invalidate;return}
     if($Event.Kind -in @('focus','blur')){$ui.Focused=$Event.Kind -eq 'focus';Invalidate;return}
     if($Event.Kind -eq 'resize'){
         $info=$window.Info()
@@ -15716,7 +15757,7 @@ function Handle-Event([NotepadWindowEvent]$Event){
 Resolve-Theme
 try{
     $window=Invoke-Window.Windows -Width $Width -Height $Height
-    $info=$window.Info();$ui.Dpi=$info.Dpi;$ui.Width=$info.Width*96/$info.Dpi;$ui.Height=$info.Height*96/$info.Dpi
+    $info=$window.Info();$ui.Dpi=$info.Dpi;$ui.Width=$info.Width*96/$info.Dpi;$ui.Height=$info.Height*96/$info.Dpi;$ui.TextScale=[NotepadWindow]::TextScaleFactor()
     $graphics=Invoke-Graphics.Windows -Hwnd $window.Handle() -Width $info.Width -Height $info.Height -Dpi $info.Dpi
     
     Apply-WindowAppearance
