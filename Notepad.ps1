@@ -759,10 +759,21 @@ class NotepadEntranceRestore {
 # A top-level window with Notepad's own caption: its window procedure, its message queue as events, its backdrop and
 # its entrance. Win32 BOOL results are [int].
 class NotepadWindow {
-    # The window the window procedure serves; Windows calls it on this thread from DispatchMessage.
+    # The window lives on a thread of its own: that thread creates it, pumps its messages and runs the window
+    # procedure, and is the one held inside Windows' own loop while the user drags an edge or the caption. The app's
+    # thread keeps handling events and painting from the queue meanwhile, so resizing repaints live.
     static [NotepadWindow]$Current
-    hidden [Collections.Generic.Queue[NotepadWindowEvent]]$events = [Collections.Generic.Queue[NotepadWindowEvent]]::new()
+    hidden [Collections.Concurrent.ConcurrentQueue[NotepadWindowEvent]]$events = [Collections.Concurrent.ConcurrentQueue[NotepadWindowEvent]]::new()
     hidden [Exception]$callbackError
+    # Set by the window thread once the window exists (or creating it failed), and when the thread ends.
+    hidden [Threading.ManualResetEventSlim]$ready = [Threading.ManualResetEventSlim]::new($false)
+    hidden [Threading.ManualResetEventSlim]$exited = [Threading.ManualResetEventSlim]::new($false)
+    # The window thread's own buffers: its MSG and the window procedure's scratch, apart from the app thread's.
+    hidden [IntPtr]$pumpMessage
+    hidden [IntPtr]$procedureScratch
+    hidden [int]$requestedWidth
+    hidden [int]$requestedHeight
+    hidden [string]$requestedTitle
     hidden [IntPtr]$hwnd
     hidden [bool]$alive = $true
     hidden [bool]$focused = $true
@@ -846,6 +857,14 @@ class NotepadWindow {
     static [int] DestroyIcon([IntPtr]$icon) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
     static [int] PeekMessageW([IntPtr]$message, [IntPtr]$hwnd, [uint]$first, [uint]$last, [uint]$remove) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] GetMessageW([IntPtr]$message, [IntPtr]$hwnd, [uint]$first, [uint]$last) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [int] PostMessageW([IntPtr]$hwnd, [uint]$message, [IntPtr]$w, [IntPtr]$l) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [void] PostQuitMessage([int]$exitCode) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('kernel32.dll')]
+    static [IntPtr] CreateThread([IntPtr]$attributes, [IntPtr]$stackSize, [IntPtr]$start, [IntPtr]$parameter, [uint]$flags, [IntPtr]$threadId) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
     static [int] TranslateMessage([IntPtr]$message) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
@@ -931,6 +950,44 @@ class NotepadWindow {
         return [NotepadWindow]::Current.Procedure($Handle, $Message, $WParam, $LParam)
     }
 
+    # The window thread's entry, started by CreateThread.
+    [System.Runtime.InteropServices.UnmanagedCallersOnly(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [uint] WindowThread([IntPtr]$ThreadArgument) {
+        return [NotepadWindow]::Current.Pump()
+    }
+
+    # On the window thread: register the class, create the window, signal the app thread, then pump messages until
+    # WM_QUIT. Any failure is kept in callbackError for the app thread.
+    hidden [uint] Pump() {
+        try {
+            $null = [NotepadWindow]::SetThreadDpiAwarenessContext([IntPtr](-4))
+            $proc = [NotepadWindow].GetMethod('WndProc').MethodHandle.GetFunctionPointer()
+            $titlePtr = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($this.requestedTitle)
+            $class = [Runtime.InteropServices.Marshal]::AllocHGlobal(80)
+            try {
+                for ($i = 0; $i -lt 80; $i++) { [Runtime.InteropServices.Marshal]::WriteByte($class, $i, 0) }
+                [Runtime.InteropServices.Marshal]::WriteInt32($class, 0, 80)
+                [Runtime.InteropServices.Marshal]::WriteInt32($class, 4, 0xB) # redraw + double clicks
+                [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 8, $proc)
+                [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 24, $this.hmodule)
+                [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 40, $this.arrow)
+                [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 64, $this.classPtr)
+                if ([NotepadWindow]::RegisterClassExW($class) -eq 0) { throw 'RegisterClassExW failed' }
+                # A normal top-level app window with our own caption controls, rather than a popup or duplicate native caption.
+                $this.hwnd = [NotepadWindow]::CreateWindowExW([uint]0x40000, $this.classPtr, $titlePtr, [uint]0x000F0000L, 100, 80, [Math]::Max(768, $this.requestedWidth), [Math]::Max(478, $this.requestedHeight), [IntPtr]::Zero, [IntPtr]::Zero, $this.hmodule, [IntPtr]::Zero)
+            }
+            finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($class); [Runtime.InteropServices.Marshal]::FreeHGlobal($titlePtr) }
+            if ($this.hwnd -eq [IntPtr]::Zero) { throw 'CreateWindowExW failed' }
+            $this.ready.Set()
+            while ([NotepadWindow]::GetMessageW($this.pumpMessage, [IntPtr]::Zero, [uint]0, [uint]0) -gt 0) {
+                $null = [NotepadWindow]::TranslateMessage($this.pumpMessage); $null = [NotepadWindow]::DispatchMessageW($this.pumpMessage)
+            }
+        }
+        catch { $this.callbackError = $_.Exception; $this.alive = $false }
+        finally { $this.ready.Set(); $this.exited.Set() }
+        return [uint]0
+    }
+
     hidden [void] Enqueue([string]$Kind) {
         $event = [NotepadWindowEvent]::new()
         $event.Kind = $Kind
@@ -939,6 +996,10 @@ class NotepadWindow {
 
     hidden [IntPtr] Procedure([IntPtr]$Handle, [uint]$Message, [IntPtr]$WParam, [IntPtr]$LParam) {
         try {
+            # Requests the app thread posts, done here because they must run on the window's own thread: WM_APP + 1
+            # sets (wParam 1) or releases mouse capture; WM_APP + 2 destroys the window and ends the pump.
+            if ($Message -eq 0x8001) { if ($WParam.ToInt64() -ne 0) { $null = [NotepadWindow]::SetCapture($Handle) } else { $null = [NotepadWindow]::ReleaseCapture() }; return [IntPtr]::Zero }
+            if ($Message -eq 0x8002) { $null = [NotepadWindow]::DestroyWindow($Handle); [NotepadWindow]::PostQuitMessage(0); return [IntPtr]::Zero }
             if ($Message -eq 0x0083) { return [IntPtr]::Zero } # WM_NCCALCSIZE: full client chrome.
             if ($Message -eq 0x0014) { return [IntPtr]1 } # suppress GDI background erase.
             if ($Message -eq 0x0024) { # WM_GETMINMAXINFO: keep the native toolbar and settings usable.
@@ -959,13 +1020,13 @@ class NotepadWindow {
             if ($Message -eq 0x0008) { $this.focused = $false; $this.Enqueue('blur'); return [IntPtr]::Zero }
             if ($Message -eq 0x0020 -and ($LParam.ToInt64() -band 0xffff) -eq 1) { $null = [NotepadWindow]::SetCursor($this.currentCursor); return [IntPtr]1 }
             if ($Message -eq 0x0084) {
-                $null = [NotepadWindow]::GetWindowRect($Handle, $this.scratch)
+                $null = [NotepadWindow]::GetWindowRect($Handle, $this.procedureScratch)
                 [int] $screenX = [int]($LParam.ToInt64() -band 0xffff)
                 if ($screenX -ge 32768) { $screenX -= 65536 }
                 [int] $screenY = [int](($LParam.ToInt64() -shr 16) -band 0xffff)
                 if ($screenY -ge 32768) { $screenY -= 65536 }
-                $left = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch); $top = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 4)
-                $right = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 8); $bottom = [Runtime.InteropServices.Marshal]::ReadInt32($this.scratch, 12)
+                $left = [Runtime.InteropServices.Marshal]::ReadInt32($this.procedureScratch); $top = [Runtime.InteropServices.Marshal]::ReadInt32($this.procedureScratch, 4)
+                $right = [Runtime.InteropServices.Marshal]::ReadInt32($this.procedureScratch, 8); $bottom = [Runtime.InteropServices.Marshal]::ReadInt32($this.procedureScratch, 12)
                 $border = [Math]::Max(4, 6 * [NotepadWindow]::GetDpiForWindow($Handle) / 96)
                 $l = $screenX -lt $left + $border; $r = $screenX -ge $right - $border; $t = $screenY -lt $top + $border; $b = $screenY -ge $bottom - $border
                 if ($t -and $l) { return [IntPtr]13 }
@@ -1007,23 +1068,21 @@ class NotepadWindow {
         $this.currentCursor = $this.arrow
         $this.scratch = [Runtime.InteropServices.Marshal]::AllocHGlobal(128)
         for ($i = 0; $i -lt 128; $i++) { [Runtime.InteropServices.Marshal]::WriteByte($this.scratch, $i, 0) }
-        $proc = [NotepadWindow].GetMethod('WndProc').MethodHandle.GetFunctionPointer()
+        $this.pumpMessage = [Runtime.InteropServices.Marshal]::AllocHGlobal(64)
+        $this.procedureScratch = [Runtime.InteropServices.Marshal]::AllocHGlobal(64)
+        # The app thread is per-monitor aware too, so window sizes and DPI read from it are physical pixels.
         $this.previousDpi = [NotepadWindow]::SetThreadDpiAwarenessContext([IntPtr](-4))
         $appId = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('MansfieldPlumbing.NotepadPS1')
         try { $null = [NotepadWindow]::SetCurrentProcessExplicitAppUserModelID($appId) } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($appId) }
         $this.hmodule = [NotepadWindow]::GetModuleHandleW([IntPtr]::Zero)
         $this.classPtr = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('NotepadPS_' + [Guid]::NewGuid().ToString('N'))
-        $titlePtr = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($Title)
-        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 0, 80)
-        [Runtime.InteropServices.Marshal]::WriteInt32($this.scratch, 4, 0xB) # redraw + double clicks
-        [Runtime.InteropServices.Marshal]::WriteIntPtr($this.scratch, 8, $proc)
-        [Runtime.InteropServices.Marshal]::WriteIntPtr($this.scratch, 24, $this.hmodule)
-        [Runtime.InteropServices.Marshal]::WriteIntPtr($this.scratch, 40, $this.arrow)
-        [Runtime.InteropServices.Marshal]::WriteIntPtr($this.scratch, 64, $this.classPtr)
-        if ([NotepadWindow]::RegisterClassExW($this.scratch) -eq 0) { throw 'RegisterClassExW failed' }
-        # A normal top-level app window with our own caption controls, rather than a popup or duplicate native caption.
-        try { $this.hwnd = [NotepadWindow]::CreateWindowExW([uint]0x40000, $this.classPtr, $titlePtr, [uint]0x000F0000L, 100, 80, [Math]::Max(768, $Width), [Math]::Max(478, $Height), [IntPtr]::Zero, [IntPtr]::Zero, $this.hmodule, [IntPtr]::Zero) }
-        finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($titlePtr) }
+        $this.requestedWidth = $Width; $this.requestedHeight = $Height; $this.requestedTitle = $Title
+        $start = [NotepadWindow].GetMethod('WindowThread').MethodHandle.GetFunctionPointer()
+        $thread = [NotepadWindow]::CreateThread([IntPtr]::Zero, [IntPtr]::Zero, $start, [IntPtr]::Zero, [uint]0, [IntPtr]::Zero)
+        if ($thread -eq [IntPtr]::Zero) { throw 'CreateThread failed' }
+        $null = [NotepadWindow]::CloseHandle($thread)
+        $this.ready.Wait()
+        if ($null -ne $this.callbackError) { throw $this.callbackError }
         if ($this.hwnd -eq [IntPtr]::Zero) { throw 'CreateWindowExW failed' }
     }
 
@@ -1134,17 +1193,17 @@ class NotepadWindow {
         $this.windowIcon = $icon; $this.ownsWindowIcon = $owned
         return $icon
     }
+    # The events the window thread queued since the last call; the window thread pumps messages on its own.
     [NotepadWindowEvent[]] Drain() {
-        while ([NotepadWindow]::PeekMessageW($this.scratch, [IntPtr]::Zero, [uint]0, [uint]0, [uint]1) -ne 0) {
-            $null = [NotepadWindow]::TranslateMessage($this.scratch); $null = [NotepadWindow]::DispatchMessageW($this.scratch)
-        }
         if ($null -ne $this.callbackError) { throw $this.callbackError }
-        $drained = $this.events.ToArray()
-        $this.events.Clear()
-        return $drained
+        $drained = [Collections.Generic.List[NotepadWindowEvent]]::new()
+        [NotepadWindowEvent] $next = $null
+        while ($this.events.TryDequeue([ref] $next)) { $drained.Add($next) }
+        return $drained.ToArray()
     }
+    # Mouse capture belongs to the window's thread, so the request is posted to it.
     [void] Capture([bool]$Value) {
-        if ($Value) { $null = [NotepadWindow]::SetCapture($this.hwnd) } else { $null = [NotepadWindow]::ReleaseCapture() }
+        $null = [NotepadWindow]::PostMessageW($this.hwnd, [uint]0x8001, [IntPtr]([int]$Value), [IntPtr]::Zero)
     }
     [void] Cursor([string]$Kind) {
         $this.currentCursor = $this.arrow
@@ -1158,14 +1217,19 @@ class NotepadWindow {
             if ([NotepadWindow]::IsZoomed($this.hwnd) -ne 0) { $show = 9 }
             $null = [NotepadWindow]::ShowWindow($this.hwnd, $show)
         }
-        elseif ($Decoration -eq [FluentWindowDecoration]::Drag) { $null = [NotepadWindow]::ReleaseCapture(); $null = [NotepadWindow]::SendMessageW($this.hwnd, [uint]0xA1, [IntPtr]2, [IntPtr]::Zero) }
+        # Posted, not sent: the window thread runs Windows' move loop while the app thread keeps painting.
+        elseif ($Decoration -eq [FluentWindowDecoration]::Drag) { $null = [NotepadWindow]::PostMessageW($this.hwnd, [uint]0x8001, [IntPtr]::Zero, [IntPtr]::Zero); $null = [NotepadWindow]::PostMessageW($this.hwnd, [uint]0xA1, [IntPtr]2, [IntPtr]::Zero) }
     }
+    # The window is destroyed on its own thread (WM_APP + 2), which then ends; the class and buffers go after that.
     [void] Dispose() {
-        $null = [NotepadWindow]::DestroyWindow($this.hwnd)
+        if ($this.alive) { $null = [NotepadWindow]::PostMessageW($this.hwnd, [uint]0x8002, [IntPtr]::Zero, [IntPtr]::Zero) }
+        $null = $this.exited.Wait(5000)
         if ($this.ownsWindowIcon -and $this.windowIcon -ne [IntPtr]::Zero) { $null = [NotepadWindow]::DestroyIcon($this.windowIcon) }
         $null = [NotepadWindow]::UnregisterClassW($this.classPtr, $this.hmodule)
         [Runtime.InteropServices.Marshal]::FreeHGlobal($this.classPtr)
         [Runtime.InteropServices.Marshal]::FreeHGlobal($this.scratch)
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($this.pumpMessage)
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($this.procedureScratch)
         $null = [NotepadWindow]::SetThreadDpiAwarenessContext($this.previousDpi)
     }
 }
