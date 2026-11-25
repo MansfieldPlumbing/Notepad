@@ -1,8 +1,7 @@
 # Notepad
 
 Windows 11 Notepad, rebuilt in PowerShell 7 from an HTML/JS simulacrum, as one script, `Notepad.ps1`.
-It embeds no browser, JavaScript runtime, compiled bridge, WPF or Windows Forms. It is on its way,
-through PSC, to a single NativeAOT executable; that executable does not exist yet.
+It embeds no browser, JavaScript runtime, compiled bridge, WPF or Windows Forms. Its native executable path uses [PSC](https://github.com/MansfieldPlumbing/PSC). Native builds have been produced during development; this repository does not currently publish a verified executable release or a complete build receipt for the present revision.
 
 ## How it was made
 
@@ -23,18 +22,14 @@ through PSC, to a single NativeAOT executable; that executable does not exist ye
 5. **One script.** The port began as `Notepad.ps1` running six scripts from `src` and two tests. PSC
    (`Invoke-PSC.ps1 -Mode Consolidate`) folded each into `Notepad.ps1` as a function; the checks the
    tests held are its `-VerifyModel` and `-VerifyGraphics` switches.
-6. **NativeAOT, in progress.** PSC lowers PowerShell to IL and links a NativeAOT executable. Of
-   `Notepad.ps1`'s 89 members, 23 lower today: the piece-table document core and two functions. What
-   remains is by category: member access on dynamically typed values, cmdlets and pipelines, the folded
-   scripts' dynamic modules, catches that read `$_`, and a few single constructs. When it builds, its
-   resource use will be compared with the simulacrum in a browser and with Windows Notepad.
+6. **Native realization.** PSC lowers typed PowerShell to IL and links NativeAOT executables. The historical partial-lowering counts no longer describe the current source; verify the complete current application and native artifact against the corresponding PSC revision rather than assuming a historical build remains valid.
 
 Nothing here uses WinForms or WPF, so an Android port replaces the window, graphics and services
 layers with a JNI canvas rather than rewriting the application.
 
 ## Run
 
-Requires Windows x64 and PowerShell 7. Double-click **Start Notepad.cmd**, or:
+Requires Windows x64. The current source declares PSC's `SingleThreadedApartment` and `ApplicationIcon` attributes. Plain pwsh may fail during parsing if those types are not registered; the legacy **Start Notepad.cmd** and direct script commands below are not a substitute for PSC-aware execution.
 
 ```powershell
 pwsh -NoProfile -STA -File .\Notepad.ps1
@@ -79,6 +74,14 @@ message); a rich Markdown preview (headings only today); movable tabs; kinetic s
 dragging; context menus; non-UTF-8 decoding. Literal replace-all uses .NET ordinal matching, so some
 JavaScript Unicode case and replacement-token behaviour differs. Drawing uses a software Direct2D HWND
 render target; the final presentation path is not chosen.
+
+## Upstream PSC integration
+
+The [PSC integration roadmap](https://github.com/MansfieldPlumbing/PSC#integration-roadmap) uses Notepad as an application-level verification target (A1) and identifies reusable presentation and document mechanisms (H2/F4).
+
+- `NotepadDocument`, `NotepadPiece` and the grouped edit journal supplied the prior art for PSC's revision-checked document editing. Application-specific selection and view state remain here.
+- The current single-replace path can use cached match offsets without checking the active document revision; creating a new tab also changes active identity without refreshing matches. Treat this as an open defect, not a behavior to preserve when acquiring mechanisms.
+- Window, graphics, hit testing and input remain concrete application proofs for shared presentation and native interop. Verify current Windows model, graphics and native realization before replacing local implementations.
 
 ## Files
 
