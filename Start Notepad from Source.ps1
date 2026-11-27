@@ -14,6 +14,7 @@ param(
     [string]$DetachedSession,
     [switch]$VerifyModel,
     [switch]$VerifyGraphics,
+    [switch]$VerifyWindow,
     [switch]$Compare,
     [switch]$VerifyNativeFeatures,
     [string]$UIAutomationTestDataDirectory

@@ -63,7 +63,9 @@ class NotepadTab {
         if ($start -ge $head.Length) { return $this.Title }
         $end = $head.IndexOf([char]10, $start)
         if ($end -lt 0) { $end = $head.Length }
-        return $head.Substring($start, [Math]::Min($end - $start, 40)).TrimEnd()
+        $captionText=$head.Substring($start,$end-$start)
+        if($this.Markdown){$captionText=[NotepadInlineLine]::Map($captionText).Text}
+        return $captionText.Substring(0,[Math]::Min($captionText.Length,40)).TrimEnd()
     }
 }
 
@@ -83,6 +85,8 @@ class NotepadFind {
     # search needs them, so typing never searches the whole document.
     [bool]$Open = $false
     [bool]$Stale = $false
+    [int]$DocumentId
+    [long]$Revision
 }
 
 class NotepadModelState {
@@ -320,6 +324,8 @@ class NotepadModel {
         $find.Matches = [NotepadMatch[]]::new(0)
         $find.Index = -1
         $find.Stale = $false
+        $find.DocumentId = $tab.Id
+        $find.Revision = $tab.Revision
         if (-not $find.Query) { return }
         $comparison = [StringComparison]::OrdinalIgnoreCase
         if ($find.MatchCase) { $comparison = [StringComparison]::Ordinal }
@@ -345,7 +351,8 @@ class NotepadModel {
     [void] SelectMatch() { $this.SelectMatch(0) }
     [void] SelectMatch([int]$Step) {
         $find = $this.modelState.Find
-        if ($find.Stale -or -not $find.Matches.Count) { $this.Find() }
+        $tab=$this.Active()
+        if ($find.Stale -or $find.DocumentId -ne $tab.Id -or $find.Revision -ne $tab.Revision -or -not $find.Matches.Count) { $this.Find() }
         if (-not $find.Matches.Count) { return }
         $next = $find.Index + $Step
         if ($find.Wrap) { $next = ($next + $find.Matches.Count) % $find.Matches.Count }
@@ -359,17 +366,30 @@ class NotepadModel {
     [void] Replace([bool]$All) {
         $find = $this.modelState.Find
         if (-not $find.Query) { return }
+        $tab = $this.Active()
+        if ($All -or $find.Stale -or $find.DocumentId -ne $tab.Id -or $find.Revision -ne $tab.Revision) { $this.Find() }
+        if (!$find.Matches.Count) { return }
         if ($All) {
-            $this.Find()
-            $tab = $this.Active()
-            $text = $tab.Content()
+            $replacement=$find.Replacement.Replace([string]([char]13)+[char]10,[string][char]10).Replace([char]13,[char]10)
+            $anchor=$tab.Anchor;$focus=$tab.Focus
+            $tab.Document.BeginGroup()
             for ($i = $find.Matches.Count - 1; $i -ge 0; $i--) {
                 $m = $find.Matches[$i]
-                $text = $text.Substring(0, $m.Start) + $find.Replacement + $text.Substring($m.End)
+                $removed=$m.End-$m.Start
+                $delta=$replacement.Length-$removed
+                $tab.Document.Replace($m.Start,$removed,$replacement)
+                if($anchor -ge $m.End){$anchor+=$delta}
+                elseif($anchor -gt $m.Start){$anchor=$m.Start+[Math]::Min($anchor-$m.Start,$replacement.Length)}
+                if($focus -ge $m.End){$focus+=$delta}
+                elseif($focus -gt $m.Start){$focus=$m.Start+[Math]::Min($focus-$m.Start,$replacement.Length)}
             }
-            if ($find.Matches.Count) { $this.Select(0, $tab.Document.Length); $this.Insert($text) }
+            $this.Select($anchor,$focus)
+            $tab.LastEdit=[DateTime]::MinValue
+            $tab.Revision++
+            $tab.RefreshModified()
+            $this.RefreshFind()
         }
-        elseif ($find.Matches.Count) {
+        else {
             $m = $find.Matches[$find.Index]
             $this.Select($m.Start, $m.End)
             $this.Insert($find.Replacement)
@@ -556,6 +576,27 @@ $testDirectory=Join-Path ([IO.Path]::GetTempPath()) ('notepad-model-'+[Guid]::Ne
 New-Item -ItemType Directory -Path $testDirectory|Out-Null
 try{
     $defaults=Invoke-Model
+    $captionModel=Invoke-Model
+    $captionTab=$captionModel.NewTab('Untitled','**_~~Hello~~_**',$null,$true)
+    Assert ($captionTab.Caption() -ceq 'Hello' -and $captionTab.Content() -ceq '**_~~Hello~~_**') 'Markdown caption leaked serialization delimiters or changed the source.'
+    $malformed='**unclosed'+[char]10+'plain ~~tail'
+    $malformedBlock=[NotepadInlineLine]::MapBlock($malformed)
+    Assert ($malformedBlock.Text -ceq $malformed) 'Unmatched Markdown delimiters were hidden.'
+    $mixedText='abc'+[char]10+'def'
+    $mixedFlags=[int[]]@(1,3,7,0,4,6,2)
+    $serialized=[NotepadInlineLine]::SerializeBlock($mixedText,$mixedFlags)
+    Assert ([NotepadInlineLine]::MapBlock($serialized).Matches($mixedText,$mixedFlags)) 'Overlapping inline styles did not round-trip across lines.'
+    $escapedRow=[NotepadTableRow]::Parse('| a\|b |  |')
+    $escapedCell=$escapedRow.Cell(0)
+    Assert ($escapedRow.Pipes.Length -eq 3 -and $escapedCell.Text -ceq ' a|b ' -and $escapedRow.Cell(1).Text -ceq '  ') 'Escaped pipes or empty cells changed the table shape.'
+    Assert ($escapedCell.SourceAtVisible[2] -eq 2 -and $escapedCell.VisibleAtSource[3] -eq 2 -and $escapedCell.VisibleAtSource[4] -eq 3) 'An escaped pipe does not have a stable source/visible caret mapping.'
+    $alignment=[NotepadTableView]::Resolve([string[]]@('| header | longer |','| :---: | ---: |','| a | b |'),0)
+    $alignedRow=[NotepadTableRow]::Parse('| a | b |')
+    $alignedText=$alignedRow.Project($alignment.Widths,$alignment.Alignment,$false).Text
+    Assert ($alignment.Alignment[0] -eq 1 -and $alignment.Alignment[1] -eq 2 -and $alignedText -match '^│ +a +│ +b │$') 'Table alignment markers did not position cells.'
+    Assert ($null -eq [NotepadTableView]::Resolve([string[]]@('| a | b |','| --- | --- |','| uneven |'),0)) 'An uneven table was partially projected.'
+    $oversize=[string[]](@('| head |','| --- |')+@('| cell |')*127)
+    Assert ($null -eq [NotepadTableView]::Resolve($oversize,0)) 'An oversized table was partially projected.'
     $newDocument=$defaults.NewTab()
     Assert ($newDocument.LineEnding -eq 'Windows (CRLF)') 'New document did not default to Windows CRLF.'
     $defaults.Insert("first`nsecond",$false)
@@ -586,6 +627,18 @@ try{
     $state.Find.MatchCase=$true;$model.Find();Assert ($state.Find.Matches.Count -eq 2) 'Case-sensitive find mismatch.'
     $model.Replace($true)
     Assert ($second.Content() -ceq '$literal ONE $literal') 'Literal replace-all mismatch.'
+    $model.Undo($false)
+    Assert ($second.Content() -ceq 'one ONE one') 'Replace All did not undo as a single edit.'
+    $model.Undo($true)
+    Assert ($second.Content() -ceq '$literal ONE $literal') 'Replace All redo did not restore all replacements.'
+    $matchModel=Invoke-Model
+    $null=$matchModel.NewTab('old','one here',$null,$false)
+    $matchModel.State().Find.Query='one'
+    $matchModel.State().Find.Replacement='new'
+    $matchModel.Find()
+    $different=$matchModel.NewTab('different','fresh one',$null,$false)
+    $matchModel.Replace($false)
+    Assert ($different.Content() -ceq 'fresh new') 'Replace reused offsets from a different document.'
     $model.Select(0,$second.Length());$model.Insert("α`nβ",$false);$second.LineEnding='Windows (CRLF)';$second.Bom=$true
     $secondPath=Join-Path $testDirectory 'second.txt';$null=$model.Save($second.Id,$secondPath)
     $bytes=[IO.File]::ReadAllBytes($secondPath)
@@ -792,6 +845,7 @@ $Native
 # Folded from src\Window.Windows.ps1
 class NotepadWindowEvent {
     [string]$Kind
+    [string[]]$Paths
     [uint]$Message
     [long]$W
     [long]$L
@@ -988,6 +1042,8 @@ class NotepadWindow {
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
     static [int] GetSystemMetrics([int]$index) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [uint] GetDoubleClickTime() { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
     static [int] SetForegroundWindow([IntPtr]$hwnd) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('shell32.dll')]
     static [int] SHGetStockIconInfo([int]$id, [uint]$flags, [IntPtr]$info) { throw 'native' }
@@ -1015,6 +1071,12 @@ class NotepadWindow {
     static [IntPtr] DispatchMessageW([IntPtr]$message) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
     static [int] IsZoomed([IntPtr]$hwnd) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('shell32.dll')]
+    static [void] DragAcceptFiles([IntPtr]$hwnd,[int]$accept) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('shell32.dll')]
+    static [uint] DragQueryFileW([IntPtr]$drop,[uint]$index,[IntPtr]$path,[uint]$capacity) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('shell32.dll')]
+    static [void] DragFinish([IntPtr]$drop) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
     static [int] DestroyWindow([IntPtr]$hwnd) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
@@ -1170,11 +1232,12 @@ class NotepadWindow {
             [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 40, $this.arrow)
             [Runtime.InteropServices.Marshal]::WriteIntPtr($class, 64, $this.classPtr)
             if ([NotepadWindow]::RegisterClassExW($class) -eq 0) { throw 'RegisterClassExW failed' }
-            # Keep WS_THICKFRAME for resizing and omit WS_SYSMENU and the native caption buttons.
-            $this.hwnd = [NotepadWindow]::CreateWindowExW([uint]0x40000, $this.classPtr, $titlePtr, [uint]0x00040000L, 100, 80, [Math]::Max(768, $this.requestedWidth), [Math]::Max(478, $this.requestedHeight), [IntPtr]::Zero, [IntPtr]::Zero, $this.hmodule, [IntPtr]::Zero)
+            # Keep resizing and the maximize hit target without enabling DWM's duplicate system buttons.
+            $this.hwnd = [NotepadWindow]::CreateWindowExW([uint]0x40000, $this.classPtr, $titlePtr, [uint]0x00050000L, 100, 80, [Math]::Max(768, $this.requestedWidth), [Math]::Max(478, $this.requestedHeight), [IntPtr]::Zero, [IntPtr]::Zero, $this.hmodule, [IntPtr]::Zero)
         }
         finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($class); [Runtime.InteropServices.Marshal]::FreeHGlobal($titlePtr) }
         if ($this.hwnd -eq [IntPtr]::Zero) { throw 'CreateWindowExW failed' }
+        [NotepadWindow]::DragAcceptFiles($this.hwnd,1)
     }
 
     hidden [uint] Pump() {
@@ -1210,6 +1273,26 @@ class NotepadWindow {
                 $this.events.Enqueue($event)
                 return [IntPtr]::Zero
             }
+            if($Message -eq 0x0233){
+                try{
+                    $files=[Collections.Generic.List[string]]::new()
+                    $count=[NotepadWindow]::DragQueryFileW($WParam,[uint]::MaxValue,[IntPtr]::Zero,0)
+                    for([uint]$index=0;$index -lt $count;$index++){
+                        $length=[NotepadWindow]::DragQueryFileW($WParam,$index,[IntPtr]::Zero,0)
+                        if($length -eq 0){continue}
+                        $pathBuffer=[Runtime.InteropServices.Marshal]::AllocHGlobal([int](($length+1)*2))
+                        try{
+                            if([NotepadWindow]::DragQueryFileW($WParam,$index,$pathBuffer,$length+1) -eq $length){
+                                $files.Add([Runtime.InteropServices.Marshal]::PtrToStringUni($pathBuffer))
+                            }
+                        }finally{[Runtime.InteropServices.Marshal]::FreeHGlobal($pathBuffer)}
+                    }
+                    $event=[NotepadWindowEvent]::new()
+                    $event.Kind='dropFiles';$event.Paths=$files.ToArray()
+                    $this.events.Enqueue($event)
+                }finally{[NotepadWindow]::DragFinish($WParam)}
+                return [IntPtr]::Zero
+            }
             if ($Message -eq 0x0083) { return [IntPtr]::Zero } # WM_NCCALCSIZE: full client chrome.
             if ($Message -eq 0x001A) { $this.Enqueue('settingChange') } # WM_SETTINGCHANGE: text size or theme may have changed.
             if ($Message -eq 0x0014) { return [IntPtr]1 } # suppress GDI background erase.
@@ -1238,18 +1321,33 @@ class NotepadWindow {
                 if ($screenY -ge 32768) { $screenY -= 65536 }
                 $left = [Runtime.InteropServices.Marshal]::ReadInt32($this.procedureScratch); $top = [Runtime.InteropServices.Marshal]::ReadInt32($this.procedureScratch, 4)
                 $right = [Runtime.InteropServices.Marshal]::ReadInt32($this.procedureScratch, 8); $bottom = [Runtime.InteropServices.Marshal]::ReadInt32($this.procedureScratch, 12)
-                $border = [Math]::Max(4.0, 6.0 * [double][NotepadWindow]::GetDpiForWindow($Handle) / 96.0)
+                $scale = [double][NotepadWindow]::GetDpiForWindow($Handle) / 96.0
+                $border = [Math]::Max(4.0, 6.0 * $scale)
+                $zoomed = [NotepadWindow]::IsZoomed($Handle) -ne 0
                 $l = $screenX -lt $left + $border; $r = $screenX -ge $right - $border; $t = $screenY -lt $top + $border; $b = $screenY -ge $bottom - $border
-                if ($t -and $l) { return [IntPtr]13 }
-                if ($t -and $r) { return [IntPtr]14 }
-                if ($b -and $l) { return [IntPtr]16 }
-                if ($b -and $r) { return [IntPtr]17 }
-                if ($l) { return [IntPtr]10 }
-                if ($r) { return [IntPtr]11 }
-                if ($t) { return [IntPtr]12 }
-                if ($b) { return [IntPtr]15 }
+                if (!$zoomed) {
+                    if ($t -and $l) { return [IntPtr]13 }
+                    if ($t -and $r) { return [IntPtr]14 }
+                    if ($b -and $l) { return [IntPtr]16 }
+                    if ($b -and $r) { return [IntPtr]17 }
+                    if ($l) { return [IntPtr]10 }
+                    if ($r) { return [IntPtr]11 }
+                    if ($t) { return [IntPtr]12 }
+                    if ($b) { return [IntPtr]15 }
+                }
+                [Runtime.InteropServices.Marshal]::WriteInt32($this.procedureScratch,16,$screenX)
+                [Runtime.InteropServices.Marshal]::WriteInt32($this.procedureScratch,20,$screenY)
+                $point=[IntPtr]::Add($this.procedureScratch,16)
+                if([NotepadWindow]::GetClientRect($Handle,$this.procedureScratch) -ne 0 -and [NotepadWindow]::ScreenToClient($Handle,$point) -ne 0){
+                    $clientX=[Runtime.InteropServices.Marshal]::ReadInt32($point)/$scale
+                    $clientY=[Runtime.InteropServices.Marshal]::ReadInt32($point,4)/$scale
+                    $width=[Runtime.InteropServices.Marshal]::ReadInt32($this.procedureScratch,8)/$scale
+                    if($clientY -ge 0 -and $clientY -lt 40 -and $clientX -ge $width-92 -and $clientX -lt $width-46){return [IntPtr]9}
+                }
                 return [IntPtr]1
             }
+            if($Message -eq 0x00A0 -and $WParam.ToInt64() -eq 9){$this.Enqueue('maximizeHover')}
+            if($Message -eq 0x02A2){$this.Enqueue('captionLeave')}
             if ($Message -eq 0x02E0) {
                 # WM_DPICHANGED lParam points to an ephemeral suggested RECT. A saved placement was measured at its
                 # own monitor's DPI, so while Place puts it back the suggested (rescaled) rectangle is not taken.
@@ -1259,7 +1357,7 @@ class NotepadWindow {
                 $null = [NotepadWindow]::SetWindowPos($Handle, [IntPtr]::Zero, $x, $y, $w, $h, [uint]0x14)
                 $this.Enqueue('resize'); return [IntPtr]::Zero
             }
-            if ($Message -eq 0x0200 -or $Message -eq 0x0201 -or $Message -eq 0x0202 -or $Message -eq 0x0203 -or $Message -eq 0x0204 -or $Message -eq 0x0205 -or $Message -eq 0x020A -or $Message -eq 0x0100 -or $Message -eq 0x0102 -or $Message -eq 0x0104) {
+            if ($Message -eq 0x0200 -or $Message -eq 0x0201 -or $Message -eq 0x0202 -or $Message -eq 0x0203 -or $Message -eq 0x0204 -or $Message -eq 0x0205 -or $Message -eq 0x0208 -or $Message -eq 0x020A -or $Message -eq 0x0100 -or $Message -eq 0x0102 -or $Message -eq 0x0104) {
                 $event = [NotepadWindowEvent]::new()
                 $event.Kind = 'input'; $event.Message = $Message; $event.W = $WParam.ToInt64(); $event.L = $LParam.ToInt64()
                 $event.Ctrl = ([NotepadWindow]::GetKeyState(0x11) -band 0x8000) -ne 0
@@ -1628,9 +1726,17 @@ class Win32Clipboard {
     [System.Runtime.InteropServices.LibraryImport('kernel32.dll')]
     static [IntPtr] GlobalFree([IntPtr]$memory) { throw 'native' }
 
+    hidden static [void] OpenWithRetry([IntPtr]$Owner) {
+        for($attempt=0;$attempt -lt 5;$attempt++){
+            if([Win32Clipboard]::OpenClipboard($Owner) -ne 0){return}
+            if($attempt -lt 4){[Threading.Thread]::Sleep(4)}
+        }
+        throw [InvalidOperationException]::new('Clipboard is busy')
+    }
+
     # The clipboard's text; '' when it holds none.
     static [string] ReadText([IntPtr]$Owner) {
-        if ([Win32Clipboard]::OpenClipboard($Owner) -eq 0) { throw [InvalidOperationException]::new('Clipboard is busy') }
+        [Win32Clipboard]::OpenWithRetry($Owner)
         try {
             # CF_UNICODETEXT is 13.
             $handle = [Win32Clipboard]::GetClipboardData([uint]13)
@@ -1684,7 +1790,7 @@ class Win32Clipboard {
     hidden static [void] Transfer([IntPtr]$Owner, [uint]$Format, [IntPtr]$Handle) {
         [bool]$owned = $true
         try {
-            if ([Win32Clipboard]::OpenClipboard($Owner) -eq 0) { throw [InvalidOperationException]::new('Clipboard is busy') }
+            [Win32Clipboard]::OpenWithRetry($Owner)
             try {
                 if ([Win32Clipboard]::EmptyClipboard() -eq 0) { throw [InvalidOperationException]::new('Cannot clear clipboard') }
                 if ([Win32Clipboard]::SetClipboardData($Format, $Handle) -eq [IntPtr]::Zero) { throw [InvalidOperationException]::new('Clipboard transfer failed') }
@@ -1964,6 +2070,12 @@ class NotepadIcons {
 # Direct2D and DirectWrite through their COM interfaces: slots checked against Windows SDK 10.0.26100.0. Each COM
 # method is a pointer stub called with the slot's address and the object; each export is a library import. Every COM
 # object and temporary allocation has an explicit owner.
+class NotepadSpellingSpan {
+    [uint]$Start
+    [uint]$Length
+    NotepadSpellingSpan([uint]$Start,[uint]$Length){$this.Start=$Start;$this.Length=$Length}
+}
+
 class NotepadGraphics {
     hidden [IntPtr]$scratch
     hidden [Collections.Generic.Dictionary[string,IntPtr]]$brushes = [Collections.Generic.Dictionary[string,IntPtr]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -1976,6 +2088,8 @@ class NotepadGraphics {
     hidden [IntPtr]$writeFactory
     hidden [IntPtr]$target
     hidden [IntPtr]$wicFactory
+    hidden [IntPtr]$spellChecker
+    hidden [bool]$spellUnavailable
     hidden [bool]$curved = $true
 
     [System.Runtime.InteropServices.LibraryImport('d2d1.dll')]
@@ -2078,6 +2192,12 @@ class NotepadGraphics {
     static [int] HitTestTextPosition([IntPtr]$method, [IntPtr]$object, [uint]$position, [int]$trailing, [IntPtr]$x, [IntPtr]$y, [IntPtr]$metrics) { throw 'native' }
     [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
     static [int] HitTestTextRange([IntPtr]$method, [IntPtr]$object, [uint]$start, [uint]$length, [single]$x, [single]$y, [IntPtr]$metrics, [uint]$capacity, [IntPtr]$count) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] SetDrawingEffect([IntPtr]$method, [IntPtr]$object, [IntPtr]$effect, [ulong]$range) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] GetLayoutRangeValue([IntPtr]$method, [IntPtr]$object, [uint]$position, [IntPtr]$value, [IntPtr]$range) { throw 'native' }
+    [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
+    static [int] SetLayoutRangeInteger([IntPtr]$method, [IntPtr]$object, [int]$value, [ulong]$range) { throw 'native' }
     # IWICImagingFactory, IWICFormatConverter
     [System.Runtime.InteropServices.UnmanagedCallConv(CallConvs = [System.Runtime.CompilerServices.CallConvStdcall])]
     static [int] CreateFormatConverter([IntPtr]$method, [IntPtr]$object, [IntPtr]$converter) { throw 'native' }
@@ -2242,6 +2362,49 @@ class NotepadGraphics {
         $this.Guid('ec5ec8a9-c395-4314-9c77-54d7a935ff70', 16)
         [NotepadGraphics]::Check([NotepadGraphics]::CoCreateInstance($this.scratch, [IntPtr]::Zero, [uint]1, [IntPtr]::Add($this.scratch, 16), [IntPtr]::Add($this.scratch, 40)))
         $this.wicFactory = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch, 40)
+    }
+    [bool] OpenSpelling([string]$Language) {
+        if($this.spellChecker -ne [IntPtr]::Zero){return $true}
+        if($this.spellUnavailable -or !$Language){return $false}
+        $spellFactory=[IntPtr]::Zero
+        $name=[Runtime.InteropServices.Marshal]::StringToHGlobalUni($Language)
+        try{
+            $this.Guid('7ab36653-1796-484b-bdfa-e74f1db7c1dc',0)
+            $this.Guid('8e018a9d-2415-4677-bf08-794ea61f94bb',16)
+            $out=[IntPtr]::Add($this.scratch,32)
+            [NotepadGraphics]::Check([NotepadGraphics]::CoCreateInstance($this.scratch,[IntPtr]::Zero,[uint]1,[IntPtr]::Add($this.scratch,16),$out))
+            $spellFactory=[Runtime.InteropServices.Marshal]::ReadIntPtr($out)
+            [NotepadGraphics]::Check([NotepadGraphics]::ComTwoPointers([NotepadGraphics]::Slot($spellFactory,4),$spellFactory,$name,$out))
+            if([Runtime.InteropServices.Marshal]::ReadInt32($out) -eq 0){$this.spellUnavailable=$true;return $false}
+            [NotepadGraphics]::Check([NotepadGraphics]::ComTwoPointers([NotepadGraphics]::Slot($spellFactory,5),$spellFactory,$name,$out))
+            $this.spellChecker=[Runtime.InteropServices.Marshal]::ReadIntPtr($out)
+            return $this.spellChecker -ne [IntPtr]::Zero
+        }catch{$this.spellUnavailable=$true;return $false}
+        finally{[NotepadGraphics]::ReleaseCom($spellFactory);[Runtime.InteropServices.Marshal]::FreeHGlobal($name)}
+    }
+    [NotepadSpellingSpan[]] CheckSpelling([string]$Text) {
+        $spans=[Collections.Generic.List[NotepadSpellingSpan]]::new()
+        $textPointer=[Runtime.InteropServices.Marshal]::StringToHGlobalUni($Text)
+        $errors=[IntPtr]::Zero
+        try{
+            [NotepadGraphics]::Check([NotepadGraphics]::ComTwoPointers([NotepadGraphics]::Slot($this.spellChecker,4),$this.spellChecker,$textPointer,$this.scratch))
+            $errors=[Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch)
+            while($errors -ne [IntPtr]::Zero){
+                $next=[NotepadGraphics]::ShellLinkString([NotepadGraphics]::Slot($errors,3),$errors,$this.scratch)
+                if($next -eq 1){break}
+                [NotepadGraphics]::Check($next)
+                $item=[Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch)
+                if($item -eq [IntPtr]::Zero){break}
+                try{
+                    [NotepadGraphics]::Check([NotepadGraphics]::ShellLinkString([NotepadGraphics]::Slot($item,3),$item,$this.scratch))
+                    $start=[Runtime.InteropServices.Marshal]::ReadInt32($this.scratch)
+                    [NotepadGraphics]::Check([NotepadGraphics]::ShellLinkString([NotepadGraphics]::Slot($item,4),$item,$this.scratch))
+                    $length=[Runtime.InteropServices.Marshal]::ReadInt32($this.scratch)
+                    if($start -ge 0 -and $length -gt 0 -and $start -le $Text.Length-$length){$spans.Add([NotepadSpellingSpan]::new([uint]$start,[uint]$length))}
+                }finally{[NotepadGraphics]::ReleaseCom($item)}
+            }
+        }finally{[NotepadGraphics]::ReleaseCom($errors);[Runtime.InteropServices.Marshal]::FreeHGlobal($textPointer)}
+        return $spans.ToArray()
     }
     [void] ExportIcon([IntPtr]$Handle, [string]$Path) {
         $this.EnsureWicFactory()
@@ -2425,6 +2588,34 @@ class NotepadGraphics {
         $brush = $this.Brush($Color)
         [NotepadGraphics]::DrawTextLayout([NotepadGraphics]::Slot($this.target, 28), $this.target, [NotepadGraphics]::Point($X, $Y), $Layout, $brush, 4)
     }
+    [void] SetLayoutColor([IntPtr]$Layout, [uint]$Start, [uint]$Length, [string]$Color) {
+        $range = ([ulong]$Length -shl 32) -bor [ulong]$Start
+        $brush = $this.Brush($Color)
+        [NotepadGraphics]::Check([NotepadGraphics]::SetDrawingEffect([NotepadGraphics]::Slot($Layout, 38), $Layout, $brush, $range))
+    }
+    [bool] HasLayoutColor([IntPtr]$Layout, [uint]$Position) {
+        [NotepadGraphics]::Check([NotepadGraphics]::GetLayoutRangeValue([NotepadGraphics]::Slot($Layout, 53), $Layout, $Position, $this.scratch, [IntPtr]::Zero))
+        $effect = [Runtime.InteropServices.Marshal]::ReadIntPtr($this.scratch)
+        [NotepadGraphics]::ReleaseCom($effect)
+        return $effect -ne [IntPtr]::Zero
+    }
+    [void] SetInlineFormat([IntPtr]$Layout,[uint]$Start,[uint]$Length,[bool]$Bold,[bool]$Italic,[bool]$Strike){
+        $range=([ulong]$Length -shl 32) -bor [ulong]$Start
+        $weight=if($Bold){700}else{400}
+        $style=if($Italic){2}else{0}
+        [NotepadGraphics]::Check([NotepadGraphics]::SetLayoutRangeInteger([NotepadGraphics]::Slot($Layout,32),$Layout,$weight,$range))
+        [NotepadGraphics]::Check([NotepadGraphics]::SetLayoutRangeInteger([NotepadGraphics]::Slot($Layout,33),$Layout,$style,$range))
+        [NotepadGraphics]::Check([NotepadGraphics]::SetLayoutRangeInteger([NotepadGraphics]::Slot($Layout,37),$Layout,[int]$Strike,$range))
+    }
+    [int] InlineFormat([IntPtr]$Layout,[uint]$Position){
+        [NotepadGraphics]::Check([NotepadGraphics]::GetLayoutRangeValue([NotepadGraphics]::Slot($Layout,47),$Layout,$Position,$this.scratch,[IntPtr]::Zero))
+        $weight=[Runtime.InteropServices.Marshal]::ReadInt32($this.scratch)
+        [NotepadGraphics]::Check([NotepadGraphics]::GetLayoutRangeValue([NotepadGraphics]::Slot($Layout,48),$Layout,$Position,$this.scratch,[IntPtr]::Zero))
+        $style=[Runtime.InteropServices.Marshal]::ReadInt32($this.scratch)
+        [NotepadGraphics]::Check([NotepadGraphics]::GetLayoutRangeValue([NotepadGraphics]::Slot($Layout,52),$Layout,$Position,$this.scratch,[IntPtr]::Zero))
+        $strike=[Runtime.InteropServices.Marshal]::ReadInt32($this.scratch)
+        return [int]($weight -ge 700) -bor ([int]($style -eq 2) -shl 1) -bor ([int]($strike -ne 0) -shl 2)
+    }
     [NotepadTextMetrics] Metrics([IntPtr]$Layout) {
         [NotepadGraphics]::Check([NotepadGraphics]::GetMetrics([NotepadGraphics]::Slot($Layout, 60), $Layout, $this.scratch))
         $metrics = [NotepadTextMetrics]::new()
@@ -2549,7 +2740,7 @@ class NotepadGraphics {
         foreach ($item in $this.gradientBrushes.Values) { [NotepadGraphics]::ReleaseCom($item) }
         foreach ($item in $this.formats.Values) { [NotepadGraphics]::ReleaseCom($item) }
         foreach ($item in $this.brushes.Values) { [NotepadGraphics]::ReleaseCom($item) }
-        foreach ($item in [IntPtr[]]@($this.target, $this.writeFactory, $this.factory, $this.wicFactory)) { [NotepadGraphics]::ReleaseCom($item) }
+        foreach ($item in [IntPtr[]]@($this.target, $this.writeFactory, $this.factory, $this.wicFactory, $this.spellChecker)) { [NotepadGraphics]::ReleaseCom($item) }
         [Runtime.InteropServices.Marshal]::FreeHGlobal($this.scratch)
     }
 }
@@ -12423,15 +12614,113 @@ try{
     $graphics.Fill((20+$caret.X),(300+$caret.Y),1,$caret.Height,'#0090f1',0)
     $selection=@($graphics.Selection($layout,1,6))
     $hit=$graphics.HitText($layout,$caret.X,$caret.Y)
+    $wrappedText='begin selected text across multiple wrapped rows'
+    $plain=$graphics.Layout($wrappedText,'Consolas',18,110,$true,400,$false,0)
+    $colored=$graphics.Layout($wrappedText,'Consolas',18,110,$true,400,$false,0)
+    try {
+        $graphics.SetLayoutColor($colored,6,28,'#ff8040')
+        if($graphics.HasLayoutColor($colored,5) -or !$graphics.HasLayoutColor($colored,6) -or
+            !$graphics.HasLayoutColor($colored,33) -or $graphics.HasLayoutColor($colored,34) -or
+            $graphics.HasLayoutColor($plain,6)){throw 'Drawing effect range or selection layout mismatch.'}
+        $plainMetrics=$graphics.Metrics($plain)
+        $coloredMetrics=$graphics.Metrics($colored)
+        if($plainMetrics.Lines -lt 2 -or $plainMetrics.Lines -ne $coloredMetrics.Lines -or
+            $plainMetrics.Width -ne $coloredMetrics.Width -or $plainMetrics.Height -ne $coloredMetrics.Height){
+            throw 'Drawing effects changed wrapped layout metrics.'
+        }
+        $plainCaret=$graphics.Caret($plain,8)
+        $coloredCaret=$graphics.Caret($colored,8)
+        if($plainCaret.X -ne $coloredCaret.X -or $plainCaret.Y -ne $coloredCaret.Y -or
+            $graphics.HitText($colored,$coloredCaret.X,$coloredCaret.Y).Position -ne 8){throw 'Drawing effects changed caret hit testing.'}
+        $graphics.DrawLayout($colored,240,300,'#ffffff')
+        $wrappedSelection=$graphics.Selection($colored,10,17)
+        if($wrappedSelection.Count -lt 2){throw 'Expected wrapped selection rectangles.'}
+        foreach($rect in $wrappedSelection){
+            $graphics.Fill((240+$rect.X),(300+$rect.Y),$rect.Width,$rect.Height,'#005b9f',0)
+            $graphics.Clip((240+$rect.X),(300+$rect.Y),$rect.Width,$rect.Height)
+            try{$graphics.DrawLayout($plain,240,300,'#ffffff')}finally{$graphics.Unclip()}
+        }
+    } finally {
+        $graphics.ReleaseLayout($colored)
+        $graphics.ReleaseLayout($plain)
+    }
+    $mapped=[NotepadInlineLine]::Map('**_~~Hello~~_** end')
+    if($mapped.Text -cne 'Hello end' -or $mapped.Styles[0] -ne 7 -or $mapped.Styles[4] -ne 7 -or $mapped.Styles[5] -ne 0 -or
+        $mapped.SourceAtVisible[0] -ne 5 -or $mapped.VisibleAtSource[13] -ne 5){
+        throw 'Markdown projection did not preserve text and nested-style offsets.'
+    }
+    $sample='0123456789012345678901234567890123456789'
+    $inline=$graphics.Layout($sample,'Consolas',19,460,$true,400,$false,0)
+    try{
+        for($mask=0;$mask -lt 8;$mask++){
+            $index=[uint]($mask*4)
+            $graphics.SetInlineFormat($inline,$index,3,($mask -band 1) -ne 0,($mask -band 2) -ne 0,($mask -band 4) -ne 0)
+            if($graphics.InlineFormat($inline,$index) -ne $mask -or $graphics.InlineFormat($inline,$index+3) -ne 0){
+                throw 'DirectWrite inline style combination escaped its range or failed to apply.'
+            }
+        }
+        $graphics.DrawLayout($inline,20,460,'#ffffff')
+        for($bit=1;$bit -le 4;$bit*=2){
+            $remaining=7 -bxor $bit
+            $graphics.SetInlineFormat($inline,28,3,($remaining -band 1) -ne 0,($remaining -band 2) -ne 0,($remaining -band 4) -ne 0)
+            if($graphics.InlineFormat($inline,28) -ne $remaining){throw 'Removing one inline style changed another style.'}
+        }
+    }finally{$graphics.ReleaseLayout($inline)}
     $graphics.End()
     if($metrics.Lines -ne 2){throw 'Text line metrics mismatch'}
     if($hit.Position -ne 5){throw "Caret hit-test round-trip mismatch: $($hit.Position)"}
     if($selection.Count -lt 1){throw 'Missing selection rectangles'}
+    $spelling='unavailable'
+    if($graphics.OpenSpelling('en-US')){
+        $known=$graphics.CheckSpelling('hello world')
+        $misspelled=$graphics.CheckSpelling('hello zzqxvpl')
+        if($known.Length -ne 0 -or $misspelled.Length -ne 1 -or $misspelled[0].Start -ne 6 -or $misspelled[0].Length -ne 7){
+            throw 'Windows spelling provider returned unexpected text ranges.'
+        }
+        $underline=$graphics.Selection($layout,1,3)
+        if($underline.Count -eq 0){throw 'A spelling range could not be mapped to layout geometry.'}
+        $spelling='verified'
+    }
+    $tokens=[Collections.Generic.List[NotepadSourceSpan]]::new()
+    $state=[NotepadCLexer]::Scan('/* a comment',0,$null)
+    $state=[NotepadCLexer]::Scan('continued */ int value = 42;',$state,$tokens)
+    if($state -ne 0 -or $tokens.Count -ne 3 -or $tokens[0].Palette -ne 8 -or $tokens[1].Palette -ne 14 -or $tokens[2].Palette -ne 11){
+        throw 'C lexer did not resume after a multiline comment.'
+    }
+    $tokens.Clear()
+    $state=[NotepadCLexer]::Scan('#define VALUE \',0,$null)
+    $state=[NotepadCLexer]::Scan('identifier',$state,$tokens)
+    if($state -ne 0 -or $tokens.Count -ne 1 -or $tokens[0].Palette -ne 9){throw 'C lexer lost continued directive state.'}
+    $tokens.Clear()
+    $state=[NotepadCLexer]::Scan('"/* string, not comment */" // comment',0,$tokens)
+    if($state -ne 0 -or $tokens.Count -ne 2 -or $tokens[0].Palette -ne 10 -or $tokens[1].Palette -ne 8){
+        throw 'C lexer misclassified a quoted comment delimiter.'
+    }
+    foreach($opening in @('@"',"@'")){
+        $tokens.Clear()
+        $state=[NotepadPowerShellLexer]::Scan(('$value = '+$opening),0,$null)
+        $bodyState=[NotepadPowerShellLexer]::Scan('<# stays inside the here-string',$state,$tokens)
+        if($state -lt 2 -or $state -gt 3 -or $bodyState -ne $state -or $tokens.Count -ne 1 -or $tokens[0].Palette -ne 10){
+            throw 'PowerShell lexer lost here-string state.'
+        }
+        $closing=[string]$opening[1]+'@'
+        $tokens.Clear()
+        $state=[NotepadPowerShellLexer]::Scan(($closing+'; return $script:value'),$bodyState,$tokens)
+        if($state -ne 0 -or $tokens.Count -ne 3 -or $tokens[1].Palette -ne 13 -or $tokens[2].Palette -ne 12){
+            throw 'PowerShell lexer did not resume after a here-string.'
+        }
+    }
+    $tokens.Clear()
+    $state=[NotepadPowerShellLexer]::Scan('<# opening comment',0,$null)
+    $state=[NotepadPowerShellLexer]::Scan('comment #> if ($x -eq 42) {}',$state,$tokens)
+    if($state -ne 0 -or $tokens.Count -ne 5 -or $tokens[0].Palette -ne 8 -or $tokens[3].Palette -ne 14){
+        throw 'PowerShell lexer did not resume after a block comment.'
+    }
     $null=[IO.Directory]::CreateDirectory([IO.Path]::Join($root,'artifacts'))
-    @{Metrics=$metrics;Caret=$caret;Hit=$hit;Selection=$selection;IconCount=$i}|ConvertTo-Json -Depth 8|Set-Content "$root\artifacts\graphics-smoke.json"
+    @{Metrics=$metrics;Caret=$caret;Hit=$hit;Selection=$selection;IconCount=$i;Spelling=$spelling;DrawingEffect=@{Start=6;Length=28;WrappedLines=$coloredMetrics.Lines;SelectionFragments=$wrappedSelection.Count}}|ConvertTo-Json -Depth 8|Set-Content "$root\artifacts\graphics-smoke.json"
     $until=[DateTime]::UtcNow.AddSeconds($Seconds)
     while([DateTime]::UtcNow -lt $until){$null=@($window.Drain());Start-Sleep -Milliseconds 15}
-    'PASS: native window, Direct2D, DirectWrite, vector icons, caret/hit-test and selection.'
+    'PASS: native window, Direct2D, DirectWrite range colors, wrapped selection, caret/hit-test, vector icons and C/PowerShell lexer state.'
 }finally{if($graphics){$graphics.Dispose()};if($window){$window.Dispose()};$native.Dispose()}
 }
 
@@ -12523,6 +12812,17 @@ try{
             $rect=Rect $hwnd;$x=$rect[2]-[int](69*$scale);$top=$rect[1]+[int](20*$scale)
             $hit=$send.DynamicInvoke($hwnd,[uint32]0x84,[IntPtr]::Zero,[IntPtr](($top -shl 16) -bor ($x -band 0xffff))).ToInt64()
             Record 'maximize button hit test (Snap Layouts)' 9 $hit ($hit -eq 9)
+            $sampleW=[int](240*$scale);$sampleH=[int](120*$scale)
+            $sampleX=$rect[2]-$sampleW;$sampleY=$rect[1]+[int](48*$scale)
+            $null=$setCursor.DynamicInvoke($rect[0]+[int](150*$scale),$top)
+            Start-Sleep -Milliseconds 550
+            $beforeHover=Pixels $sampleX $sampleY $sampleW $sampleH
+            $null=$setCursor.DynamicInvoke($x,$top)
+            Start-Sleep -Milliseconds 1100
+            $hoverChange=Difference $beforeHover (Pixels $sampleX $sampleY $sampleW $sampleH)
+            Record 'maximize hover opens a flyout below the caption' '> 2 mean pixel-byte difference' $hoverChange ($hoverChange -gt 2)
+            $null=$setCursor.DynamicInvoke($rect[0]+[int](150*$scale),$top)
+            Start-Sleep -Milliseconds 350
             # Maximize fills the work area; restore returns the window.
             $before=Rect $hwnd
             $null=$show.DynamicInvoke($hwnd,3);Start-Sleep -Milliseconds 600
@@ -13632,12 +13932,13 @@ if ($VerifyNativeFeatures) {
     # Tests use a fresh clone and retained hit rectangles, without touching the user's running editor.
     $livePath=Join-Path $UIAutomationTestDataDirectory 'native-feature-replay-live.json'
     if(Test-Path $livePath){Remove-Item -LiteralPath $livePath}
-    $nativeReplay=Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -ArgumentList @('-NoProfile','-STA','-File',('"'+(Join-Path $PSScriptRoot 'Start Notepad from Source.ps1')+'"'),'-NoSession','-Width','1000','-Height','720','-RunSeconds','120','-DiagnosticPath',('"'+$livePath+'"')) -WindowStyle Hidden -PassThru
+    $startupErrors=Join-Path $UIAutomationTestDataDirectory 'native-feature-startup.stderr.log'
+    $nativeReplay=Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -ArgumentList @('-NoProfile','-STA','-File',('"'+(Join-Path $PSScriptRoot 'Start Notepad from Source.ps1')+'"'),'-NoSession','-Width','1000','-Height','720','-RunSeconds','120','-DiagnosticPath',('"'+$livePath+'"')) -WindowStyle Hidden -RedirectStandardError $startupErrors -PassThru
     $replayStates=[Collections.Generic.List[object]]::new();$replayChecks=[Collections.Generic.List[object]]::new()
     $replayRoot=[IntPtr]::Zero;$replayWalker=[IntPtr]::Zero;$replayUia=[IntPtr]::Zero;$replayUnknown=[IntPtr]::Zero
     try {
-        for($i=0;$i -lt 100 -and -not(Test-Path $livePath);$i++){Start-Sleep -Milliseconds 100}
-        if(-not(Test-Path $livePath)){throw 'The native feature replay did not expose its diagnostic state.'}
+        for($i=0;$i -lt 300 -and !$nativeReplay.HasExited -and -not(Test-Path $livePath);$i++){Start-Sleep -Milliseconds 100}
+        if(-not(Test-Path $livePath)){throw ('The native feature replay did not expose its diagnostic state. '+(Get-Content -LiteralPath $startupErrors -Raw))}
         # Do not query UIA while the HWND is still moving outside the virtual desktop.
         for($i=0;$i -lt 100;$i++){if((Get-Content -LiteralPath $livePath -Raw|ConvertFrom-Json).EntranceStatus -eq 'Completed'){break};Start-Sleep -Milliseconds 40}
         $replayHandle=Get-NativeAppWindowHandle $nativeReplay.Id
@@ -13658,7 +13959,8 @@ if ($VerifyNativeFeatures) {
                 $nodes=@($before.Nodes | Where-Object { $_.Id -eq $Id -and (-not $Value -or $_.Data.Value -eq $Value) })
                 if($nodes.Count -ne 1){throw "Replay hit '$Id' was not unique."}
                 $r=$nodes[0].Rect
-                if(-not $before.SettingsOpen -or ($r[1] -ge 40 -and $r[1]+$r[3] -le $before.Height-10)){break}
+                if(-not $before.SettingsOpen -or $Id -eq 'settings-btn-back' -or
+                    ($r[1] -ge 40 -and $r[1]+$r[3] -le $before.Height-10)){break}
                 $delta=if($r[1] -lt 40){120}else{-120}
                 $null=$send.DynamicInvoke([object[]]@($replayHandle,[uint32]0x20A,[IntPtr]($delta -shl 16),[IntPtr]::Zero))
                 for($j=0;$j -lt 30;$j++){Start-Sleep -Milliseconds 30;if((Read-Replay).ScrollSequence -gt $before.ScrollSequence){break}}
@@ -13685,7 +13987,7 @@ if ($VerifyNativeFeatures) {
             Capture-Replay ('picker-'+$Role)
             Click-Replay 'picker-input-hex'
             foreach($character in $Hex.ToCharArray()){$null=$send.DynamicInvoke([object[]]@($replayHandle,[uint32]0x102,[IntPtr][int]$character,[IntPtr]::Zero))}
-            for($k=0;$k -lt 60;$k++){Start-Sleep -Milliseconds 30;if((Read-Replay).Settings.colors.$Role -eq $Hex){break}}
+            for($k=0;$k -lt 200;$k++){Start-Sleep -Milliseconds 40;if((Read-Replay).Settings.colors.$Role -eq $Hex){break}}
             $actual=(Read-Replay).Settings.colors.$Role
             $replayChecks.Add([pscustomobject]@{Property=('Canvas color picker '+$Role);Expected=$Hex;Observed=$actual;Verdict=if($actual -eq $Hex){'TRUE'}else{'FALSE'}})
             if($actual -ne $Hex){throw 'The canvas color picker contradicted the requested hex value.'}
@@ -13740,7 +14042,37 @@ if ($VerifyNativeFeatures) {
         $typed=(Read-Replay).Session.Tabs[0].Text
         $replayChecks.Add([pscustomobject]@{Property='Bold toolbar edits document';Expected='**strong**';Observed=$typed;Verdict=if($typed -ceq '**strong**'){'TRUE'}else{'FALSE'}})
         Capture-Replay 'bold'
+        Click-Replay 'format-view'
+        $projection=(Read-Replay).VisibleInlineLines | Where-Object Text -ceq 'strong' | Select-Object -First 1
+        $visibleBold=if($projection){$projection.Text}else{''}
+        $replayChecks.Add([pscustomobject]@{Property='Formatted view draws bold text without delimiters';Expected='strong, bold';Observed=$visibleBold;Verdict=if($projection -and $projection.Styles.Count -eq 6 -and $projection.Styles[0] -eq 1){'TRUE'}else{'FALSE'}})
+        Click-Replay 'format-italic'
+        Click-Replay 'format-strike'
+        $combined=(Read-Replay).VisibleInlineLines | Where-Object Text -ceq 'strong' | Select-Object -First 1
+        $styleMask=if($combined){$combined.Styles[0]}else{-1}
+        $replayChecks.Add([pscustomobject]@{Property='Formatted editing combines all three styles';Expected=7;Observed=$styleMask;Verdict=if($styleMask -eq 7){'TRUE'}else{'FALSE'}})
+        Capture-Replay 'inline-formatted'
+        Click-Replay 'format-italic'
+        $combined=(Read-Replay).VisibleInlineLines | Where-Object Text -ceq 'strong' | Select-Object -First 1
+        $styleMask=if($combined){$combined.Styles[0]}else{-1}
+        $replayChecks.Add([pscustomobject]@{Property='Formatted editing removes italic independently';Expected=5;Observed=$styleMask;Verdict=if($styleMask -eq 5){'TRUE'}else{'FALSE'}})
+        Click-Replay 'format-strike'
+        Click-Replay 'format-view'
+        Click-Replay 'menu-btn-edit'
+        Click-Replay 'flyout-edit-11'
+        Click-Replay 'format-clear'
+        $cleared=(Read-Replay).Session.Tabs[0].Text
+        $replayChecks.Add([pscustomobject]@{Property='Clear formatting preserves selected text';Expected='strong';Observed=$cleared;Verdict=if($cleared -ceq 'strong'){'TRUE'}else{'FALSE'}})
+        Click-Replay 'format-table'
+        Click-Replay 'flyout-table-cell-3-2'
+        $tableText=(Read-Replay).Session.Tabs[0].Text
+        $expectedTable=[string]::Join([string][char]10,[string[]]@('| Column 1 | Column 2 | Column 3 |','| --- | --- | --- |','|  |  |  |'))
+        $replayChecks.Add([pscustomobject]@{Property='Table picker inserts selected dimensions';Expected='3 columns × 2 rows';Observed=$tableText;Verdict=if($tableText -ceq $expectedTable){'TRUE'}else{'FALSE'}})
         Click-Replay 'btn-settings-toggle'
+        $copyModeBefore=(Read-Replay).Settings.copyAsFile
+        Click-Replay 'toggle-setting-copyAsFile'
+        $copyModeAfter=(Read-Replay).Settings.copyAsFile
+        $replayChecks.Add([pscustomobject]@{Property='Whole-document file mode rocker';Expected=!$copyModeBefore;Observed=$copyModeAfter;Verdict=if($copyModeAfter -ne $copyModeBefore){'TRUE'}else{'FALSE'}})
         Click-Replay 'setting-background-opacity' '' 0.54
         $opacity=(Read-Replay).Settings.backgroundOpacity
         $replayChecks.Add([pscustomobject]@{Property='Background opacity slider';Expected=54;Observed=$opacity;Verdict=if($opacity -eq 54){'TRUE'}else{'FALSE'}})
@@ -13760,6 +14092,11 @@ if ($VerifyNativeFeatures) {
         $replayChecks.Add([pscustomobject]@{Property='Reset icon';Expected='default';Observed=$reset;Verdict=if($reset -eq 'default'){'TRUE'}else{'FALSE'}})
         Click-Replay 'header-card-colors-setting'
         Capture-Replay 'color-grid'
+        $grid=Read-Replay
+        $swatches=@($grid.Nodes | Where-Object {$_.Id -match '^(palette-[0-9]+|color-(foreground|tabs|cursor|selectionBackground|topLeft|topRight|bottomLeft|bottomRight|chrome))$'})
+        $scale=$grid.Dpi/96.0
+        $sizes=@($swatches | ForEach-Object {"$([Math]::Round($_.Rect[2]*$scale))x$([Math]::Round($_.Rect[3]*$scale))"} | Sort-Object -Unique)
+        $replayChecks.Add([pscustomobject]@{Property='Color swatches share physical dimensions';Expected='25 equally sized squares';Observed="$($swatches.Count) swatches, $($sizes -join ', ')";Verdict=if($swatches.Count -eq 25 -and $sizes.Count -eq 1){'TRUE'}else{'FALSE'}})
         Choose-ReplayColor 'topLeft' '#1C1B22';Choose-ReplayColor 'topRight' '#3A294D';Choose-ReplayColor 'bottomLeft' '#283647';Choose-ReplayColor 'bottomRight' '#402039'
         Click-Replay 'setting-background-opacity' '' 1.0
         $null=$send.DynamicInvoke([object[]]@($replayHandle,[uint32]0x100,[IntPtr]35,[IntPtr]::Zero))
@@ -13772,11 +14109,103 @@ if ($VerifyNativeFeatures) {
         $gradientImage=$replayStates[$replayStates.Count-1].Image
         $bitmap=[Drawing.Bitmap]::FromFile($gradientImage)
         try{$pixel=$bitmap.GetPixel([int]($bitmap.Width/2),[int]($bitmap.Height/2));$expected=@(48,39,60);$error=[Math]::Max([Math]::Abs($pixel.R-$expected[0]),[Math]::Max([Math]::Abs($pixel.G-$expected[1]),[Math]::Abs($pixel.B-$expected[2])));$replayChecks.Add([pscustomobject]@{Property='Four-corner bilinear center pixel';Expected='RGB 48,39,60 ±2';Observed=($pixel.R.ToString()+','+$pixel.G+','+$pixel.B);Verdict=if($error -le 2){'TRUE'}else{'FALSE'}})}finally{$bitmap.Dispose()}
-        Click-Replay 'btn-settings-toggle'
-        Click-Replay 'toggle-setting-copyAsFile'
-        $d=Read-Replay
-        $replayChecks.Add([pscustomobject]@{Property='Whole-document file mode rocker';Expected=$true;Observed=$d.Settings.copyAsFile;Verdict=if($d.Settings.copyAsFile){'TRUE'}else{'FALSE'}})
-        Click-Replay 'settings-btn-back'
+        Click-Replay 'btn-add-tab'
+        foreach($c in ('**word**'+[char]13+'_tail_').ToCharArray()){
+            $null=$send.DynamicInvoke([object[]]@($replayHandle,[uint32]0x102,[IntPtr][int]$c,[IntPtr]::Zero))
+        }
+        Click-Replay 'format-view'
+        Click-Replay 'menu-btn-edit';Click-Replay 'flyout-edit-11';Click-Replay 'format-strike'
+        $beforeEdit=Read-Replay
+        $originalMarkdown=$beforeEdit.Session.Tabs[-1].Text
+        $lineStyles=@($beforeEdit.VisibleInlineLines | Where-Object Text | ForEach-Object {$_.Styles[0]})
+        $crossStyles=$lineStyles.Count -eq 2 -and $lineStyles[0] -eq 5 -and $lineStyles[1] -eq 6
+        $replayChecks.Add([pscustomobject]@{Property='Cross-line formatting preserves mixed styles';Expected='5,6';Observed=($lineStyles -join ',');Verdict=if($crossStyles){'TRUE'}else{'FALSE'}})
+        $null=$send.DynamicInvoke([object[]]@($replayHandle,[uint32]0x102,[IntPtr][int][char]'X',[IntPtr]::Zero))
+        for($j=0;$j -lt 40;$j++){if((Read-Replay).Session.Tabs[-1].Text -ne $originalMarkdown){break};Start-Sleep -Milliseconds 40}
+        $edited=(Read-Replay).Session.Tabs[-1].Text
+        $replayChecks.Add([pscustomobject]@{Property='Replace a selection across Markdown lines';Expected='**~~X~~**';Observed=$edited;Verdict=if($edited -ceq '**~~X~~**'){'TRUE'}else{'FALSE'}})
+        Click-Replay 'menu-btn-edit';Click-Replay 'flyout-edit-0'
+        $reverted=(Read-Replay).Session.Tabs[-1].Text
+        $replayChecks.Add([pscustomobject]@{Property='Undo restores exact Markdown across lines';Expected=$originalMarkdown;Observed=$reverted;Verdict=if($reverted -ceq $originalMarkdown){'TRUE'}else{'FALSE'}})
+        Click-Replay 'btn-add-tab';Click-Replay 'format-table';Click-Replay 'flyout-table-cell-2-2'
+        Click-Replay 'format-view'
+        $tableView=Read-Replay
+        $tableSource=$tableView.Session.Tabs[-1].Text
+        $drawnRows=@($tableView.VisibleInlineLines | Where-Object {$_.Text -match '^[│├]'})
+        $drawn=$drawnRows.Count -eq 3 -and $drawnRows[0].Text.Contains('Column 1') -and $drawnRows[1].Text.Contains('┼')
+        $replayChecks.Add([pscustomobject]@{Property='Formatted table draws aligned cell borders';Expected='3 visual rows';Observed=$drawnRows.Count;Verdict=if($drawn){'TRUE'}else{'FALSE'}})
+        Capture-Replay 'formatted-table'
+        $tableScale=$tableView.Dpi/96.0
+        $cellPoint=[IntPtr](([int](101*$tableScale) -shl 16) -bor [int](38*$tableScale))
+        foreach($message in @(0x200,0x201,0x202)){
+            $null=$send.DynamicInvoke([object[]]@($replayHandle,[uint32]$message,[IntPtr]$(if($message -eq 0x201){1}else{0}),$cellPoint))
+        }
+        $null=$send.DynamicInvoke([object[]]@($replayHandle,[uint32]0x102,[IntPtr]9,[IntPtr]::Zero))
+        $null=$send.DynamicInvoke([object[]]@($replayHandle,[uint32]0x102,[IntPtr][int][char]'Z',[IntPtr]::Zero))
+        for($j=0;$j -lt 40;$j++){if((Read-Replay).Session.Tabs[-1].Text -ne $tableSource){break};Start-Sleep -Milliseconds 40}
+        $cellEdited=(Read-Replay).Session.Tabs[-1].Text
+        $header=$cellEdited.Split([char]10)[0]
+        $replayChecks.Add([pscustomobject]@{Property='Tab moves to the next cell for direct editing';Expected='| Column 1 | Z |';Observed=$header;Verdict=if($header -ceq '| Column 1 | Z |'){'TRUE'}else{'FALSE'}})
+        Click-Replay 'menu-btn-edit';Click-Replay 'flyout-edit-0'
+        Click-Replay 'format-table';Click-Replay 'flyout-table-add-row'
+        Click-Replay 'format-table';Click-Replay 'flyout-table-add-column'
+        $changedTable=(Read-Replay).Session.Tabs[-1].Text
+        $newRows=$changedTable.Split([char]10)
+        $structure=$newRows.Length -eq 4 -and ([NotepadTableRow]::Parse($newRows[0])).Pipes.Length -eq 4
+        $replayChecks.Add([pscustomobject]@{Property='Table menu adds a row and a column';Expected='4 source rows × 3 columns';Observed=$changedTable;Verdict=if($structure){'TRUE'}else{'FALSE'}})
+        Click-Replay 'menu-btn-edit';Click-Replay 'flyout-edit-0'
+        Click-Replay 'menu-btn-edit';Click-Replay 'flyout-edit-0'
+        $undoneTable=(Read-Replay).Session.Tabs[-1].Text
+        $replayChecks.Add([pscustomobject]@{Property='Table structural edits undo to exact source';Expected=$tableSource;Observed=$undoneTable;Verdict=if($undoneTable -ceq $tableSource){'TRUE'}else{'FALSE'}})
+        Click-Replay 'btn-add-tab'
+        $escapedTable=[string]::Join([string][char]13,[string[]]@('| a | x\|y |','| :---: | ---: |','|  |  |'))
+        foreach($c in $escapedTable.ToCharArray()){
+            $null=$send.DynamicInvoke([object[]]@($replayHandle,[uint32]0x102,[IntPtr][int]$c,[IntPtr]::Zero))
+        }
+        Click-Replay 'format-view'
+        $escapedState=Read-Replay
+        $header=$escapedState.VisibleInlineLines[0]
+        $point=[IntPtr](([int](($header.Top+$header.Height/2)*$tableScale) -shl 16) -bor [int](34*$tableScale))
+        foreach($message in @(0x200,0x201,0x202)){
+            $null=$send.DynamicInvoke([object[]]@($replayHandle,[uint32]$message,[IntPtr]$(if($message -eq 0x201){1}else{0}),$point))
+        }
+        $null=$send.DynamicInvoke([object[]]@($replayHandle,[uint32]0x102,[IntPtr]9,[IntPtr]::Zero))
+        for($j=0;$j -lt 40;$j++){if((Read-Replay).VisibleSelection -ceq 'x|y'){break};Start-Sleep -Milliseconds 40}
+        $selectedTable=Read-Replay
+        $escapedOk=$header.Text.Contains('x|y') -and !$header.Text.Contains('\|') -and
+            $selectedTable.VisibleSelection -ceq 'x|y' -and $selectedTable.Session.Tabs[-1].Text.Contains('x\|y')
+        $replayChecks.Add([pscustomobject]@{Property='Escaped pipe survives projection and cell selection';Expected='x|y';Observed=$selectedTable.VisibleSelection;Verdict=if($escapedOk){'TRUE'}else{'FALSE'}})
+        Capture-Replay 'escaped-table'
+        Add-Type -AssemblyName System.Windows.Forms
+        $sequenceType=New-NativeDelegateType 'ReplayClipboardSequence' ([uint32]) ([type[]]@())
+        $sequence=Get-NativeFunction 'user32.dll' 'GetClipboardSequenceNumber' $sequenceType
+        $ownerType=New-NativeDelegateType 'ReplayClipboardOwner' ([IntPtr]) ([type[]]@())
+        $clipboardOwner=Get-NativeFunction 'user32.dll' 'GetClipboardOwner' $ownerType
+        $priorClipboard=[Windows.Forms.Clipboard]::GetDataObject()
+        $ownedSequence=0
+        try {
+            $beforeCopy=$sequence.DynamicInvoke()
+            Click-Replay 'menu-btn-edit';Click-Replay 'flyout-edit-2'
+            if($clipboardOwner.DynamicInvoke() -eq $replayHandle){$ownedSequence=$sequence.DynamicInvoke()}
+            $clipboardCell=if($ownedSequence -and $ownedSequence -ne $beforeCopy){[Win32Clipboard]::ReadText([IntPtr]::Zero)}else{''}
+            $cellTransferred=$ownedSequence -ne $beforeCopy -and $clipboardCell -ceq 'x|y'
+            $replayChecks.Add([pscustomobject]@{Property='Windows clipboard receives visible cell text';Expected='x|y';Observed=$clipboardCell;Verdict=if($cellTransferred){'TRUE'}else{'FALSE'}})
+            if($cellTransferred){
+                Click-Replay 'menu-btn-edit';Click-Replay 'flyout-edit-11'
+                $beforeCopy=$sequence.DynamicInvoke()
+                Click-Replay 'menu-btn-edit';Click-Replay 'flyout-edit-2'
+                if($clipboardOwner.DynamicInvoke() -eq $replayHandle){$ownedSequence=$sequence.DynamicInvoke()}else{$ownedSequence=0}
+                $clipboardTable=if($ownedSequence -and $ownedSequence -ne $beforeCopy){[Win32Clipboard]::ReadText([IntPtr]::Zero)}else{''}
+                $expectedSource=$selectedTable.Session.Tabs[-1].Text
+                $tableTransferred=$ownedSequence -ne $beforeCopy -and $clipboardTable -ceq $expectedSource
+                $replayChecks.Add([pscustomobject]@{Property='Windows clipboard preserves whole Markdown table';Expected=$expectedSource;Observed=$clipboardTable;Verdict=if($tableTransferred){'TRUE'}else{'FALSE'}})
+            }
+        } finally {
+            if($ownedSequence -and $sequence.DynamicInvoke() -eq $ownedSequence){
+                if($null -eq $priorClipboard){[Windows.Forms.Clipboard]::Clear()}
+                else{[Windows.Forms.Clipboard]::SetDataObject($priorClipboard,$true,5,20)}
+            }
+        }
         [pscustomobject]@{Machine=$env:COMPUTERNAME;WindowsBuild=[Environment]::OSVersion.Version.ToString();TimeUtc=[DateTime]::UtcNow;SourceSHA256=(Get-FileHash (Join-Path $PSScriptRoot 'Notepad.ps1') -Algorithm SHA256).Hash;States=$replayStates.ToArray();Checks=$replayChecks.ToArray()} | Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'native-feature-replay.clixml')
         $replayChecks | Format-Table -AutoSize
         if(@($replayChecks|Where-Object Verdict -eq 'FALSE').Count){throw 'The native feature replay found a defect.'}
@@ -14636,6 +15065,7 @@ enum FluentAction {
     ContextPage
     InsertControl
     InsertTable
+    TableStructure
     ReadingDirection
     ShowControls
     None
@@ -14717,6 +15147,7 @@ enum FluentAction {
     SaveCloseWindow
     Dismiss
     ToggleMarkdownPreview
+    ToggleMarkdownSource
     Link
     ClearFormatting
     PageSetup
@@ -15337,6 +15768,464 @@ class NotepadMenuEntry {
 }
 # One line of the document as the editor's gate drew it this frame: its line number, where it starts in the text,
 # its length without the line break, its top in window coordinates, its laid-out height and its text layout.
+class NotepadSourceSpan {
+    [int]$Start
+    [int]$Length
+    [int]$Palette
+    NotepadSourceSpan([int]$Start,[int]$Length,[int]$Palette){
+        $this.Start=$Start;$this.Length=$Length;$this.Palette=$Palette
+    }
+}
+
+class NotepadCLexer {
+    static [int] Scan([string]$Text,[int]$State,[Collections.Generic.List[NotepadSourceSpan]]$Spans){
+        $i=0
+        $length=$Text.Length
+        $block=($State -band 1) -ne 0
+        $directive=($State -band 2) -ne 0
+        if(!$block -and !$directive){$directive=$Text.TrimStart().StartsWith('#',[StringComparison]::Ordinal)}
+        $quote=$State -shr 2
+        while($i -lt $length){
+            $start=$i
+            $c=$Text[$i]
+            $next=[char]0
+            if($i+1 -lt $length){$next=$Text[$i+1]}
+            $color=-1
+            if($block -or ($quote -eq 0 -and $c -eq '/' -and $next -eq '*')){
+                if(!$block){$i+=2;$block=$true}
+                $close=$Text.IndexOf('*/',$i,[StringComparison]::Ordinal)
+                if($close -lt 0){$i=$length}else{$i=$close+2;$block=$false}
+                $color=8
+            }elseif($quote -eq 0 -and $c -eq '/' -and $next -eq '/'){
+                $i=$length;$color=8
+            }elseif($quote -ne 0 -or $c -eq '"' -or $c -eq "'"){
+                if($quote -eq 0){$quote=[int]$c;$i++}
+                while($i -lt $length){
+                    $ch=$Text[$i];$i++
+                    if($ch -eq '\'){$i=[Math]::Min($length,$i+1);continue}
+                    if([int]$ch -eq $quote){$quote=0;break}
+                }
+                $color=10
+            }elseif([char]::IsLetter($c) -or $c -eq '_'){
+                $i++
+                while($i -lt $length -and ([char]::IsLetterOrDigit($Text[$i]) -or $Text[$i] -eq '_')){$i++}
+                if($directive){$color=9}
+                elseif($null -ne $Spans){
+                    $word=$Text.Substring($start,$i-$start)
+                    if($word -cin @('if','else','for','while','do','switch','case','default','break','continue','goto','return','struct','union','enum','typedef','static','extern','const','volatile','restrict','inline','sizeof','auto','register')){$color=13}
+                    elseif($word -cin @('void','char','short','int','long','float','double','signed','unsigned','bool','_Bool','size_t','intptr_t','uintptr_t','int8_t','int16_t','int32_t','int64_t','uint8_t','uint16_t','uint32_t','uint64_t')){$color=14}
+                }
+            }elseif([char]::IsDigit($c) -or ($c -eq '.' -and [char]::IsDigit($next))){
+                $i++
+                while($i -lt $length){
+                    $ch=$Text[$i]
+                    if([char]::IsLetterOrDigit($ch) -or $ch -eq '.' -or $ch -eq '_'){$i++;continue}
+                    if(($ch -eq '+' -or $ch -eq '-') -and $Text[$i-1] -cin @('e','E','p','P')){$i++;continue}
+                    break
+                }
+                $color=11
+            }else{
+                $i++
+                if($directive -and ![char]::IsWhiteSpace($c)){$color=9}
+            }
+            if($null -ne $Spans -and $color -ge 0){$Spans.Add([NotepadSourceSpan]::new($start,$i-$start,$color))}
+        }
+        $continued=$Text.EndsWith('\',[StringComparison]::Ordinal)
+        $exit=0
+        if($block){$exit=1}
+        if($continued -and $directive){$exit=$exit -bor 2}
+        if($continued){$exit=$exit -bor ($quote -shl 2)}
+        return $exit
+    }
+}
+
+class NotepadPowerShellLexer {
+    static [int] Scan([string]$Text,[int]$State,[Collections.Generic.List[NotepadSourceSpan]]$Spans){
+        $end=$Text.Length
+        $i=0
+        $stateNow=$State
+        if($stateNow -eq 2 -or $stateNow -eq 3){
+            $closing=if($stateNow -eq 2){'"@'}else{"'@"}
+            if(!$Text.StartsWith($closing,[StringComparison]::Ordinal)){
+                if($null -ne $Spans -and $end -gt 0){$Spans.Add([NotepadSourceSpan]::new(0,$end,10))}
+                return $stateNow
+            }
+            if($null -ne $Spans){$Spans.Add([NotepadSourceSpan]::new(0,2,10))}
+            $i=2;$stateNow=0
+        }
+        while($i -lt $end){
+            $start=$i;$c=$Text[$i];$color=-1
+            $next=[char]0
+            if($i+1 -lt $end){$next=$Text[$i+1]}
+            if($stateNow -eq 1 -or ($stateNow -eq 0 -and $c -eq '<' -and $next -eq '#')){
+                if($stateNow -eq 0){$i+=2;$stateNow=1}
+                $close=$Text.IndexOf('#>',$i,[StringComparison]::Ordinal)
+                if($close -lt 0){$i=$end}else{$i=$close+2;$stateNow=0}
+                $color=8
+            }elseif($stateNow -eq 0 -and $c -eq '#'){
+                $i=$end;$color=8
+            }elseif($stateNow -eq 0 -and $c -eq '@' -and ($next -eq '"' -or $next -eq "'") -and [string]::IsNullOrWhiteSpace($Text.Substring($i+2))){
+                $stateNow=if($next -eq '"'){2}else{3}
+                $i=$end;$color=10
+            }elseif($stateNow -ge 4 -or $c -eq '"' -or $c -eq "'"){
+                if($stateNow -eq 0){$stateNow=[int]$c;$i++}
+                while($i -lt $end){
+                    $ch=$Text[$i];$i++
+                    if($stateNow -eq 34 -and $ch -eq [char]96){$i=[Math]::Min($end,$i+1);continue}
+                    if([int]$ch -ne $stateNow){continue}
+                    if($i -lt $end -and $Text[$i] -eq $ch){$i++;continue}
+                    $stateNow=0;break
+                }
+                $color=10
+            }elseif($c -eq [char]96){
+                $i=[Math]::Min($end,$i+2)
+            }elseif(($c -eq '$' -or $c -eq '@') -and ([char]::IsLetterOrDigit($next) -or $next -in @('_','{','?','^','$'))){
+                $i++
+                if($next -eq '{'){
+                    $i++
+                    while($i -lt $end){
+                        $ch=$Text[$i];$i++
+                        if($ch -eq [char]96){$i=[Math]::Min($end,$i+1);continue}
+                        if($ch -eq '}'){break}
+                    }
+                }else{
+                    $i++
+                    while($i -lt $end -and ([char]::IsLetterOrDigit($Text[$i]) -or $Text[$i] -in @('_',':'))){$i++}
+                }
+                $color=12
+            }elseif([char]::IsDigit($c)){
+                $i++
+                while($i -lt $end -and ([char]::IsLetterOrDigit($Text[$i]) -or $Text[$i] -in @('.','_'))){$i++}
+                $color=11
+            }elseif([char]::IsLetter($c) -or ($c -eq '-' -and [char]::IsLetter($next))){
+                $i++
+                while($i -lt $end -and ([char]::IsLetterOrDigit($Text[$i]) -or $Text[$i] -in @('_','-'))){$i++}
+                if($null -ne $Spans){
+                    $word=$Text.Substring($start,$i-$start)
+                    if($word -in @('begin','process','end','clean','param','function','filter','class','enum','using','if','elseif','else','switch','for','foreach','while','do','until','return','break','continue','throw','try','catch','finally','trap','exit','in','hidden','static','dynamicparam','workflow')){$color=13}
+                    elseif($word -in @('-eq','-ne','-lt','-le','-gt','-ge','-ceq','-cne','-like','-notlike','-match','-notmatch','-replace','-contains','-notcontains','-in','-notin','-is','-isnot','-as','-and','-or','-xor','-not','-band','-bor','-bxor','-bnot','-shl','-shr','-split','-join','-f')){$color=14}
+                }
+            }else{$i++}
+            if($null -ne $Spans -and $color -ge 0){$Spans.Add([NotepadSourceSpan]::new($start,$i-$start,$color))}
+        }
+        return $stateNow
+    }
+}
+
+class NotepadInlineLine {
+    [string]$Text
+    [int[]]$VisibleAtSource
+    [int[]]$SourceAtVisible
+    [int[]]$Styles
+
+    static [string] Serialize([string]$Visible,[int[]]$Flags){
+        $builder=[Text.StringBuilder]::new()
+        $markers=[string[]]@('**','*','~~')
+        $open=[int[]]::new(3)
+        $wanted=[int[]]::new(3)
+        $count=0
+        for($i=0;$i -le $Visible.Length;$i++){
+            $mask=0
+            if($i -lt $Visible.Length){$mask=$Flags[$i]}
+            $needed=0
+            for($bit=0;$bit -lt 3;$bit++){
+                if(($mask -band (1 -shl $bit)) -ne 0){$wanted[$needed]=$bit;$needed++}
+            }
+            $common=0
+            while($common -lt $count -and $common -lt $needed -and $open[$common] -eq $wanted[$common]){$common++}
+            for($j=$count-1;$j -ge $common;$j--){$null=$builder.Append($markers[$open[$j]])}
+            for($j=$common;$j -lt $needed;$j++){$open[$j]=$wanted[$j];$null=$builder.Append($markers[$open[$j]])}
+            $count=$needed
+            if($i -lt $Visible.Length){$null=$builder.Append($Visible[$i])}
+        }
+        return $builder.ToString()
+    }
+
+    static [NotepadInlineLine] Map([string]$Source){
+        $line=[NotepadInlineLine]::new()
+        $length=$Source.Length
+        $markers=[int[]]::new($length)
+        $effects=[int[]]::new($length+1)
+        $positions=[Collections.Generic.List[int]]::new()
+        $stack=[Collections.Generic.List[int]]::new()
+        for($i=0;$i -lt $length;$i++){
+            if($Source[$i] -eq '\'){$i++;continue}
+            $bit=0;$size=1
+            $top=$stack.Count-1
+            if($i+1 -lt $length -and $Source[$i] -eq $Source[$i+1]){
+                if($Source[$i] -eq '*'){$bit=1;$size=2}
+                elseif($Source[$i] -eq '~'){$bit=4;$size=2}
+            }
+            if($Source[$i] -eq '*' -and (!$bit -or ($top -ge 0 -and $stack[$top] -eq 2 -and
+                $Source[$positions[$top]] -eq '*' -and $i -gt 0 -and ![char]::IsWhiteSpace($Source[$i-1])))){
+                $bit=2;$size=1
+            }
+            if($Source[$i] -eq '_'){$bit=2}
+            if(!$bit){continue}
+            $canClose=$i -gt 0 -and ![char]::IsWhiteSpace($Source[$i-1])
+            $canOpen=$i+$size -lt $length -and ![char]::IsWhiteSpace($Source[$i+$size])
+            if($Source[$i] -eq '_' -and $i -gt 0 -and $i+1 -lt $length -and [char]::IsLetterOrDigit($Source[$i-1]) -and [char]::IsLetterOrDigit($Source[$i+1])){continue}
+            if($top -ge 0 -and $stack[$top] -eq $bit -and $Source[$positions[$top]] -eq $Source[$i] -and $canClose -and $i -gt $positions[$top]+$size){
+                $open=$positions[$top]
+                $stack.RemoveAt($top);$positions.RemoveAt($top)
+                $markers[$open]=$size;$markers[$i]=$size
+                $effects[$open+$size]=$effects[$open+$size] -bxor $bit
+                $effects[$i]=$effects[$i] -bxor $bit
+            }elseif($canOpen -and !$stack.Contains($bit)){
+                $stack.Add($bit);$positions.Add($i)
+            }
+            $i+=$size-1
+        }
+        $line.VisibleAtSource=[int[]]::new($length+1)
+        $positions.Clear()
+        $visible=[Text.StringBuilder]::new($length)
+        $styleBits=[Collections.Generic.List[int]]::new()
+        $active=0;$sourceEnd=0
+        for($i=0;$i -lt $length;$i++){
+            $active=$active -bxor $effects[$i]
+            $line.VisibleAtSource[$i]=$visible.Length
+            if($markers[$i]){
+                for($j=1;$j -lt $markers[$i];$j++){$line.VisibleAtSource[$i+$j]=$visible.Length}
+                $i+=$markers[$i]-1
+                continue
+            }
+            $positions.Add($i)
+            $null=$visible.Append($Source[$i])
+            $styleBits.Add($active)
+            $sourceEnd=$i+1
+        }
+        $line.VisibleAtSource[$length]=$visible.Length
+        $positions.Add($sourceEnd)
+        $line.SourceAtVisible=$positions.ToArray()
+        $line.Text=$visible.ToString()
+        $line.Styles=$styleBits.ToArray()
+        return $line
+    }
+
+    static [NotepadInlineLine] MapBlock([string]$Source){
+        $block=[NotepadInlineLine]::new()
+        $block.VisibleAtSource=[int[]]::new($Source.Length+1)
+        $textBuilder=[Text.StringBuilder]::new()
+        $offsets=[Collections.Generic.List[int]]::new()
+        $styleBits=[Collections.Generic.List[int]]::new()
+        $rawStart=0
+        $sourceEnd=0
+        do{
+            $rawEnd=$Source.IndexOf([char]10,$rawStart)
+            if($rawEnd -lt 0){$rawEnd=$Source.Length}
+            $line=[NotepadInlineLine]::Map($Source.Substring($rawStart,$rawEnd-$rawStart))
+            $visibleStart=$textBuilder.Length
+            for($i=0;$i -lt $line.VisibleAtSource.Length;$i++){
+                $block.VisibleAtSource[$rawStart+$i]=$visibleStart+$line.VisibleAtSource[$i]
+            }
+            $null=$textBuilder.Append($line.Text)
+            for($i=0;$i -lt $line.Text.Length;$i++){
+                $offsets.Add($rawStart+$line.SourceAtVisible[$i]);$styleBits.Add($line.Styles[$i])
+            }
+            $sourceEnd=$rawStart+$line.SourceAtVisible[$line.Text.Length]
+            if($rawEnd -lt $Source.Length){
+                $offsets.Add($rawEnd);$styleBits.Add(0);$null=$textBuilder.Append([char]10)
+            }
+            $rawStart=$rawEnd+1
+        }while($rawStart -le $Source.Length)
+        $offsets.Add($sourceEnd)
+        $block.SourceAtVisible=$offsets.ToArray()
+        $block.Styles=$styleBits.ToArray()
+        $block.Text=$textBuilder.ToString()
+        return $block
+    }
+
+    static [string] SerializeBlock([string]$Visible,[int[]]$Flags){
+        $builder=[Text.StringBuilder]::new()
+        $start=0
+        for($end=0;$end -le $Visible.Length;$end++){
+            if($end -lt $Visible.Length -and $Visible[$end] -ne [char]10){continue}
+            $length=$end-$start
+            $lineFlags=[int[]]::new($length)
+            [Array]::Copy($Flags,$start,$lineFlags,0,$length)
+            $null=$builder.Append([NotepadInlineLine]::Serialize($Visible.Substring($start,$length),$lineFlags))
+            if($end -lt $Visible.Length){$null=$builder.Append([char]10)}
+            $start=$end+1
+        }
+        return $builder.ToString()
+    }
+
+    static [void] NormalizeWhitespace([string]$Visible,[int[]]$Flags){
+        for($bit=1;$bit -le 4;$bit*=2){
+            $start=-1;$first=-1;$last=-1
+            for($i=0;$i -le $Visible.Length;$i++){
+                if($i -lt $Visible.Length -and $Visible[$i] -ne [char]10 -and ($Flags[$i] -band $bit)){
+                    if($start -lt 0){$start=$i}
+                    if(![char]::IsWhiteSpace($Visible[$i])){if($first -lt 0){$first=$i};$last=$i}
+                    continue
+                }
+                if($start -ge 0){
+                    if($first -lt 0){$first=$i;$last=$i-1}
+                    for($at=$start;$at -lt $first;$at++){$Flags[$at]=$Flags[$at] -band (-bnot $bit)}
+                    for($at=$last+1;$at -lt $i;$at++){$Flags[$at]=$Flags[$at] -band (-bnot $bit)}
+                    $start=-1;$first=-1;$last=-1
+                }
+            }
+        }
+    }
+
+    [bool] Matches([string]$Visible,[int[]]$Flags){
+        if($this.Text -cne $Visible -or $this.Styles.Length -ne $Flags.Length){return $false}
+        for($i=0;$i -lt $Flags.Length;$i++){if($this.Styles[$i] -ne $Flags[$i]){return $false}}
+        return $true
+    }
+}
+
+class NotepadTableRow {
+    [string]$Source
+    [int[]]$Pipes
+
+    static [NotepadTableRow] Parse([string]$SourceText){
+        if($SourceText.Length -lt 2 -or $SourceText[0] -ne '|' -or $SourceText[-1] -ne '|'){return $null}
+        $positions=[Collections.Generic.List[int]]::new()
+        for($i=0;$i -lt $SourceText.Length;$i++){
+            if($SourceText[$i] -eq '\'){$i++;continue}
+            if($SourceText[$i] -eq '|'){$positions.Add($i)}
+        }
+        if($positions.Count -lt 2 -or $positions[$positions.Count-1] -ne $SourceText.Length-1){return $null}
+        $row=[NotepadTableRow]::new();$row.Source=$SourceText;$row.Pipes=$positions.ToArray()
+        return $row
+    }
+
+    [bool] IsDivider(){
+        for($column=0;$column+1 -lt $this.Pipes.Length;$column++){
+            $from=$this.Pipes[$column]+1
+            $value=$this.Source.Substring($from,$this.Pipes[$column+1]-$from).Trim()
+            if(![Text.RegularExpressions.Regex]::IsMatch($value,'^:?-{3,}:?$')){return $false}
+        }
+        return $true
+    }
+
+    [NotepadInlineLine] Cell([int]$Column){
+        $from=$this.Pipes[$Column]+1
+        $end=$this.Pipes[$Column+1]
+        $sourceText=$this.Source.Substring($from,$end-$from)
+        $original=[NotepadInlineLine]::Map($sourceText)
+        if(!$original.Text.Contains('\|')){return $original}
+        $visible=[Text.StringBuilder]::new()
+        $positions=[Collections.Generic.List[int]]::new()
+        $flags=[Collections.Generic.List[int]]::new()
+        $visibleOffset=[int[]]::new($original.Text.Length+1)
+        for($i=0;$i -lt $original.Text.Length;$i++){
+            $visibleOffset[$i]=$visible.Length
+            $character=$original.Text[$i]
+            if($character -eq '\' -and $i+1 -lt $original.Text.Length -and $original.Text[$i+1] -in @('\','|')){
+                if($original.Text[$i+1] -eq '|'){
+                    $positions.Add($original.SourceAtVisible[$i]);$flags.Add($original.Styles[$i+1])
+                    $i++;$visibleOffset[$i]=$visible.Length
+                    $null=$visible.Append('|')
+                }else{
+                    $positions.Add($original.SourceAtVisible[$i]);$flags.Add($original.Styles[$i])
+                    $null=$visible.Append($character)
+                    $i++;$visibleOffset[$i]=$visible.Length
+                    $positions.Add($original.SourceAtVisible[$i]);$flags.Add($original.Styles[$i])
+                    $null=$visible.Append($original.Text[$i])
+                }
+                continue
+            }
+            $positions.Add($original.SourceAtVisible[$i]);$flags.Add($original.Styles[$i])
+            $null=$visible.Append($character)
+        }
+        $visibleOffset[$original.Text.Length]=$visible.Length
+        $positions.Add($original.SourceAtVisible[$original.Text.Length])
+        $original.Text=$visible.ToString()
+        for($i=0;$i -lt $original.VisibleAtSource.Length;$i++){
+            $original.VisibleAtSource[$i]=$visibleOffset[$original.VisibleAtSource[$i]]
+        }
+        $original.SourceAtVisible=$positions.ToArray();$original.Styles=$flags.ToArray()
+        return $original
+    }
+
+    [NotepadInlineLine] Project([int[]]$Widths,[int[]]$Alignment,[bool]$Divider){
+        $mapped=[NotepadInlineLine]::new()
+        $mapped.VisibleAtSource=[int[]]::new($this.Source.Length+1)
+        $builder=[Text.StringBuilder]::new()
+        $positions=[Collections.Generic.List[int]]::new()
+        $flags=[Collections.Generic.List[int]]::new()
+        for($column=0;$column+1 -lt $this.Pipes.Length;$column++){
+            $pipe=$this.Pipes[$column]
+            $mapped.VisibleAtSource[$pipe]=$builder.Length
+            $positions.Add($pipe);$flags.Add(0)
+            if($Divider){$null=$builder.Append($(if($column -eq 0){'├'}else{'┼'}))}else{$null=$builder.Append('│')}
+            $from=$pipe+1;$end=$this.Pipes[$column+1]
+            $cell=$this.Cell($column)
+            $width=$Widths[$column]
+            $leading=0
+            if(!$Divider){
+                if($Alignment[$column] -eq 1){$leading=($width-$cell.Text.Length) -shr 1}
+                elseif($Alignment[$column] -eq 2){$leading=$width-$cell.Text.Length}
+            }
+            for($i=0;$i -lt $leading;$i++){
+                $null=$builder.Append(' ');$positions.Add($from+$cell.SourceAtVisible[0]);$flags.Add(0)
+            }
+            $visibleStart=$builder.Length
+            for($i=0;$i -lt $cell.VisibleAtSource.Length;$i++){
+                $mapped.VisibleAtSource[$from+$i]=$visibleStart+$cell.VisibleAtSource[$i]
+            }
+            if($Divider){
+                for($i=0;$i -lt $cell.Text.Length;$i++){
+                    $null=$builder.Append('─');$positions.Add($from+$cell.SourceAtVisible[$i]);$flags.Add(0)
+                }
+            }else{
+                $null=$builder.Append($cell.Text)
+                for($i=0;$i -lt $cell.Text.Length;$i++){$positions.Add($from+$cell.SourceAtVisible[$i]);$flags.Add($cell.Styles[$i])}
+            }
+            for($i=$cell.Text.Length+$leading;$i -lt $width;$i++){
+                if($Divider){$null=$builder.Append('─')}else{$null=$builder.Append(' ')}
+                $positions.Add($end);$flags.Add(0)
+            }
+        }
+        $last=$this.Source.Length-1
+        $mapped.VisibleAtSource[$last]=$builder.Length
+        if($Divider){$null=$builder.Append('┤')}else{$null=$builder.Append('│')}
+        $positions.Add($last);$flags.Add(0)
+        $mapped.VisibleAtSource[$this.Source.Length]=$builder.Length
+        $positions.Add($this.Source.Length)
+        $mapped.Text=$builder.ToString();$mapped.SourceAtVisible=$positions.ToArray();$mapped.Styles=$flags.ToArray()
+        return $mapped
+    }
+}
+
+class NotepadTableView {
+    [int]$FirstLine
+    [int]$LastLine
+    [int[]]$Widths
+    [int[]]$Alignment
+
+    static [NotepadTableView] Resolve([string[]]$Rows,[int]$First){
+        if($Rows.Length -lt 2 -or $Rows.Length -gt 128){return $null}
+        $header=[NotepadTableRow]::Parse($Rows[0])
+        $divider=[NotepadTableRow]::Parse($Rows[1])
+        if(!$header -or $header.IsDivider() -or !$divider -or $divider.Pipes.Length -ne $header.Pipes.Length -or !$divider.IsDivider()){return $null}
+        $view=[NotepadTableView]::new()
+        $view.FirstLine=$First;$view.LastLine=$First+$Rows.Length-1
+        $view.Widths=[int[]]::new($header.Pipes.Length-1)
+        $view.Alignment=[int[]]::new($view.Widths.Length)
+        for($column=0;$column -lt $view.Alignment.Length;$column++){
+            $from=$divider.Pipes[$column]+1
+            $marker=$divider.Source.Substring($from,$divider.Pipes[$column+1]-$from).Trim()
+            if($marker.EndsWith(':',[StringComparison]::Ordinal)){
+                $view.Alignment[$column]=2
+                if($marker.StartsWith(':',[StringComparison]::Ordinal)){$view.Alignment[$column]=1}
+            }
+        }
+        foreach($line in $Rows){
+            $candidate=[NotepadTableRow]::Parse($line)
+            if(!$candidate -or $candidate.Pipes.Length -ne $header.Pipes.Length){return $null}
+            for($column=0;$column -lt $view.Widths.Length;$column++){
+                $cell=$candidate.Cell($column)
+                $view.Widths[$column]=[Math]::Max($view.Widths[$column],$cell.Text.Length)
+            }
+        }
+        return $view
+    }
+}
+
 class NotepadGateLine {
     [int]$Line
     [int]$Start
@@ -15344,10 +16233,15 @@ class NotepadGateLine {
     [double]$Top
     [double]$Height
     [IntPtr]$Layout
+    [NotepadInlineLine]$Inline
+    [NotepadTableRow]$TableRow
+    [bool]$TableDivider
 }
 
 # The interface state. A value-type member that starts unset is Nullable: it reads $null until first set.
 class NotepadUi {
+    [Collections.Generic.HashSet[int]]$MarkdownFormattedTabs=[Collections.Generic.HashSet[int]]::new()
+    [Collections.Generic.Dictionary[int,int]]$InlineTyping=[Collections.Generic.Dictionary[int,int]]::new()
     [bool]$Dirty
     [bool]$Running
     [string]$Hover
@@ -15428,13 +16322,22 @@ class NotepadUi {
     # line's layout keyed by its format and text with the keys used this frame, and the lines the last frame drew.
     [string]$LineStartsKey
     [int[]]$LineStarts
+    [string]$SyntaxStateKey
+    [Collections.Generic.List[int]]$SyntaxEntryStates
     [Collections.Generic.Dictionary[string,IntPtr]]$LineLayouts
     [Collections.Generic.HashSet[string]]$LineLayoutsUsed
     [Collections.Generic.List[NotepadGateLine]]$GateLines
+    [Collections.Generic.Dictionary[string,NotepadSpellingSpan[]]]$Spelling=[Collections.Generic.Dictionary[string,NotepadSpellingSpan[]]]::new([StringComparer]::Ordinal)
+    [Collections.Generic.List[NotepadGateLine]]$SpellingGate
+    [int]$SpellingLine
+    [bool]$SpellingUnavailable
     # A selection drag: the pointer's last position and the time of the last kinetic scroll step.
     [double]$DragX
     [double]$DragY
     [datetime]$DragTick
+    [datetime]$WordClickTime
+    [int]$WordClickX
+    [int]$WordClickY
     # Windows' text size as a factor on interface text (not the editor's own font), read at start and when Windows
     # reports a setting change.
     [double]$TextScale = 1.0
@@ -15479,6 +16382,11 @@ function Write-ApplicationDiagnostic {
     $snapshot.Minimized=$ui.Minimized
     $snapshot.ScrollSequence=$ui.ScrollSequence
     $snapshot.ColorPicker=$ui.ColorPicker
+    $snapshot.VisibleInlineLines=@(foreach($line in $ui.GateLines){if($line.Inline){@{Text=$line.Inline.Text;Styles=$line.Inline.Styles;Top=$line.Top;Height=$line.Height}}})
+    $current=$model.Active()
+    if($current.Anchor -ne $current.Focus -and $ui.MarkdownFormattedTabs.Contains($current.Id)){
+        $snapshot.VisibleSelection=Get-SelectedDisplayText $current ([Math]::Min($current.Anchor,$current.Focus)) ([Math]::Abs($current.Focus-$current.Anchor))
+    }else{$snapshot.VisibleSelection=''}
     $temporary=$DiagnosticPath+'.'+$PID+'.tmp'
     try{[IO.File]::WriteAllText($temporary,($snapshot|ConvertTo-Json -Depth 32),[Text.UTF8Encoding]::new($false));[IO.File]::Move($temporary,$DiagnosticPath,$true)}
     catch [IO.IOException] {return} catch [UnauthorizedAccessException] {return}
@@ -15911,8 +16819,13 @@ function Command([FluentAction]$Action,[object]$Data=$null){
         ([FluentAction]::InsertTable){
             $before=[Math]::Min($tab.Anchor,$tab.Focus)
             $after=[Math]::Max($tab.Anchor,$tab.Focus)
-            $table="| Column 1 | Column 2 |`n| --- | --- |`n|  |  |"
             $lineBreak=[string][char]10
+            $columns=2;$rows=2
+            if($Data -is [int[]]){$columns=$Data[0];$rows=$Data[1]}
+            $header=[Text.StringBuilder]::new('|')
+            for($column=1;$column -le $columns;$column++){$null=$header.Append(' Column ').Append($column).Append(' |')}
+            $table=$header.ToString()+$lineBreak+'|'+(' --- |'*$columns)
+            for($row=1;$row -lt $rows;$row++){$table+=$lineBreak+'|'+('  |'*$columns)}
             if($before -gt 0){
                 if($tab.At($before-1) -ne [char]10){$table=$lineBreak+$lineBreak+$table}
                 elseif($before -gt 1 -and $tab.At($before-2) -ne [char]10){$table=$lineBreak+$table}
@@ -15922,13 +16835,15 @@ function Command([FluentAction]$Action,[object]$Data=$null){
                 elseif($after+1 -lt $tab.Length() -and $tab.At($after+1) -ne [char]10){$table+=$lineBreak}
             }
             $model.Insert($table,$false)
+            $tab.Markdown=$true
         }
+        ([FluentAction]::TableStructure){Edit-TableStructure $tab ([string]$Data)}
         ([FluentAction]::ReadingDirection){$ui.RightToLeft=-not $ui.RightToLeft;$tab.ScrollX=0}
         ([FluentAction]::ShowControls){$ui.ShowControls=-not $ui.ShowControls;Invalidate;return}
         ([FluentAction]::Undo){$model.Undo($false)}
         ([FluentAction]::Redo){$model.Undo($true)}
         ([FluentAction]::SelectAll){$model.Select(0,$tab.Document.Length)}
-        ([FluentAction]::Copy){$start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor);if($length){[Win32Clipboard]::WriteText($window.Handle(),$tab.Slice($start,$length))}}
+        ([FluentAction]::Copy){$start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor);if($length){[Win32Clipboard]::WriteText($window.Handle(),(Get-SelectedDisplayText $tab $start $length))}}
         ([FluentAction]::CopyDocument){try{if($settings.copyAsFile){[Win32Clipboard]::WriteFile($window.Handle(),$tab.Content(),$tab.Title)}else{[Win32Clipboard]::WriteText($window.Handle(),$tab.Content())}}catch{Open-Modal 'Copy document' $_.Exception.Message @(@{Text='Close';Action=[FluentAction]::Dismiss;Primary=$true})}}
         ([FluentAction]::EditColor){Open-CanvasColorPicker $Data -1}
         ([FluentAction]::EditAnsi){Open-CanvasColorPicker '' ([int]$Data)}
@@ -15968,9 +16883,9 @@ function Command([FluentAction]$Action,[object]$Data=$null){
             $model.Insert(('['+$linkText+']('+$destination+')'),$false)
             $tab.Markdown=$true;$ui.Modal=$null;$ui.Focus='editor-area'
         }
-        ([FluentAction]::Cut){$start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor);if($length){[Win32Clipboard]::WriteText($window.Handle(),$tab.Slice($start,$length));$model.Insert('',$false)}}
-        ([FluentAction]::Paste){$text=[Win32Clipboard]::ReadText($window.Handle());if($text.Length){$model.Insert($text,$false)}}
-        ([FluentAction]::Delete){$model.Delete($false)}
+        ([FluentAction]::Cut){$start=[Math]::Min($tab.Anchor,$tab.Focus);$length=[Math]::Abs($tab.Focus-$tab.Anchor);if($length){[Win32Clipboard]::WriteText($window.Handle(),(Get-SelectedDisplayText $tab $start $length));if(!(Edit-InlineText $tab '' 0)){$model.Insert('',$false)}}}
+        ([FluentAction]::Paste){$text=[Win32Clipboard]::ReadText($window.Handle());if($text.Length){if(!(Edit-InlineText $tab $text 0)){$model.Insert($text,$false)}}}
+        ([FluentAction]::Delete){if(!(Edit-InlineText $tab '' 1)){$model.Delete($false)}}
         ([FluentAction]::TimeDate){$now=[DateTime]::Now;$model.Insert(($now.ToString('t')+' '+$now.ToString('M/d/yyyy',[Globalization.CultureInfo]::InvariantCulture)),$false)}
         ([FluentAction]::Find) {Open-Find $false}
         ([FluentAction]::Replace){Open-Find $true}
@@ -16011,8 +16926,13 @@ function Command([FluentAction]$Action,[object]$Data=$null){
         ([FluentAction]::SaveCloseWindow){$success=$true;foreach($document in $state.Tabs){if($document.Modified -and -not(Save-Document $document)){$success=$false;break}};if($success){$ui.Running=$false}}
         ([FluentAction]::Dismiss){$ui.Focus='editor-area'}
         ([FluentAction]::ToggleMarkdownPreview){Open-Modal ('Markdown Preview: '+$tab.Title) '' @(@{Text='Close';Action=[FluentAction]::Dismiss;Primary=$true});$ui.Modal.Markdown=$tab.Content()}
+        ([FluentAction]::ToggleMarkdownSource){
+            if(!$ui.MarkdownFormattedTabs.Remove($tab.Id)){$null=$ui.MarkdownFormattedTabs.Add($tab.Id);$tab.Markdown=$true}
+            $ui.Focus='editor-area'
+        }
         ([FluentAction]::Link){[string]$address=$Data;if($address.StartsWith('https://',[StringComparison]::Ordinal) -or $address.StartsWith('http://',[StringComparison]::Ordinal)){[NotepadWindow]::OpenLink($address)}}
         ([FluentAction]::ClearFormatting){
+            if(Apply-InlineStyle $tab 0){break}
             $start=[Math]::Min($tab.Anchor,$tab.Focus);$end=[Math]::Max($tab.Anchor,$tab.Focus)
             if($start -ne $end){
                 $sourceText=$tab.Slice($start,$end-$start)
@@ -16088,24 +17008,99 @@ function Get-MarkdownPrefixLength([string]$Text){
     }
     return $length
 }
+function Get-WordRange([NotepadTab]$Tab,[int]$Position){
+    $line=$Tab.Document.LineOf($Position)
+    $start=$Tab.Document.LineStart($line)
+    $nextLine=$line+1
+    $end=if($nextLine -lt $Tab.Document.LineCount()){$Tab.Document.LineStart($nextLine)-1}else{$Tab.Length()}
+    $text=$Tab.Slice($start,$end-$start)
+    $offset=$Position-$start
+    $boundaries=[Globalization.StringInfo]::ParseCombiningCharacters($text)
+    $wordStart=-1
+    for($i=0;$i -lt $boundaries.Length;$i++){
+        $at=$boundaries[$i]
+        $kind=[Globalization.CharUnicodeInfo]::GetUnicodeCategory($text,$at)
+        $isWord=$kind -in @([Globalization.UnicodeCategory]::UppercaseLetter,[Globalization.UnicodeCategory]::LowercaseLetter,
+            [Globalization.UnicodeCategory]::TitlecaseLetter,[Globalization.UnicodeCategory]::ModifierLetter,
+            [Globalization.UnicodeCategory]::OtherLetter,[Globalization.UnicodeCategory]::DecimalDigitNumber,
+            [Globalization.UnicodeCategory]::LetterNumber,[Globalization.UnicodeCategory]::OtherNumber)
+        if($isWord){if($wordStart -lt 0){$wordStart=$at};continue}
+        if($wordStart -ge 0 -and $offset -ge $wordStart -and $offset -le $at){return [int[]]@(($start+$wordStart),($start+$at))}
+        if($at -gt $offset){break}
+        $wordStart=-1
+    }
+    if($wordStart -ge 0 -and $offset -ge $wordStart){return [int[]]@(($start+$wordStart),$end)}
+    return [int[]]@($Position,$Position)
+}
+
+function Apply-InlineStyle([NotepadTab]$Tab,[int]$Bit){
+    if(!$ui.MarkdownFormattedTabs.Contains($Tab.Id)){return $false}
+    $start=[Math]::Min($Tab.Anchor,$Tab.Focus);$end=[Math]::Max($Tab.Anchor,$Tab.Focus)
+    $lineStart=$Tab.Document.LineStart($Tab.Document.LineOf($start))
+    $lastLine=$Tab.Document.LineOf($end)
+    $lineEnd=$Tab.Length()
+    if($lastLine+1 -lt $Tab.Document.LineCount()){$lineEnd=$Tab.Document.LineStart($lastLine+1)-1}
+    $source=$Tab.Slice($lineStart,$lineEnd-$lineStart)
+    $inline=[NotepadInlineLine]::MapBlock($source)
+    $first=$inline.VisibleAtSource[$start-$lineStart];$last=$inline.VisibleAtSource[$end-$lineStart]
+    if($first -eq $last){
+        $previous=0
+        if($ui.InlineTyping.ContainsKey($Tab.Id)){$previous=$ui.InlineTyping[$Tab.Id]}
+        elseif($first -gt 0){$previous=$inline.Styles[$first-1]}
+        elseif($inline.Styles.Length){$previous=$inline.Styles[0]}
+        $ui.InlineTyping[$Tab.Id]=if(!$Bit){0}else{$previous -bxor $Bit}
+        return $true
+    }
+    while($first -lt $last -and [char]::IsWhiteSpace($inline.Text[$first])){$first++}
+    while($last -gt $first -and [char]::IsWhiteSpace($inline.Text[$last-1])){$last--}
+    if($first -eq $last){return $true}
+    $remove=$true
+    for($i=$first;$i -lt $last;$i++){if(![char]::IsWhiteSpace($inline.Text[$i]) -and ($inline.Styles[$i] -band $Bit) -eq 0){$remove=$false;break}}
+    for($i=$first;$i -lt $last;$i++){
+        if(!$Bit -or $inline.Text[$i] -eq [char]10){$inline.Styles[$i]=0}
+        elseif($remove){$inline.Styles[$i]=$inline.Styles[$i] -band (-bnot $Bit)}
+        else{$inline.Styles[$i]=$inline.Styles[$i] -bor $Bit}
+    }
+    [NotepadInlineLine]::NormalizeWhitespace($inline.Text,$inline.Styles)
+    $replacement=[NotepadInlineLine]::SerializeBlock($inline.Text,$inline.Styles)
+    $checked=[NotepadInlineLine]::MapBlock($replacement)
+    if(!$checked.Matches($inline.Text,$inline.Styles)){
+        Open-Modal 'Format selection' 'This selection cannot be represented without changing the visible text. Switch to Source view to edit the original Markdown.' @(@{Text='Close';Action=[FluentAction]::Dismiss;Primary=$true})
+        return $true
+    }
+    Write-InlineBlock $lineStart $source $replacement
+    $model.Select(($lineStart+$checked.SourceAtVisible[$first]),($lineStart+$checked.SourceAtVisible[$last]))
+    return $true
+}
+
+function Get-InlineToolbarState([NotepadTab]$Tab){
+    if(!$ui.MarkdownFormattedTabs.Contains($Tab.Id)){return 0}
+    if($Tab.Anchor -eq $Tab.Focus -and $ui.InlineTyping.ContainsKey($Tab.Id)){return $ui.InlineTyping[$Tab.Id]}
+    $low=[Math]::Min($Tab.Anchor,$Tab.Focus);$high=[Math]::Max($Tab.Anchor,$Tab.Focus)
+    $line=$Tab.Document.LineOf($low)
+    if($Tab.Document.LineOf($high) -ne $line){return 0}
+    $start=$Tab.Document.LineStart($line)
+    $end=$Tab.Length()
+    if($line+1 -lt $Tab.Document.LineCount()){$end=$Tab.Document.LineStart($line+1)-1}
+    $inline=[NotepadInlineLine]::Map($Tab.Slice($start,$end-$start))
+    if(!$inline.Styles.Length){return 0}
+    $first=$inline.VisibleAtSource[$low-$start];$last=$inline.VisibleAtSource[$high-$start]
+    if($first -eq $last){return $inline.Styles[[Math]::Clamp($first-1,0,$inline.Styles.Length-1)]}
+    $state=7
+    for($i=$first;$i -lt $last;$i++){$state=$state -band $inline.Styles[$i]}
+    return $state
+}
+
 function Format-Selection([string]$Marker){
     $tab=$model.Active()
+    $bit=if($Marker -eq '**'){1}elseif($Marker -eq '_'){2}else{4}
+    if(Apply-InlineStyle $tab $bit){$ui.Focus='editor-area';return}
     [int]$start=[Math]::Min($tab.Anchor,$tab.Focus)
     [int]$end=[Math]::Max($tab.Anchor,$tab.Focus)
     if($start -eq $end){
         $ui.Focus='editor-area'
-        $line=$tab.Document.LineOf($start)
-        $lineStart=$tab.Document.LineStart($line)
-        $nextLine=$line+1
-        $lineEnd=if($nextLine -lt $tab.Document.LineCount()){$tab.Document.LineStart($nextLine)-1}else{$tab.Length()}
-        $position=$start-$lineStart
-        foreach($word in [Text.RegularExpressions.Regex]::Matches($tab.Slice($lineStart,$lineEnd-$lineStart),'[\p{L}\p{N}][\p{L}\p{N}\p{M}]*')){
-            if($word.Index -gt $position){break}
-            if($word.Index+$word.Length -lt $position){continue}
-            $start=$lineStart+$word.Index
-            $end=$start+$word.Length
-            break
-        }
+        $range=Get-WordRange $tab $start
+        $start=$range[0];$end=$range[1]
         if($start -eq $end){return}
     }
     [string]$selected=$tab.Slice($start,$end-$start)
@@ -16262,19 +17257,207 @@ function Get-LineText([int]$LineNumber){
 
 # The layout of one line in the editor's format, reused while the same text is drawn in the same format. Layouts
 # not used by a frame are released at the end of Paint-Editor.
-function Get-LineLayout([string]$Text){
+function Get-SyntaxEntryState([int]$Line,[string]$Language){
+    $key=$ui.LineStartsKey+'|'+$Language
+    if($ui.SyntaxStateKey -ne $key){
+        $ui.SyntaxStateKey=$key
+        $ui.SyntaxEntryStates=[Collections.Generic.List[int]]::new()
+        $ui.SyntaxEntryStates.Add(0)
+    }
+    while($ui.SyntaxEntryStates.Count -le $Line){
+        $previous=$ui.SyntaxEntryStates.Count-1
+        $text=Get-LineText $previous
+        $state=$ui.SyntaxEntryStates[$previous]
+        if($Language -eq 'c'){$ui.SyntaxEntryStates.Add([NotepadCLexer]::Scan($text,$state,$null))}
+        else{$ui.SyntaxEntryStates.Add([NotepadPowerShellLexer]::Scan($text,$state,$null))}
+    }
+    return $ui.SyntaxEntryStates[$Line]
+}
+
+function Get-LineLayout([string]$Text,[int]$SyntaxState=-1,[string]$PaletteKey='',[string]$Language=''){
     if($null -eq $ui.LineLayouts){$ui.LineLayouts=[Collections.Generic.Dictionary[string,IntPtr]]::new();$ui.LineLayoutsUsed=[Collections.Generic.HashSet[string]]::new()}
     $fontSize=[int]$settings.fontSize*96/72*([int]$settings.zoom/100)
     $weight=if($settings.fontStyle.Contains('Bold')){700}else{400};$italic=$settings.fontStyle.Contains('Italic')
     $available=[Math]::Max(1,$ui.Width-32-12)
-    $key="$fontSize|$($settings.fontFamily)|$($settings.fontStyle)|$($settings.wordWrap)|$($ui.RightToLeft)|$available|$Text"
+    $key="$fontSize|$($settings.fontFamily)|$($settings.fontStyle)|$($settings.wordWrap)|$($ui.RightToLeft)|$available|$Language|$SyntaxState|$PaletteKey|$Text"
     if(-not $ui.LineLayouts.ContainsKey($key)){
         $layout=$graphics.Layout($Text,$settings.fontFamily,$fontSize,$available,[bool]$settings.wordWrap,$weight,$italic,($fontSize*1.45))
         if($ui.RightToLeft){$graphics.ReadRightToLeft($layout)}
+        if($SyntaxState -ge 0){
+            $spans=[Collections.Generic.List[NotepadSourceSpan]]::new()
+            if($Language -eq 'c'){$null=[NotepadCLexer]::Scan($Text,$SyntaxState,$spans)}
+            else{$null=[NotepadPowerShellLexer]::Scan($Text,$SyntaxState,$spans)}
+            foreach($span in $spans){$graphics.SetLayoutColor($layout,[uint]$span.Start,[uint]$span.Length,$settings.ansiColors[$span.Palette])}
+        }
         $ui.LineLayouts[$key]=$layout
     }
     $null=$ui.LineLayoutsUsed.Add($key)
     return $ui.LineLayouts[$key]
+}
+
+function Get-InlineLayout([string]$Source,[NotepadInlineLine]$Inline,[bool]$Table=$false){
+    $fontSize=[int]$settings.fontSize*96/72*([int]$settings.zoom/100)
+    $available=[Math]::Max(1,$ui.Width-44)
+    $key="inline|$fontSize|$($settings.fontFamily)|$($settings.fontStyle)|$($settings.wordWrap)|$($ui.RightToLeft)|$available|$Table|$($Inline.Text.Length)|$($Inline.Text)|$Source"
+    if(!$ui.LineLayouts.ContainsKey($key)){
+        $baseBold=$settings.fontStyle.Contains('Bold');$baseItalic=$settings.fontStyle.Contains('Italic')
+        $weight=if($baseBold){700}else{400}
+        $fontFamily=if($Table){'Consolas'}else{$settings.fontFamily}
+        $layout=$graphics.Layout($Inline.Text,$fontFamily,$fontSize,$available,(!$Table -and $settings.wordWrap),$weight,$baseItalic,($fontSize*1.45))
+        try{
+            if($ui.RightToLeft){$graphics.ReadRightToLeft($layout)}
+            $start=0
+            while($start -lt $Inline.Styles.Length){
+                $style=$Inline.Styles[$start];$end=$start+1
+                while($end -lt $Inline.Styles.Length -and $Inline.Styles[$end] -eq $style){$end++}
+                if($style){
+                    $graphics.SetInlineFormat($layout,[uint]$start,[uint]($end-$start),($baseBold -or ($style -band 1) -ne 0),($baseItalic -or ($style -band 2) -ne 0),(($style -band 4) -ne 0))
+                }
+                $start=$end
+            }
+            $ui.LineLayouts[$key]=$layout
+        }catch{$graphics.ReleaseLayout($layout);throw}
+    }
+    $null=$ui.LineLayoutsUsed.Add($key)
+    return $ui.LineLayouts[$key]
+}
+
+function Get-TableView([int]$Line,[NotepadTableRow]$Row){
+    $first=$Line
+    while($first -gt 0 -and $Line-$first -lt 128){
+        $previous=[NotepadTableRow]::Parse((Get-LineText ($first-1)))
+        if(!$previous){break}
+        $first--
+    }
+    if($first -gt 0 -and [NotepadTableRow]::Parse((Get-LineText ($first-1)))){return $null}
+    $rows=[Collections.Generic.List[string]]::new()
+    for($number=$first;$number -lt $ui.LineStarts.Length;$number++){
+        $text=Get-LineText $number
+        if(![NotepadTableRow]::Parse($text)){break}
+        if($number-$first -ge 128){return $null}
+        $rows.Add($text)
+    }
+    if($Line -ge $first+$rows.Count){return $null}
+    return [NotepadTableView]::Resolve($rows.ToArray(),$first)
+}
+
+function Move-TableCell([NotepadTab]$Tab,[bool]$Backward){
+    if(!$ui.MarkdownFormattedTabs.Contains($Tab.Id)){return $false}
+    Update-LineStarts $Tab
+    $line=$Tab.Document.LineOf($Tab.Focus)
+    $row=[NotepadTableRow]::Parse((Get-LineText $line))
+    if(!$row){return $false}
+    $view=Get-TableView $line $row
+    if(!$view){return $false}
+    $offset=$Tab.Focus-$ui.LineStarts[$line]
+    $column=0
+    while($column+2 -lt $row.Pipes.Length -and $offset -gt $row.Pipes[$column+1]){$column++}
+    if($Backward){
+        if($column -gt 0){$column--}
+        elseif($line -gt $view.FirstLine){
+            $line--
+            if($line -eq $view.FirstLine+1){$line--}
+            $column=$row.Pipes.Length-2
+        }else{return $true}
+    }else{
+        if($column+2 -lt $row.Pipes.Length){$column++}
+        elseif($line -lt $view.LastLine){
+            $line++
+            if($line -eq $view.FirstLine+1){$line++}
+            if($line -gt $view.LastLine){return $true}
+            $column=0
+        }else{return $true}
+    }
+    $next=[NotepadTableRow]::Parse((Get-LineText $line))
+    $start=$next.Pipes[$column]+1
+    $end=$next.Pipes[$column+1]
+    while($start -lt $end -and $next.Source[$start] -eq ' '){$start++}
+    while($end -gt $start -and $next.Source[$end-1] -eq ' '){$end--}
+    $null=$ui.InlineTyping.Remove($Tab.Id)
+    $model.Select(($ui.LineStarts[$line]+$start),($ui.LineStarts[$line]+$end))
+    Invalidate $true
+    return $true
+}
+
+function Edit-TableStructure([NotepadTab]$Tab,[string]$Operation){
+    if(!$ui.MarkdownFormattedTabs.Contains($Tab.Id)){return}
+    Update-LineStarts $Tab
+    $line=$Tab.Document.LineOf($Tab.Focus)
+    $row=[NotepadTableRow]::Parse((Get-LineText $line))
+    if(!$row){return}
+    $view=Get-TableView $line $row
+    if(!$view){return}
+    $column=0;$offset=$Tab.Focus-$ui.LineStarts[$line]
+    while($column+2 -lt $row.Pipes.Length -and $offset -gt $row.Pipes[$column+1]){$column++}
+    if($Operation -eq 'remove-row' -and $line -le $view.FirstLine+1){return}
+    if($Operation -eq 'remove-column' -and $row.Pipes.Length -le 2){return}
+    $entries=[Collections.Generic.List[string]]::new()
+    $targetLine=$line-$view.FirstLine
+    for($i=$view.FirstLine;$i -le $view.LastLine;$i++){
+        $rowText=Get-LineText $i
+        if($Operation -eq 'remove-row' -and $i -eq $line){continue}
+        if($Operation -eq 'add-column' -or $Operation -eq 'remove-column'){
+            $current=[NotepadTableRow]::Parse($rowText)
+            $right=$current.Pipes[$column+1]
+            if($Operation -eq 'add-column'){
+                $cell=if($i -eq $view.FirstLine+1){' --- |'}else{'  |'}
+                $rowText=$rowText.Insert($right+1,$cell)
+            }else{
+                $left=$current.Pipes[$column]
+                $rowText=$rowText.Remove($left,$right-$left)
+            }
+        }
+        $entries.Add($rowText)
+        if($Operation -eq 'add-row' -and $i -eq [Math]::Max($line,$view.FirstLine+1)){
+            $entries.Add('|' + ('  |'*($row.Pipes.Length-1)))
+            $targetLine=$entries.Count-1
+        }
+    }
+    $start=$ui.LineStarts[$view.FirstLine]
+    $end=$Tab.Length()
+    if($view.LastLine+1 -lt $ui.LineStarts.Length){$end=$ui.LineStarts[$view.LastLine+1]-1}
+    $replacement=[string]::Join([string][char]10,$entries.ToArray())
+    Write-InlineBlock $start ($Tab.Slice($start,$end-$start)) $replacement
+    $targetLine=[Math]::Clamp($targetLine,0,$entries.Count-1)
+    if($targetLine -eq 1){$targetLine=0}
+    $destination=$start
+    for($i=0;$i -lt $targetLine;$i++){$destination+=$entries[$i].Length+1}
+    $targetRow=[NotepadTableRow]::Parse($entries[$targetLine])
+    if($Operation -eq 'add-column'){$column++}
+    $column=[Math]::Min($column,$targetRow.Pipes.Length-2)
+    $destination+=$targetRow.Pipes[$column]+1
+    $model.Select($destination,$destination)
+}
+
+function Get-EditorGeometryLayout([string]$Text,[bool]$Formatted){
+    $plain=Get-LineLayout $Text
+    if(!$Formatted){return $plain}
+    return Get-InlineLayout $Text ([NotepadInlineLine]::Map($Text))
+}
+
+function Uses-Spelling([NotepadTab]$Tab){
+    return $settings.spellCheck -and [IO.Path]::GetExtension($Tab.Path) -in @('','.txt','.md','.markdown')
+}
+
+function Check-VisibleSpelling {
+    if($ui.SpellingUnavailable -or $ui.Settings -or $ui.Minimized -or $ui.EntranceStatus -eq 'Animating' -or $null -eq $ui.GateLines){return}
+    $tab=$model.Active()
+    if(!(Uses-Spelling $tab) -or $ui.LineStartsKey -ne "$($tab.Id)|$($tab.Revision)|$($tab.Document.Length)"){return}
+    if(![object]::ReferenceEquals($ui.SpellingGate,$ui.GateLines)){
+        $ui.SpellingGate=$ui.GateLines;$ui.SpellingLine=0
+    }
+    while($ui.SpellingLine -lt $ui.SpellingGate.Count){
+        $line=$ui.SpellingGate[$ui.SpellingLine];$ui.SpellingLine++
+        if($line.Length -eq 0 -or $line.Length -gt 4096){continue}
+        $text=$tab.Slice($line.Start,$line.Length)
+        if($ui.Spelling.ContainsKey($text) -or [string]::IsNullOrWhiteSpace($text)){continue}
+        if(!$graphics.OpenSpelling([Globalization.CultureInfo]::CurrentUICulture.Name)){$ui.SpellingUnavailable=$true;return}
+        if($ui.Spelling.Count -ge 256){$ui.Spelling.Clear()}
+        try{$ui.Spelling[$text]=$graphics.CheckSpelling($text)}
+        catch{$ui.Spelling[$text]=[NotepadSpellingSpan[]]::new(0)}
+        if($ui.Spelling[$text].Length -gt 0){Invalidate}
+        return
+    }
 }
 
 function Paint-Editor {
@@ -16284,19 +17467,27 @@ function Paint-Editor {
     Node 'editor-area' 0 80 $ui.Width $h ([FluentAction]::Editor) $null 'text'
     $available=[Math]::Max(1,$ui.Width-32-12);$view=$h-28
     Update-LineStarts $tab
+    $formatted=$tab.Markdown -and $ui.MarkdownFormattedTabs.Contains($tab.Id)
     if($null -ne $ui.LineLayoutsUsed){$ui.LineLayoutsUsed.Clear()}
     $starts=$ui.LineStarts;$lineCount=$starts.Length
     $caretLine=Get-LineIndex $tab.Focus
     if($ui.EnsureCaret){
-        $caretLayout=Get-LineLayout (Get-LineText $caretLine)
-        $caretAt=$graphics.Caret($caretLayout,[uint32]($tab.Focus-$starts[$caretLine]),$false)
+        $caretText=Get-LineText $caretLine
+        $caretPosition=$tab.Focus-$starts[$caretLine]
+        $caretLayout=Get-LineLayout $caretText
+        if($formatted){
+            $caretInline=[NotepadInlineLine]::Map($caretText)
+            $caretLayout=Get-InlineLayout $caretText $caretInline
+            $caretPosition=$caretInline.VisibleAtSource[$caretPosition]
+        }
+        $caretAt=$graphics.Caret($caretLayout,[uint32]$caretPosition,$false)
         $caretLineHeight=$graphics.Metrics($caretLayout).Height
         # Above the gate: the caret line becomes the top. Below it: the top moves down until the caret line ends
         # inside the gate.
         if($caretLine -lt [int]$tab.ScrollY){$tab.ScrollY=$caretLine}
         else{
             $sum=0.0;$first=$caretLine
-            while($first -ge [int]$tab.ScrollY){$sum+=$graphics.Metrics((Get-LineLayout (Get-LineText $first))).Height;if($sum -gt $view){break};$first--}
+            while($first -ge [int]$tab.ScrollY){$sum+=$graphics.Metrics((Get-EditorGeometryLayout (Get-LineText $first) $formatted)).Height;if($sum -gt $view){break};$first--}
             if($sum -gt $view){$tab.ScrollY=[Math]::Min($caretLine,$first+1)}
         }
         if($settings.wordWrap -and [Math]::Floor($tab.ScrollY) -eq $caretLine){
@@ -16312,15 +17503,15 @@ function Paint-Editor {
     # Find the earliest starting point that still fills the viewport with the end of the document.
     $tailLine=$lineCount-1
     $tailHeight=0.0
-    $lineHeight=$graphics.Metrics((Get-LineLayout (Get-LineText $tailLine))).Height
+    $lineHeight=$graphics.Metrics((Get-EditorGeometryLayout (Get-LineText $tailLine) $formatted)).Height
     while($tailLine -gt 0 -and $tailHeight+$lineHeight -lt $view){
         $tailHeight+=$lineHeight
         $tailLine--
-        $lineHeight=$graphics.Metrics((Get-LineLayout (Get-LineText $tailLine))).Height
+        $lineHeight=$graphics.Metrics((Get-EditorGeometryLayout (Get-LineText $tailLine) $formatted)).Height
     }
     $maxTop=$tailLine+[Math]::Max(0,($tailHeight+$lineHeight-$view)/[Math]::Max(1,$lineHeight))
     $tab.ScrollY=[Math]::Clamp([double]$tab.ScrollY,0,$maxTop);$top=[int][Math]::Floor($tab.ScrollY)
-    $topLayout=Get-LineLayout (Get-LineText $top)
+    $topLayout=Get-EditorGeometryLayout (Get-LineText $top) $formatted
     $topHeight=$graphics.Metrics($topLayout).Height
     $rowHeight=$graphics.Caret($topLayout,0,$false).Height
     $ui.WheelStep=[Math]::Min(3,3*$rowHeight/[Math]::Max(1,$topHeight))
@@ -16328,32 +17519,77 @@ function Paint-Editor {
     $graphics.Clip(0,94,($ui.Width-12),[Math]::Max(1,$h-14))
     $selStart=[Math]::Min($tab.Anchor,$tab.Focus);$selEnd=[Math]::Max($tab.Anchor,$tab.Focus)
     $foreground=Role-Color 'foreground';$selectionBack=Role-Color 'selectionBackground';$selectionFore=Color 'selection-text'
+    $extension=[IO.Path]::GetExtension($tab.Path)
+    $language=''
+    if($extension -in @('.c','.h')){$language='c'}
+    elseif($extension -in @('.ps1','.psm1','.psd1')){$language='powershell'}
+    $syntaxPalette=''
+    if($language){$syntaxPalette=[string]::Join('|',$settings.ansiColors)}
+    $spell=Uses-Spelling $tab
     $gate=[Collections.Generic.List[NotepadGateLine]]::new()
+    $tableView=$null
     for($line=$top;$line -lt $lineCount -and $y -lt 80+$h;$line++){
         $start=$starts[$line];$end=if($line+1 -lt $lineCount){$starts[$line+1]-1}else{$tab.Document.Length}
-        $layout=Get-LineLayout $tab.Slice($start,$end-$start)
+        $lineText=$tab.Slice($start,$end-$start)
+        $layout=Get-LineLayout $lineText
+        $inline=$null
+        $tableRow=$null;$divider=$false;$renderTable=$false
+        if($formatted){
+            $tableRow=[NotepadTableRow]::Parse($lineText)
+            if($tableRow -and (!$tableView -or $line -gt $tableView.LastLine)){$tableView=Get-TableView $line $tableRow}
+            if($tableRow -and $tableView -and $line -ge $tableView.FirstLine -and $line -le $tableView.LastLine){
+                $divider=$line -eq $tableView.FirstLine+1
+                $inline=$tableRow.Project($tableView.Widths,$tableView.Alignment,$divider)
+                $renderTable=$true
+            }else{$inline=[NotepadInlineLine]::Map($lineText);$tableRow=$null}
+            $layout=Get-InlineLayout $lineText $inline $renderTable
+        }
         $gateLine=[NotepadGateLine]::new();$gateLine.Line=$line;$gateLine.Start=$start;$gateLine.Length=$end-$start;$gateLine.Top=$y;$gateLine.Height=$graphics.Metrics($layout).Height;$gateLine.Layout=$layout
+        $gateLine.Inline=$inline
+        $gateLine.TableRow=$tableRow;$gateLine.TableDivider=$divider
         $gate.Add($gateLine)
         # This line's share of the selection, plus a sliver for its line break when the selection runs past it.
         $from=[Math]::Max($selStart,$start);$to=[Math]::Min($selEnd,$end)
         [NotepadRect[]]$rects=[NotepadRect[]]::new(0)
-        if($to -gt $from){$rects=@($graphics.Selection($layout,($from-$start),($to-$from)))}
+        if($to -gt $from){
+            $visibleFrom=$from-$start;$visibleTo=$to-$start
+            if($inline){$visibleFrom=$inline.VisibleAtSource[$visibleFrom];$visibleTo=$inline.VisibleAtSource[$visibleTo]}
+            if($visibleTo -gt $visibleFrom){$rects=@($graphics.Selection($layout,$visibleFrom,($visibleTo-$visibleFrom)))}
+        }
         foreach($rect in $rects){$graphics.Fill(($ox+$rect.X),($y+$rect.Y),[Math]::Max(1,$rect.Width),$rect.Height,$selectionBack,0)}
         if($selStart -le $end -and $selEnd -gt $end -and $line+1 -lt $lineCount){
-            $breakAt=$graphics.Caret($layout,[uint32]($end-$start),$false);$graphics.Fill(($ox+$breakAt.X),($y+$breakAt.Y),6,$breakAt.Height,$selectionBack,0)
+            $lineEnd=$end-$start
+            if($inline){$lineEnd=$inline.Text.Length}
+            $breakAt=$graphics.Caret($layout,[uint32]$lineEnd,$false);$graphics.Fill(($ox+$breakAt.X),($y+$breakAt.Y),6,$breakAt.Height,$selectionBack,0)
         }
-        $graphics.DrawLayout($layout,$ox,$y,$foreground)
+        $paintLayout=$layout
+        if($language -and !$formatted){$paintLayout=Get-LineLayout $lineText (Get-SyntaxEntryState $line $language) $syntaxPalette $language}
+        $graphics.DrawLayout($paintLayout,$ox,$y,$foreground)
         if($ui.ShowControls){
             $controls=[Text.RegularExpressions.Regex]::Matches($tab.Slice($start,$end-$start),'[\p{Cf}\u001E\u001F]')
             foreach($control in $controls){
-                $at=$graphics.Caret($layout,[uint32]$control.Index,$false)
+                $controlPosition=$control.Index
+                if($inline){$controlPosition=$inline.VisibleAtSource[$controlPosition]}
+                $at=$graphics.Caret($layout,[uint32]$controlPosition,$false)
                 $code='U+'+([int][char]$control.Value[0]).ToString('X4')
                 Label $code ($ox+$at.X) ($y+$at.Y+$at.Height-6) 48 (Color 'accent-color') 8 'Consolas'
             }
         }
         foreach($rect in $rects){$graphics.Clip(($ox+$rect.X),($y+$rect.Y),[Math]::Max(1,$rect.Width),$rect.Height);$graphics.DrawLayout($layout,$ox,$y,$selectionFore);$graphics.Unclip()}
+        if(!$formatted -and $spell -and $ui.Spelling.ContainsKey($lineText)){
+            foreach($errorSpan in $ui.Spelling[$lineText]){
+                foreach($fragment in $graphics.Selection($layout,$errorSpan.Start,$errorSpan.Length)){
+                    $underlineY=$y+$fragment.Y+$fragment.Height-2
+                    for($dot=0.0;$dot -lt $fragment.Width;$dot+=3){
+                        $graphics.Fill(($ox+$fragment.X+$dot),$underlineY,[Math]::Min(1.5,$fragment.Width-$dot),1.5,'#e45252',0)
+                    }
+                }
+            }
+        }
         if($line -eq $caretLine -and $ui.Focus -eq 'editor-area' -and $ui.Focused -and $ui.Blink -and -not $ui.Modal -and -not $ui.Settings){
-            $caretAt=$graphics.Caret($layout,[uint32]($tab.Focus-$start),$false);$graphics.Fill(($ox+$caretAt.X),($y+$caretAt.Y),1,$caretAt.Height,(Role-Color 'cursor'),0)
+            $position=$tab.Focus-$start
+            if($inline){$position=$inline.VisibleAtSource[$position]}
+            $caretAt=$graphics.Caret($layout,[uint32]$position,$false);$graphics.Fill(($ox+$caretAt.X),($y+$caretAt.Y),1,$caretAt.Height,(Role-Color 'cursor'),0)
         }
         $y+=$gateLine.Height
     }
@@ -16453,7 +17689,7 @@ function Paint-Chrome {
         $mx+=$entry.Width+2
     }
     if($settings.formatting){
-        $fx=($w-280)/2
+        $fx=($w-386)/2
         $headingLine=$tab.Document.LineOf($tab.Focus)
         $headingStart=$tab.Document.LineStart($headingLine)
         $headingEnd=if($headingLine+1 -lt $tab.Document.LineCount()){$tab.Document.LineStart($headingLine+1)-1}else{$tab.Length()}
@@ -16464,17 +17700,29 @@ function Paint-Chrome {
         Icon 'chevronDown' ($fx+32) 56 8
         Button 'format-lists' ($fx+44) 45 38 30 ([FluentAction]::ToggleMenu) '' '' 'lists';Label ([string][char]0xE8FD) ($fx+51) 52 22 (Color 'text-primary') 16 'Segoe Fluent Icons'
         $inlineColor=Color 'text-primary'
+        $inlineState=Get-InlineToolbarState $tab
         Button 'format-bold' ($fx+84) 45 30 30 ([FluentAction]::FormatBold)
+        if($inlineState -band 1){$graphics.Stroke(($fx+84),45,30,30,(Color 'accent-color'),4,1)}
         Label ([string][char]0xE8DD) ($fx+91) 52 20 $inlineColor 16 'Segoe Fluent Icons'
         Button 'format-italic' ($fx+116) 45 30 30 ([FluentAction]::FormatItalic)
+        if($inlineState -band 2){$graphics.Stroke(($fx+116),45,30,30,(Color 'accent-color'),4,1)}
         Label ([string][char]0xE8DB) ($fx+123) 52 20 $inlineColor 16 'Segoe Fluent Icons'
         Button 'format-strike' ($fx+148) 45 30 30 ([FluentAction]::FormatStrike)
+        if($inlineState -band 4){$graphics.Stroke(($fx+148),45,30,30,(Color 'accent-color'),4,1)}
         Label ([string][char]0xEDE0) ($fx+155) 52 20 $inlineColor 16 'Segoe Fluent Icons'
         Button 'format-link' ($fx+180) 45 30 30 ([FluentAction]::FormatLink);Label ([string][char]0xE71B) ($fx+187) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
         Button 'format-more' ($fx+212) 45 30 30 ([FluentAction]::ToggleMenu) '' '' 'formatMore';Label ([string][char]0xE712) ($fx+219) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
+        Button 'format-table' ($fx+244) 45 34 30 ([FluentAction]::ToggleMenu) '' '' 'table'
+        Label '▦' ($fx+251) 50 22 (Color 'text-primary') 17
+        $clearAction=if($tab.Anchor -ne $tab.Focus){[FluentAction]::ClearFormatting}else{[FluentAction]::None}
+        Button 'format-clear' ($fx+280) 45 30 30 $clearAction
+        Label ([string][char]0xE75C) ($fx+287) 52 20 $(if($clearAction -eq [FluentAction]::None){Color 'text-disabled'}else{$inlineColor}) 16 'Segoe Fluent Icons'
+        Button 'format-view' ($fx+312) 45 34 30 ([FluentAction]::ToggleMarkdownSource)
+        Label '</>' ($fx+317) 51 25 $inlineColor 14 'Consolas'
+        if($ui.MarkdownFormattedTabs.Contains($tab.Id)){$graphics.Stroke(($fx+312),45,34,30,(Color 'accent-color'),4,1)}
     }
     # One copy button, in the centre ribbon after the formatting buttons, or alone in the centre when formatting is off.
-    $copyX=if($settings.formatting){($w-280)/2+244}else{($w-32)/2}
+    $copyX=if($settings.formatting){($w-386)/2+350}else{($w-32)/2}
     Button 'btn-copy-document' $copyX 45 32 30 ([FluentAction]::CopyDocument)
     Label ([string][char]0xE8C8) ($copyX+8) 52 20 (Color 'text-primary') 16 'Segoe Fluent Icons'
     Button 'btn-settings-toggle' ($w-40) 43 32 32 ([FluentAction]::OpenSettings) '' 'gear'
@@ -16634,6 +17882,51 @@ function Paint-EditorMenu {
     Paint-MenuRows $rows $sideX $sideY $sideWidth 'flyout-context-side' $rowHeight
 }
 function Paint-Menus {
+    if($ui.Menu -eq 'table'){
+        $cardWidth=190.0;$cell=30.0;$step=34.0
+        $x=[Math]::Clamp(($ui.Width-386)/2+244,4.0,[Math]::Max(4.0,$ui.Width-$cardWidth-4))
+        $y=83.0
+        $activeTab=$model.Active()
+        $table=$null;$caretRow=$null;$caretLine=0
+        if($ui.MarkdownFormattedTabs.Contains($activeTab.Id)){
+            Update-LineStarts $activeTab
+            $caretLine=$activeTab.Document.LineOf($activeTab.Focus)
+            $caretRow=[NotepadTableRow]::Parse((Get-LineText $caretLine))
+            if($caretRow){$table=Get-TableView $caretLine $caretRow}
+        }
+        $height=207.0
+        if($table){$height+=110}
+        $graphics.Fill($x,$y,$cardWidth,$height,(Color 'bg-flyout'),7)
+        $graphics.Stroke($x,$y,$cardWidth,$height,(Color 'border-control'),7,1)
+        Node 'flyout-table-background' $x $y $cardWidth $height ([FluentAction]::None)
+        $hoverColumns=0;$hoverRows=0
+        if($ui.Hover.StartsWith('flyout-table-cell-')){
+            $parts=$ui.Hover.Split('-')
+            $hoverColumns=[int]$parts[3];$hoverRows=[int]$parts[4]
+        }
+        $label=if($hoverColumns){"$hoverColumns × $hoverRows"}else{'Insert Markdown table'}
+        Label $label ($x+12) ($y+8) ($cardWidth-24) (Color 'text-primary') 12
+        for($row=1;$row -le 5;$row++){
+            for($column=1;$column -le 5;$column++){
+                $left=$x+12+($column-1)*$step;$top=$y+31+($row-1)*$step
+                $active=$column -le $hoverColumns -and $row -le $hoverRows
+                if($active){$graphics.Fill($left,$top,$cell,$cell,(Menu-SelectionColor),4)}
+                $graphics.Stroke($left,$top,$cell,$cell,(Color 'border-control'),4,1)
+                Node "flyout-table-cell-$column-$row" $left $top $cell $cell ([FluentAction]::InsertTable) ([int[]]@($column,$row))
+            }
+        }
+        if($table){
+            Button 'flyout-table-add-row' ($x+6) ($y+205) ($cardWidth-12) 25 ([FluentAction]::TableStructure) 'Add row below' '' 'add-row'
+            Button 'flyout-table-add-column' ($x+6) ($y+231) ($cardWidth-12) 25 ([FluentAction]::TableStructure) 'Add column to the right' '' 'add-column'
+            if($caretLine -gt $table.FirstLine+1){
+                Button 'flyout-table-remove-row' ($x+6) ($y+257) ($cardWidth-12) 25 ([FluentAction]::TableStructure) 'Delete row' '' 'remove-row'
+            }
+            if($caretRow.Pipes.Length -gt 2){
+                Button 'flyout-table-remove-column' ($x+6) ($y+283) ($cardWidth-12) 25 ([FluentAction]::TableStructure) 'Delete column' '' 'remove-column'
+            }
+        }
+        return
+    }
     if(-not $ui.Menu){return}
     if($ui.Menu -eq 'context'){Paint-EditorMenu;return}
     [NotepadMenuRow[]]$rows=switch($ui.Menu){
@@ -16724,6 +18017,16 @@ function Toggle-Control([string]$Key,[double]$X,[double]$Y){
     $graphics.Fill(($X+3+$(if($on){18}else{0})),($Y+$(if($on){5}else{6})),($(if($on){14}else{12})),($(if($on){14}else{12})),$knob,7)
     Label $(if($on){'On'}else{'Off'}) ($X+50) ($Y+4) 28 (Color 'text-primary') 13
 }
+function Paint-ColorSwatch([string]$Id,[double]$X,[double]$Y,[string]$Fill,[FluentAction]$Action,[object]$Data){
+    $scale=[double]$ui.Dpi/96.0
+    $left=[Math]::Round($X*$scale)/$scale
+    $top=[Math]::Round($Y*$scale)/$scale
+    $size=[Math]::Round(32.0*$scale)/$scale
+    $border=1.0/$scale
+    Node $Id $left $top $size $size $Action $Data
+    $graphics.Fill($left,$top,$size,$size,$Fill,4)
+    $graphics.Stroke(($left+$border/2),($top+$border/2),($size-$border),($size-$border),(Color 'border-control'),4,$border)
+}
 function Paint-ColorControls([double]$X,[double]$Y,[double]$W){
     [string[]]$names=@('Black','Red','Green','Yellow','Blue','Purple','Cyan','White')
     [string[][]]$roles=@(@('foreground','Foreground'),@('tabs','Tabs'),@('cursor','Cursor color'),@('selectionBackground','Selection background'),@('topLeft','Top left'),@('topRight','Top right'),@('bottomLeft','Bottom left'),@('bottomRight','Bottom right'),@('chrome','Title bar and toolbar'))
@@ -16731,11 +18034,13 @@ function Paint-ColorControls([double]$X,[double]$Y,[double]$W){
         $rowY=$Y+$i*40
         if($i -lt $names.Length){
             Label $names[$i] ($X+24) ($rowY+8) 72 (Color 'text-primary') 14
-            foreach($bright in [int[]]@(0,1)){$index=$i+8*$bright;$sx=$X+112+42*$bright;Node ('palette-'+$index) $sx $rowY 32 32 ([FluentAction]::EditAnsi) $index;$graphics.Fill($sx,$rowY,32,32,$settings.ansiColors[$index],4);$graphics.Stroke($sx,$rowY,32,32,(Color 'border-control'),4,1)}
+            foreach($bright in [int[]]@(0,1)){
+                $index=$i+8*$bright
+                Paint-ColorSwatch ('palette-'+$index) ($X+112+42*$bright) $rowY $settings.ansiColors[$index] ([FluentAction]::EditAnsi) $index
+            }
         }
         Label $roles[$i][1] ($X+$W/2) ($rowY+8) ($W/2-66) (Color 'text-primary') 14
-        $cx=$X+$W-56;Node ('color-'+$roles[$i][0]) $cx $rowY 32 32 ([FluentAction]::EditColor) $roles[$i][0]
-        $graphics.Fill($cx,$rowY,32,32,(Role-Color $roles[$i][0]),4);$graphics.Stroke($cx,$rowY,32,32,(Color 'border-control'),4,1)
+        Paint-ColorSwatch ('color-'+$roles[$i][0]) ($X+$W-56) $rowY (Role-Color $roles[$i][0]) ([FluentAction]::EditColor) $roles[$i][0]
     }
     Button 'reset-colors' ($X+24) ($Y+370) 130 32 ([FluentAction]::ResetColors) 'Reset colors' '' $null $false $true
 }
@@ -16774,6 +18079,7 @@ function Paint-Settings {
         @{Section='Text Formatting'}
         @{Title='Font';Icon='font';Accordion='card-font-setting'}
         @{Title='Word wrap';Subtitle='Fit text within window by default';Icon='wordWrap';Key='wordWrap';Toggle=$true}
+        @{Title='Spell check';Subtitle='Mark spelling errors in text and Markdown documents';Icon='spellCheck';Key='spellCheck';Toggle=$true}
         @{Title='Formatting';Icon='formatting';Key='formatting';Toggle=$true}
         @{Section='Opening Notepad'}
         @{Title='Opening files';Subtitle='Choose where your files are opened';Icon='openFiles';Key='openingFiles';Select=@(@{Text='Open in a new tab';Value='newTab'},@{Text='Open in a new window';Value='newWindow'});SelectWidth=184}
@@ -16968,12 +18274,20 @@ function Paint-CanvasColorPicker {
     if($height -lt $naturalHeight){$track=$height-16;$thumb=$track*$height/$naturalHeight;$ty=$y+8+($track-$thumb)*$p.Scroll/($naturalHeight-$height);$graphics.Fill(($x+$width-7),$ty,4,$thumb,'rgba(255,255,255,0.3)',2)}
 }
 function Paint-Tooltip {
-    if(-not $ui.TooltipShown -or $ui.Hover -ne 'btn-copy-document' -or $ui.Settings -or $ui.Modal){return}
-    $r=$ui.Nodes['btn-copy-document'].Rect;$width=if($settings.copyAsFile){228}else{164}
+    if(-not $ui.TooltipShown -or $ui.Settings -or $ui.Modal){return}
+    $text=switch($ui.Hover){
+        'format-clear'{'Clear formatting'}
+        'format-table'{'Insert table'}
+        'format-view'{if($ui.MarkdownFormattedTabs.Contains($model.Active().Id)){'Show Markdown source'}else{'Show formatted text'}}
+        'btn-copy-document'{if($settings.copyAsFile){'Copy whole document as .txt file'}else{'Copy whole document'}}
+        default{''}
+    }
+    if(!$text -or !$ui.Nodes.ContainsKey($ui.Hover)){return}
+    $r=$ui.Nodes[$ui.Hover].Rect;$width=(Measure-LabelWidth $text 12)+20
     $x=[Math]::Clamp(($r[0]+$r[2]/2-$width/2),8,[Math]::Max(8,$ui.Width-$width-8));$y=$r[1]+$r[3]+7
     $graphics.Fill(($x+1),($y+3),$width,32,'rgba(0,0,0,0.2)',4)
     $graphics.Fill($x,$y,$width,30,(Color 'bg-flyout'),4);$graphics.Stroke($x,$y,$width,30,(Color 'border-control'),4,1)
-    Label $(if($settings.copyAsFile){'Copy whole document as .txt file'}else{'Copy whole document'}) ($x+10) ($y+7) ($width-20) (Color 'text-primary') 12
+    Label $text ($x+10) ($y+7) ($width-20) (Color 'text-primary') 12
 }
 function Paint-TabDrag {
     if(!$ui.TabDragId -or !$ui.TabDragPreview -or $ui.TabDragOutside){return}
@@ -17029,13 +18343,176 @@ function Step-DragScroll([datetime]$Instant){
 
 # A point in the editor to a text position, through the line of the last frame's gate under it (the last line when
 # the point is below them all).
+function Move-InlineCaret([NotepadTab]$Tab,[bool]$Backward,[bool]$Extend){
+    if(!$ui.MarkdownFormattedTabs.Contains($Tab.Id)){return $false}
+    $line=$Tab.Document.LineOf($Tab.Focus)
+    $start=$Tab.Document.LineStart($line)
+    $end=$Tab.Length()
+    if($line+1 -lt $Tab.Document.LineCount()){$end=$Tab.Document.LineStart($line+1)-1}
+    $inline=[NotepadInlineLine]::Map($Tab.Slice($start,$end-$start))
+    if($inline.Text.Length -eq $end-$start){return $false}
+    $position=$inline.VisibleAtSource[$Tab.Focus-$start]
+    $bounds=[Globalization.StringInfo]::ParseCombiningCharacters($inline.Text)
+    $destination=-1
+    if($Backward){
+        for($i=$bounds.Length-1;$i -ge 0;$i--){if($bounds[$i] -lt $position){$destination=$bounds[$i];break}}
+    }else{
+        foreach($boundary in $bounds){if($boundary -gt $position){$destination=$boundary;break}}
+        if($destination -lt 0 -and $position -lt $inline.Text.Length){$destination=$inline.Text.Length}
+    }
+    if($destination -lt 0){
+        if($Backward){
+            if($start -eq 0){return $true}
+            $target=$start-1
+        }else{
+            if($end -ge $Tab.Length()){return $true}
+            $target=$end+1
+        }
+    }else{$target=$start+$inline.SourceAtVisible[$destination]}
+    $anchor=if($Extend){$Tab.Anchor}else{$target}
+    $model.Select($anchor,$target)
+    return $true
+}
+
+function Get-SelectedDisplayText([NotepadTab]$Tab,[int]$Start,[int]$Length){
+    if(!$ui.MarkdownFormattedTabs.Contains($Tab.Id)){return $Tab.Slice($Start,$Length)}
+    $end=$Start+$Length
+    Update-LineStarts $Tab
+    $firstLine=$Tab.Document.LineOf($Start)
+    $lastLine=$Tab.Document.LineOf($end)
+    $row=[NotepadTableRow]::Parse((Get-LineText $firstLine))
+    if($row){
+        $view=Get-TableView $firstLine $row
+        if($view){
+            if($firstLine -eq $lastLine -and $firstLine -ne $view.FirstLine+1){
+                $rowStart=$ui.LineStarts[$firstLine]
+                for($column=0;$column+1 -lt $row.Pipes.Length;$column++){
+                    $cellStart=$rowStart+$row.Pipes[$column]+1;$cellEnd=$rowStart+$row.Pipes[$column+1]
+                    if($Start -ge $cellStart -and $end -le $cellEnd){
+                        $cell=$row.Cell($column)
+                        $from=$cell.VisibleAtSource[$Start-$cellStart]
+                        $to=$cell.VisibleAtSource[$end-$cellStart]
+                        return $cell.Text.Substring($from,$to-$from)
+                    }
+                }
+            }
+            # Copying structure preserves the authoring text so it can be pasted as a Markdown table.
+            return $Tab.Slice($Start,$Length)
+        }
+    }
+    $blockStart=$Tab.Document.LineStart($Tab.Document.LineOf($Start))
+    $blockEnd=$Tab.Length()
+    if($lastLine+1 -lt $Tab.Document.LineCount()){$blockEnd=$Tab.Document.LineStart($lastLine+1)-1}
+    $inline=[NotepadInlineLine]::MapBlock($Tab.Slice($blockStart,$blockEnd-$blockStart))
+    $first=$inline.VisibleAtSource[$Start-$blockStart]
+    $last=$inline.VisibleAtSource[$end-$blockStart]
+    return $inline.Text.Substring($first,$last-$first)
+}
+
+function Write-InlineBlock([int]$Start,[string]$Source,[string]$Serialized){
+    # Only the changed slice enters the piece table and the undo journal.
+    $prefix=0
+    $shared=[Math]::Min($Source.Length,$Serialized.Length)
+    while($prefix -lt $shared -and $Source[$prefix] -ceq $Serialized[$prefix]){$prefix++}
+    $suffix=0
+    while($suffix -lt $shared-$prefix -and $Source[$Source.Length-1-$suffix] -ceq $Serialized[$Serialized.Length-1-$suffix]){$suffix++}
+    if($prefix -eq $Source.Length -and $prefix -eq $Serialized.Length){return}
+    $model.Select(($Start+$prefix),($Start+$Source.Length-$suffix))
+    $model.Insert($Serialized.Substring($prefix,$Serialized.Length-$prefix-$suffix),$false)
+}
+
+function Edit-InlineText([NotepadTab]$Tab,[string]$Replacement,[int]$Direction){
+    if(!$ui.MarkdownFormattedTabs.Contains($Tab.Id)){return $false}
+    $from=[Math]::Min($Tab.Anchor,$Tab.Focus)
+    $to=[Math]::Max($Tab.Anchor,$Tab.Focus)
+    $firstLine=$Tab.Document.LineOf($from)
+    $lastLine=$Tab.Document.LineOf($to)
+    Update-LineStarts $Tab
+    $tableRow=[NotepadTableRow]::Parse((Get-LineText $firstLine))
+    if($tableRow){
+        $table=Get-TableView $firstLine $tableRow
+        if($table){
+            if($firstLine -ne $lastLine -or $firstLine -eq $table.FirstLine+1 -or
+                $Replacement.Contains('|') -or $Replacement.Contains([char]10) -or $Replacement.Contains([char]13)){return $true}
+            $startOffset=$from-$ui.LineStarts[$firstLine];$endOffset=$to-$ui.LineStarts[$firstLine]
+            $editable=$false
+            for($column=0;$column+1 -lt $tableRow.Pipes.Length;$column++){
+                $left=$tableRow.Pipes[$column]+1;$right=$tableRow.Pipes[$column+1]
+                if($startOffset -lt $left -or $endOffset -gt $right){continue}
+                if($from -eq $to -and (($Direction -lt 0 -and $startOffset -eq $left) -or ($Direction -gt 0 -and $endOffset -eq $right))){return $true}
+                $escaped=$tableRow.Source.IndexOf('\|',$left,[StringComparison]::Ordinal)
+                while($escaped -ge 0 -and $escaped+1 -lt $right){
+                    if($startOffset -eq $escaped+1 -or $endOffset -eq $escaped+1 -or
+                        ($from -eq $to -and (($Direction -lt 0 -and $startOffset -eq $escaped+2) -or
+                            ($Direction -gt 0 -and $endOffset -eq $escaped)))){return $true}
+                    $escaped=$tableRow.Source.IndexOf('\|',$escaped+2,[StringComparison]::Ordinal)
+                }
+                $editable=$true;break
+            }
+            if(!$editable){return $true}
+        }
+    }
+    if($from -eq $to -and $Direction -ne 0){
+        # Include the adjacent paragraph when deletion may consume the line break.
+        if($Direction -lt 0 -and $firstLine -gt 0){$firstLine--}
+        if($Direction -gt 0 -and $lastLine+1 -lt $Tab.Document.LineCount()){$lastLine++}
+    }
+    $start=$Tab.Document.LineStart($firstLine)
+    $end=$Tab.Length()
+    if($lastLine+1 -lt $Tab.Document.LineCount()){$end=$Tab.Document.LineStart($lastLine+1)-1}
+    $source=$Tab.Slice($start,$end-$start)
+    $inline=[NotepadInlineLine]::MapBlock($source)
+    $hasPending=$ui.InlineTyping.ContainsKey($Tab.Id)
+    if(!$hasPending -and $inline.Text.Length -eq $source.Length){return $false}
+    $first=$inline.VisibleAtSource[$from-$start]
+    $last=$inline.VisibleAtSource[$to-$start]
+    if($Direction -ne 0 -and $first -eq $last){
+        $boundaries=[Globalization.StringInfo]::ParseCombiningCharacters($inline.Text)
+        if($Direction -lt 0){
+            if(!$first){return $true}
+            for($i=$boundaries.Length-1;$i -ge 0;$i--){if($boundaries[$i] -lt $first){$first=$boundaries[$i];break}}
+        }else{
+            if($last -eq $inline.Text.Length){return $true}
+            $last=$inline.Text.Length
+            foreach($at in $boundaries){if($at -gt $first){$last=$at;break}}
+        }
+    }
+    $Replacement=$Replacement.Replace([string]([char]13)+[char]10,[string][char]10).Replace([char]13,[char]10)
+    $visible=$inline.Text.Remove($first,$last-$first).Insert($first,$Replacement)
+    $flags=[int[]]::new($visible.Length)
+    [Array]::Copy($inline.Styles,0,$flags,0,$first)
+    $insertStyle=0
+    if($hasPending){$insertStyle=$ui.InlineTyping[$Tab.Id]}
+    elseif($first -lt $last){$insertStyle=$inline.Styles[$first]}
+    elseif($first -gt 0){$insertStyle=$inline.Styles[$first-1]}
+    elseif($inline.Styles.Length){$insertStyle=$inline.Styles[0]}
+    for($i=$first;$i -lt $first+$Replacement.Length;$i++){
+        if($visible[$i] -ne [char]10){$flags[$i]=$insertStyle}
+    }
+    [Array]::Copy($inline.Styles,$last,$flags,$first+$Replacement.Length,$inline.Styles.Length-$last)
+    [NotepadInlineLine]::NormalizeWhitespace($visible,$flags)
+    $serialized=[NotepadInlineLine]::SerializeBlock($visible,$flags)
+    $next=[NotepadInlineLine]::MapBlock($serialized)
+    if(!$next.Matches($visible,$flags)){
+        Open-Modal 'Edit formatted text' 'This edit cannot preserve the Markdown formatting. Switch to Source view to edit the original Markdown.' @(@{Text='Close';Action=[FluentAction]::Dismiss;Primary=$true})
+        return $true
+    }
+    Write-InlineBlock $start $source $serialized
+    $target=$start+$next.SourceAtVisible[$first+$Replacement.Length]
+    $model.Select($target,$target)
+    return $true
+}
+
 function Editor-Hit([double]$X,[double]$Y,[bool]$Extend=$false){
     $tab=$model.Active();$position=$tab.Focus
+    $null=$ui.InlineTyping.Remove($tab.Id)
     if($null -ne $ui.GateLines -and $ui.GateLines.Count){
         [NotepadGateLine]$under=$ui.GateLines[$ui.GateLines.Count-1]
         foreach($gateLine in $ui.GateLines){if($Y -lt $gateLine.Top+$gateLine.Height){$under=$gateLine;break}}
         $hit=$graphics.HitText($under.Layout,($X-$ui.EditorOrigin[0]),[Math]::Max(0,$Y-$under.Top))
-        $position=$under.Start+[Math]::Min($hit.Position,$under.Length)
+        $offset=[Math]::Min($hit.Position,$under.Length)
+        if($under.Inline){$offset=$under.Inline.SourceAtVisible[[Math]::Min($offset,$under.Inline.Text.Length)]}
+        $position=$under.Start+$offset
     }
     $anchor=if($Extend){$tab.Anchor}else{$position};$model.Select($anchor,$position);$ui.Focus='editor-area';Invalidate $true
 }
@@ -17058,7 +18535,9 @@ function Key-Input([NotepadWindowEvent]$Event){
         $x=16.0;$y=94.0
         foreach($visibleLine in $ui.GateLines){
             if($tab.Focus -ge $visibleLine.Start -and $tab.Focus -le $visibleLine.Start+$visibleLine.Length){
-                $caret=$graphics.Caret($visibleLine.Layout,[uint32]($tab.Focus-$visibleLine.Start),$false)
+                $position=$tab.Focus-$visibleLine.Start
+                if($visibleLine.Inline){$position=$visibleLine.Inline.VisibleAtSource[$position]}
+                $caret=$graphics.Caret($visibleLine.Layout,[uint32]$position,$false)
                 $x=$ui.EditorOrigin[0]+$caret.X;$y=$visibleLine.Top+$caret.Y+$caret.Height
                 break
             }
@@ -17126,9 +18605,11 @@ function Key-Input([NotepadWindowEvent]$Event){
     if($key -eq 114){Command $(if($shift){[FluentAction]::FindPrevious}else{[FluentAction]::FindNext});return}
     if($key -eq 116){Command ([FluentAction]::TimeDate);return}
     if($ui.Focus -ne 'editor-area' -or $ui.Settings){return}
+    $tab=$model.Active()
     switch($key){
-        8{$model.Delete($true)};46{$model.Delete($false)}
-        37{$model.Move('left',$shift,$ctrl)};39{$model.Move('right',$shift,$ctrl)}
+        8{if(!(Edit-InlineText $tab '' -1)){$model.Delete($true)}};46{if(!(Edit-InlineText $tab '' 1)){$model.Delete($false)}}
+        37{if($ctrl -or (!$shift -and $tab.Anchor -ne $tab.Focus) -or !(Move-InlineCaret $tab $true $shift)){$model.Move('left',$shift,$ctrl)}}
+        39{if($ctrl -or (!$shift -and $tab.Anchor -ne $tab.Focus) -or !(Move-InlineCaret $tab $false $shift)){$model.Move('right',$shift,$ctrl)}}
         36{$model.Move('home',$shift,$ctrl)};35{$model.Move('end',$shift,$ctrl)}
         {$_ -in @(38,40,33,34)}{
             # Up and Down move a wrapped row within the line, then into the neighbouring line; Page Up and Down move
@@ -17153,6 +18634,28 @@ function Key-Input([NotepadWindowEvent]$Event){
     Invalidate ($key -in @(8,46,37,39,36,35,38,40,33,34))
 }
 function Handle-Event([NotepadWindowEvent]$Event){
+    if($Event.Kind -eq 'dropFiles'){
+        if($ui.Modal){return}
+        $ui.Settings=$false
+        $failures=[Collections.Generic.List[string]]::new()
+        $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach($path in $Event.Paths){
+            if(!$seen.Add($path)){continue}
+            try{Open-EditorFile $path}catch{$failures.Add($path+' — '+$_.Exception.Message)}
+        }
+        if($failures.Count){Open-Modal 'Open dropped files' ([string]::Join([string][char]10,$failures.ToArray())) @(@{Text='Close';Action=[FluentAction]::Dismiss;Primary=$true})}
+        Invalidate $true
+        return
+    }
+    if($Event.Kind -eq 'maximizeHover'){
+        $hoverId=if($ui.Settings){'settings-win-max'}else{'btn-win-max'}
+        if($ui.Hover -ne $hoverId){$ui.Hover=$hoverId;Invalidate}
+        return
+    }
+    if($Event.Kind -eq 'captionLeave'){
+        if($ui.Hover -in @('settings-win-max','btn-win-max')){$ui.Hover='';Invalidate}
+        return
+    }
     if($Event.Kind -eq 'tabTransfer'){Receive-TabTransfer $Event.W $Event.L;return}
     if($Event.Kind -eq 'minimized'){$ui.Minimized=$true;Write-ApplicationDiagnostic;return}
     if($Event.Kind -eq 'close'){Request-Close;return}
@@ -17171,6 +18674,7 @@ function Handle-Event([NotepadWindowEvent]$Event){
     $msg=$Event.Message
     if($msg -in @(0x100,0x104)){$ui.PendingHigh='';$ui.ContextEnter=$false;if($Event.Alt -and $Event.W -eq 115){Request-Close;return};Key-Input $Event;return}
     if($msg -eq 0x102){
+        if($Event.W -eq 9 -and $ui.Focus -eq 'editor-area' -and !$ui.Settings -and !$ui.Modal -and (Move-TableCell ($model.Active()) $Event.Shift)){return}
         $high=$ui.PendingHigh;$ui.PendingHigh=''
         if($ui.ContextEnter -and $Event.W -eq 13){$ui.ContextEnter=$false;return}
         if($ui.Menu -eq 'context'){return}
@@ -17179,7 +18683,7 @@ function Handle-Event([NotepadWindowEvent]$Event){
         if([char]::IsHighSurrogate($char)){$ui.PendingHigh=[string]$char;return}
         $text=[string]$char
         if([char]::IsLowSurrogate($char)){if(-not $high){return};$text=$high+$text}
-        if($ui.Focus -eq 'editor-area' -and -not $ui.Modal -and -not $ui.Settings){if($Event.W -eq 13){$text="`n"};$model.Insert($text,($text -ne "`n" -and $text -ne "`t"))}
+        if($ui.Focus -eq 'editor-area' -and -not $ui.Modal -and -not $ui.Settings){if($Event.W -eq 13){$text="`n"};if(!(Edit-InlineText ($model.Active()) $text 0)){$model.Insert($text,($text -ne "`n" -and $text -ne "`t"))}}
         elseif(($ui.Focus -in @('find-query-input','replace-query-input','dialog-input','link-text-input') -or ($ui.ColorPicker -and $ui.Focus.StartsWith('picker-input-'))) -and $Event.W -ge 32){Input-Insert $text}
         Invalidate $true;return
     }
@@ -17196,6 +18700,12 @@ function Handle-Event([NotepadWindowEvent]$Event){
         $ui.ScrollSequence++;Invalidate;return
     }
     [NotepadHitNode]$hit=Hit $x $y;$id=if($hit){$hit.Id}else{''}
+    if($msg -eq 0x208){
+        if($hit -and !$ui.Modal -and !$ui.Settings -and $hit.Action -in @([FluentAction]::SwitchTab,[FluentAction]::CloseSpecific)){
+            Command ([FluentAction]::CloseSpecific) $hit.Data
+        }
+        return
+    }
     # The right button acts on release: on the window icon it steps the icon back.
     if($msg -eq 0x204){return}
     if($msg -eq 0x205){
@@ -17253,7 +18763,20 @@ function Handle-Event([NotepadWindowEvent]$Event){
         if($hit -and $hit.Action -eq [FluentAction]::OpacitySlider){$ui.SliderDrag=$true;$ui.SliderKey=[string]$hit.Data;$ui.Focus='opacity-slider';$window.Capture($true);Set-SliderFromPoint $x;return}
         if($hit -and $hit.Action -eq [FluentAction]::Editor){
             Editor-Hit $x $y $Event.Shift
-            if($msg -eq 0x203){$tab=$model.Active();$pos=$tab.Focus;$start=$pos;$end=$pos;while($start -gt 0 -and -not [char]::IsWhiteSpace($tab.At($start-1))){$start--};while($end -lt $tab.Document.Length -and -not [char]::IsWhiteSpace($tab.At($end))){$end++};$model.Select($start,$end)}
+            $tab=$model.Active()
+            $clickTime=[DateTime]::UtcNow
+            if($msg -eq 0x203){
+                $word=Get-WordRange $tab $tab.Focus
+                $model.Select($word[0],$word[1])
+                $ui.WordClickTime=$clickTime;$ui.WordClickX=$px;$ui.WordClickY=$py
+            }elseif(($clickTime-$ui.WordClickTime).TotalMilliseconds -le [NotepadWindow]::GetDoubleClickTime() -and
+                [Math]::Abs($px-$ui.WordClickX)*2 -le [NotepadWindow]::GetSystemMetrics(36) -and
+                [Math]::Abs($py-$ui.WordClickY)*2 -le [NotepadWindow]::GetSystemMetrics(37)){
+                $line=$tab.Document.LineOf($tab.Focus)
+                $lineEnd=if($line+1 -lt $tab.Document.LineCount()){$tab.Document.LineStart($line+1)}else{$tab.Length()}
+                $model.Select($tab.Document.LineStart($line),$lineEnd)
+                $ui.WordClickTime=[DateTime]::MinValue
+            }else{$ui.WordClickTime=[DateTime]::MinValue}
             $ui.Drag=$true;$ui.DragX=$x;$ui.DragY=$y;$ui.DragTick=[DateTime]::UtcNow;$window.Capture($true)
         }elseif($hit -and $hit.Action -eq [FluentAction]::Drag){
             # A double-click on the title bar maximizes or restores, as on any Windows title bar; a single press drags.
@@ -17333,7 +18856,7 @@ try{
         Complete-TabTransfer $now
         if($ui.PowerShell.Poll() -and $ui.Modal -and $ui.Modal.PowerShell){Invalidate}
         if($ui.Drag -and $ui.EditorRect){Step-DragScroll $now}
-        if($ui.Hover -eq 'btn-copy-document' -and -not $ui.TooltipShown -and ($now-$ui.HoverSince).TotalMilliseconds -ge 450){$ui.TooltipShown=$true;Invalidate}
+        if($ui.Hover -in @('btn-copy-document','format-clear','format-table','format-view') -and -not $ui.TooltipShown -and ($now-$ui.HoverSince).TotalMilliseconds -ge 450){$ui.TooltipShown=$true;Invalidate}
         if($ui.EntranceStatus -eq 'Animating'){
           [double]$elapsed=($now-$ui.EntranceStart).TotalMilliseconds;[double]$progress=[Math]::Clamp($elapsed/$ui.Entrance.DurationMs,0.0,1.0)
             $eased=if($progress -ge 1){1.0}else{Entrance-Easing $progress}
@@ -17346,6 +18869,7 @@ try{
         }
         if(($now-$ui.LastBlink).TotalMilliseconds -ge 530){$ui.Blink=-not $ui.Blink;$ui.LastBlink=$now;if($ui.Focus -in @('editor-area','find-query-input','replace-query-input','dialog-input','link-text-input')){Invalidate}}
         if($ui.Dirty -and -not $ui.Minimized -and $ui.Width -gt 0 -and $ui.Height -gt 0 -and $ui.EntranceStatus -ne 'Animating'){Paint}
+        Check-VisibleSpelling
         if(($now-$ui.LastSession).TotalSeconds -ge 2){Persist;$ui.LastSession=$now}
         if($RunSeconds -gt 0 -and ($now-$start).TotalSeconds -ge $RunSeconds){$ui.Running=$false}
         [Threading.Thread]::Sleep(8)

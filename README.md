@@ -78,8 +78,15 @@ Direct2D, DirectWrite, text metrics, caret/hit-test round trips and selection re
 - Enable Recent Files in Settings to keep a list of recently opened or saved documents. The Opening Files
   preference applies to File → Open and File → Recent.
 - Mica, Acrylic, Reverse Mica and Clear backdrops with curved or straight corners. The four-corner
-  gradient has its own strength setting. The formatting toolbar edits Markdown source, and the copy
-  button copies the whole document as text or as a UTF-8 file.
+  gradient has its own strength setting.
+- The **</>** toolbar switch toggles between Markdown source and formatted editing. Format view
+  renders inline bold, italic, and strikethrough and supports editing cells in pipe-delimited
+  tables with a header separator. Use Tab and Shift+Tab to move between cells. The table menu
+  adds and removes rows and columns. Tables over 128 source rows and uneven tables remain in
+  text form. A cell copies as visible text. A whole table copies as Markdown.
+- The copy-document button copies the complete document as text or as a UTF-8 file.
+- C and PowerShell source highlighting uses the configurable color palette. Windows spelling
+  providers can mark misspellings in text and Markdown when the current UI language is available.
 - Saves target each document's own buffer; a cancelled or failed save neither closes a document nor
   marks it saved.
 - Click the title-bar notepad icon to cycle through 19 colors. Right-click to step back. Hold for
@@ -94,7 +101,7 @@ Direct2D, DirectWrite, text metrics, caret/hit-test round trips and selection re
 
 Parity with Windows Notepad is not established. Still to do: source-accurate blur, shadows and timed
 transitions; clipping and overflow; keyboard menu behaviour; caret geometry across fonts and DPI;
-IME/TSF composition; UI Automation; spell-check; printing and page setup; a rich Markdown
+IME/TSF composition; UI Automation; spelling suggestions and dictionary commands; printing and page setup; a rich Markdown
 preview; encoding selection for new files. Moving a tab between windows starts a new undo history.
 Literal replace-all uses .NET ordinal matching, so some
 JavaScript Unicode case and replacement-token behaviour differs. Drawing uses a software Direct2D HWND
