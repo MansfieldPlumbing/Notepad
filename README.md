@@ -1,7 +1,9 @@
 # Notepad
 
 Windows 11 Notepad, rebuilt in PowerShell 7 from an HTML/JS simulacrum, as one script, `Notepad.ps1`.
-It embeds no browser, JavaScript runtime, compiled bridge, WPF or Windows Forms. Its native executable path uses [PSC](https://github.com/MansfieldPlumbing/PSC). Native builds have been produced during development; this repository does not currently publish a verified executable release or a complete build receipt for the present revision.
+It embeds no browser, JavaScript runtime, compiled bridge, WPF or Windows Forms. The native executable
+is built with [PSC](https://github.com/MansfieldPlumbing/PSC). Native builds have been verified during
+development. A verified executable release for this revision is still pending.
 
 ## How it was made
 
@@ -22,56 +24,79 @@ It embeds no browser, JavaScript runtime, compiled bridge, WPF or Windows Forms.
 5. **One script.** The port began as `Notepad.ps1` running six scripts from `src` and two tests. PSC
    (`Invoke-PSC.ps1 -Mode Consolidate`) folded each into `Notepad.ps1` as a function; the checks the
    tests held are its `-VerifyModel` and `-VerifyGraphics` switches.
-6. **Native realization.** PSC lowers typed PowerShell to IL and links NativeAOT executables. The historical partial-lowering counts no longer describe the current source; verify the complete current application and native artifact against the corresponding PSC revision rather than assuming a historical build remains valid.
+6. **Native realization.** PSC lowers typed PowerShell to IL and links a NativeAOT executable.
+   Verify the application and native artifact against the corresponding PSC revision.
 
 Nothing here uses WinForms or WPF, so an Android port replaces the window, graphics and services
 layers with a JNI canvas rather than rewriting the application.
 
 ## Run
 
-Requires Windows x64. The current source declares PSC's `SingleThreadedApartment` and `ApplicationIcon` attributes. Plain pwsh may fail during parsing if those types are not registered; the legacy **Start Notepad.cmd** and direct script commands below are not a substitute for PSC-aware execution.
+Double-click **Start Notepad.cmd** to launch the Windows x64 NativeAOT build at `build\Notepad.exe`.
+If the executable is absent, the launcher runs the source in PowerShell 7.
+Double-click **Start Notepad from Source.cmd** to use PowerShell 7 even when a build is present.
+You can also start that executable directly:
 
 ```powershell
-pwsh -NoProfile -STA -File .\Notepad.ps1
-pwsh -NoProfile -STA -File .\Notepad.ps1 -Path C:\example\notes.txt
+.\build\Notepad.exe
+.\build\Notepad.exe -Path C:\example\notes.txt
 ```
 
 `-NoSession` neither loads nor writes preferences and session data (normally in
 `%LOCALAPPDATA%\NotepadPS1`). `-NoAnimation` skips the entrance animation.
 
+When you customize the icon, Notepad maintains **Notepad (custom icon).lnk** next to the running app.
+The shortcut follows the icon selected in the title bar and can be pinned separately.
+
 ## Checks
 
 ```powershell
-pwsh -NoProfile -File .\Notepad.ps1 -VerifyModel
-pwsh -NoProfile -STA -File .\Notepad.ps1 -VerifyGraphics
-pwsh -NoProfile -STA -File .\Notepad.ps1 -NoSession -RunSeconds 2
-pwsh -NoProfile -STA -File .\Notepad.ps1 -Compare -VerifyNativeFeatures
+pwsh -NoProfile -STA -File '.\Start Notepad from Source.ps1' -VerifyModel
+pwsh -NoProfile -STA -File '.\Start Notepad from Source.ps1' -VerifyGraphics
+pwsh -NoProfile -STA -File '.\Start Notepad from Source.ps1' -NoSession -RunSeconds 2
+pwsh -NoProfile -STA -File '.\Start Notepad from Source.ps1' -VerifyNativeFeatures
 ```
 
 `-VerifyModel` checks saving an inactive document, Unicode edits, undo/redo, find/replace,
 UTF-8/BOM/CRLF and session restoration. `-VerifyGraphics` checks all 25 icons, native window creation,
-Direct2D, DirectWrite, text metrics, caret/hit-test round trips and selection rectangles. `-Compare`
-writes its typed evidence to `evidence`; **Settings → Compare with Windows Notepad** runs it inside the
-application. None of these establishes screenshot equality or complete input-method support.
+Direct2D, DirectWrite, text metrics, caret/hit-test round trips and selection rectangles.
+`-VerifyNativeFeatures` writes replay evidence to `UIAutomation-TestData`.
 
 ## Implemented
 
 - Text entry, grapheme-aware cursor and deletion, mouse and word selection, clipboard, undo/redo,
   wrapping, scrolling and zoom.
+- Right-click or press Shift+F10 in the editor for editing commands, Markdown table insertion and
+  Unicode tools. The display options change reading order and mark control characters in the
+  editor without changing the file.
 - Tabs, menus, settings, theme and font choices, find/replace, Go To, status bar, close prompts, UTF-8
-  file opening and saving, and session persistence.
-- DWM materials (Mica, Acrylic, Reverse Mica) and curved or straight corners; a formatting toolbar
-  that edits Markdown source; whole-document Copy as text or as a UTF-8 file.
+  and BOM-marked UTF-16 LE/BE file opening and saving, and session persistence.
+- Drag a tab along its strip to reorder it. Drop it on another Notepad tab strip to dock it there,
+  or release it outside the windows to open it in a new window. A move between windows preserves
+  the text, file association, encoding, and selection. Use Ctrl+Tab or Ctrl+Shift+Tab to switch
+  tabs, or use the arrows when the tab strip fills up.
+- Enable Recent Files in Settings to keep a list of recently opened or saved documents. The Opening Files
+  preference applies to File → Open and File → Recent.
+- Mica, Acrylic, Reverse Mica and Clear backdrops with curved or straight corners. The four-corner
+  gradient has its own strength setting. The formatting toolbar edits Markdown source, and the copy
+  button copies the whole document as text or as a UTF-8 file.
 - Saves target each document's own buffer; a cancelled or failed save neither closes a document nor
   marks it saved.
+- Click the title-bar notepad icon to cycle through 19 colors. Right-click to step back. Hold for
+  about two-thirds of a second and release over the icon to switch to the Windows icon catalog.
+  Repeat the hold to return to the color palette.
+- **View → PowerShell** runs commands in a persistent installed `pwsh.exe` session found on PATH.
+  The dialog shows recent output from the command session. Close the dialog to return to your
+  document, or choose **End session** to stop the process. The session uses redirected streams and
+  supports noninteractive commands. Interactive terminal programs need a terminal host.
 
 ## Not yet
 
 Parity with Windows Notepad is not established. Still to do: source-accurate blur, shadows and timed
 transitions; clipping and overflow; keyboard menu behaviour; caret geometry across fonts and DPI;
-IME/TSF composition; UI Automation; spell-check; printing and page setup (they show an unimplemented
-message); a rich Markdown preview (headings only today); movable tabs; kinetic scrolling; scrollbar
-dragging; context menus; non-UTF-8 decoding. Literal replace-all uses .NET ordinal matching, so some
+IME/TSF composition; UI Automation; spell-check; printing and page setup; a rich Markdown
+preview; encoding selection for new files. Moving a tab between windows starts a new undo history.
+Literal replace-all uses .NET ordinal matching, so some
 JavaScript Unicode case and replacement-token behaviour differs. Drawing uses a software Direct2D HWND
 render target; the final presentation path is not chosen.
 
@@ -87,6 +112,7 @@ The [PSC integration roadmap](https://github.com/MansfieldPlumbing/PSC#integrati
 
 - `Notepad.ps1`: the whole application, its design data and its checks.
 - `Start Notepad.cmd`: starts it.
+- `Start Notepad from Source.cmd` and its PowerShell launcher: start the app from source.
 - `reference/notepad.html`: the original simulacrum.
 - `reference/notepad.design.html`: the corrected reference page `-BuildDesign` generates, loading
   `notepad.design.js`.
