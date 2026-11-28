@@ -15,6 +15,7 @@ param(
     [switch]$VerifyModel,
     [switch]$VerifyGraphics,
     [switch]$VerifyWindow,
+    [switch]$InteractiveWindowVerification,
     [switch]$Compare,
     [switch]$VerifyNativeFeatures,
     [string]$UIAutomationTestDataDirectory

@@ -57,6 +57,11 @@ pwsh -NoProfile -STA -File '.\Start Notepad from Source.ps1' -NoSession -RunSeco
 pwsh -NoProfile -STA -File '.\Start Notepad from Source.ps1' -VerifyNativeFeatures
 ```
 
+`-VerifyWindow` checks caption hit tests, window bounds, and maximize and restore without moving the
+pointer or sending keyboard shortcuts. It may still show test windows. Add
+`-InteractiveWindowVerification` to exercise physical drag, Snap hover, and keyboard snapping on
+a desktop reserved for testing.
+
 `-VerifyModel` checks saving an inactive document, Unicode edits, undo/redo, find/replace,
 UTF-8/BOM/CRLF and session restoration. `-VerifyGraphics` checks all 25 icons, native window creation,
 Direct2D, DirectWrite, text metrics, caret/hit-test round trips and selection rectangles.

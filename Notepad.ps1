@@ -10,7 +10,7 @@ param(
     [ValidateSet('editor','settings')][string]$StartPage='editor',
     [ValidateSet('solid','mica','acrylic','reverseMica','clear')][string]$Backdrop,
     [ValidateSet('curved','straight')][string]$CornerStyle,[switch]$NoAnimation,
-    [switch]$VerifyModel,[switch]$VerifyGraphics,[switch]$VerifyWindow
+    [switch]$VerifyModel,[switch]$VerifyGraphics,[switch]$VerifyWindow,[switch]$InteractiveWindowVerification
 )
 
 # Folded from src\Model.ps1
@@ -942,6 +942,12 @@ class NotepadWindow {
     # The window thread's own buffers: its MSG and the window procedure's scratch, apart from the app thread's.
     hidden [IntPtr]$pumpMessage
     hidden [IntPtr]$procedureScratch
+    static [double] CaptionButtonWidth() { return 46 }
+    static [double] CaptionButtonHeight() { return 40 }
+    static [double] CaptionButtonLeft([double]$ClientWidth, [int]$FromRight) {
+        return $ClientWidth - $FromRight * [NotepadWindow]::CaptionButtonWidth()
+    }
+
     hidden [int]$requestedWidth
     hidden [int]$requestedHeight
     hidden [string]$requestedTitle
@@ -993,6 +999,8 @@ class NotepadWindow {
     static [int] GetClassNameW([IntPtr]$hwnd,[IntPtr]$name,[int]$length) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
     static [IntPtr] MonitorFromPoint([long]$point,[uint]$flags) { throw 'native' }
+    [System.Runtime.InteropServices.LibraryImport('user32.dll')]
+    static [IntPtr] MonitorFromRect([IntPtr]$rect,[uint]$flags) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
     static [int] GetMonitorInfoW([IntPtr]$monitor,[IntPtr]$info) { throw 'native' }
     [System.Runtime.InteropServices.LibraryImport('user32.dll')]
@@ -1293,7 +1301,27 @@ class NotepadWindow {
                 }finally{[NotepadWindow]::DragFinish($WParam)}
                 return [IntPtr]::Zero
             }
-            if ($Message -eq 0x0083) { return [IntPtr]::Zero } # WM_NCCALCSIZE: full client chrome.
+            if ($Message -eq 0x0083) { # WM_NCCALCSIZE
+                if ($LParam -ne [IntPtr]::Zero -and [NotepadWindow]::IsZoomed($Handle) -ne 0) {
+                    # Both RECT and NCCALCSIZE_PARAMS start with the proposed rectangle.
+                    $monitor = [NotepadWindow]::MonitorFromRect($LParam, 2)
+                    $info = $this.procedureScratch
+                    [Runtime.InteropServices.Marshal]::WriteInt32($info, 0, 40)
+                    if ([NotepadWindow]::GetMonitorInfoW($monitor, $info) -ne 0) {
+                        $left = [Math]::Max([Runtime.InteropServices.Marshal]::ReadInt32($LParam, 0), [Runtime.InteropServices.Marshal]::ReadInt32($info, 20))
+                        $top = [Math]::Max([Runtime.InteropServices.Marshal]::ReadInt32($LParam, 4), [Runtime.InteropServices.Marshal]::ReadInt32($info, 24))
+                        $right = [Math]::Min([Runtime.InteropServices.Marshal]::ReadInt32($LParam, 8), [Runtime.InteropServices.Marshal]::ReadInt32($info, 28))
+                        $bottom = [Math]::Min([Runtime.InteropServices.Marshal]::ReadInt32($LParam, 12), [Runtime.InteropServices.Marshal]::ReadInt32($info, 32))
+                        if ($right -gt $left -and $bottom -gt $top) {
+                            [Runtime.InteropServices.Marshal]::WriteInt32($LParam, 0, $left)
+                            [Runtime.InteropServices.Marshal]::WriteInt32($LParam, 4, $top)
+                            [Runtime.InteropServices.Marshal]::WriteInt32($LParam, 8, $right)
+                            [Runtime.InteropServices.Marshal]::WriteInt32($LParam, 12, $bottom)
+                        }
+                    }
+                }
+                return [IntPtr]::Zero
+            }
             if ($Message -eq 0x001A) { $this.Enqueue('settingChange') } # WM_SETTINGCHANGE: text size or theme may have changed.
             if ($Message -eq 0x0014) { return [IntPtr]1 } # suppress GDI background erase.
             if ($Message -eq 0x0024) { # WM_GETMINMAXINFO: keep the native toolbar and settings usable.
@@ -1342,7 +1370,7 @@ class NotepadWindow {
                     $clientX=[Runtime.InteropServices.Marshal]::ReadInt32($point)/$scale
                     $clientY=[Runtime.InteropServices.Marshal]::ReadInt32($point,4)/$scale
                     $width=[Runtime.InteropServices.Marshal]::ReadInt32($this.procedureScratch,8)/$scale
-                    if($clientY -ge 0 -and $clientY -lt 40 -and $clientX -ge $width-92 -and $clientX -lt $width-46){return [IntPtr]9}
+                    if($clientY -ge 0 -and $clientY -lt [NotepadWindow]::CaptionButtonHeight() -and $clientX -ge [NotepadWindow]::CaptionButtonLeft($width,2) -and $clientX -lt [NotepadWindow]::CaptionButtonLeft($width,1)){return [IntPtr]9}
                 }
                 return [IntPtr]1
             }
@@ -12731,7 +12759,7 @@ try{
 # The mouse is moved and pressed during the resize. Keys are sent only while Notepad is the foreground window.
 function Invoke-Window.Verify {
 [CmdletBinding()]
-param()
+param([switch]$Interactive)
 $ErrorActionPreference='Stop'
 $root=Split-Path $(Join-Path $PSScriptRoot 'tests')
 $native=Invoke-Native
@@ -12740,6 +12768,8 @@ function Bind([string]$Name,[Type]$Return,[Type[]]$Types,[string]$Library='user3
 function Record([string]$Check,[object]$Expected,[object]$Observed,[object]$Holds){$records.Add([pscustomobject]@{Check=$Check;Expected=$Expected;Observed=$Observed;Holds=$Holds})}
 $dpiContext=Bind 'SetThreadDpiAwarenessContext' ([IntPtr]) @([IntPtr]);$previousDpi=$dpiContext.DynamicInvoke([IntPtr](-4))
 $getClassName=Bind 'GetClassNameW' ([int]) @([IntPtr],[IntPtr],[int])
+$getClientRect=Bind 'GetClientRect' ([bool]) @([IntPtr],[IntPtr])
+$mapPoints=Bind 'MapWindowPoints' ([int]) @([IntPtr],[IntPtr],[IntPtr],[uint32])
 $getRect=Bind 'GetWindowRect' ([bool]) @([IntPtr],[IntPtr])
 $getDpi=Bind 'GetDpiForWindow' ([uint32]) @([IntPtr])
 $show=Bind 'ShowWindow' ([bool]) @([IntPtr],[int])
@@ -12762,6 +12792,11 @@ $getBits=Bind 'GetDIBits' ([int]) @([IntPtr],[IntPtr],[uint32],[uint32],[IntPtr]
 $scratch=$native.Allocate(256)
 function Rect([IntPtr]$Hwnd){$null=$getRect.DynamicInvoke($Hwnd,$scratch);[int[]]@(0,4,8,12|ForEach-Object{[Runtime.InteropServices.Marshal]::ReadInt32($scratch,$_)})}
 function Frame([IntPtr]$Hwnd){$null=$dwmGet.DynamicInvoke($Hwnd,[uint32]9,$scratch,[uint32]16);[int[]]@(0,4,8,12|ForEach-Object{[Runtime.InteropServices.Marshal]::ReadInt32($scratch,$_)})}
+function ClientInScreen([IntPtr]$Hwnd){
+    if(-not $getClientRect.DynamicInvoke($Hwnd,$scratch)){throw 'GetClientRect failed.'}
+    $null=$mapPoints.DynamicInvoke($Hwnd,[IntPtr]::Zero,$scratch,[uint32]2)
+    [int[]]@(0,4,8,12|ForEach-Object{[Runtime.InteropServices.Marshal]::ReadInt32($scratch,$_)})
+}
 function WorkArea([IntPtr]$Hwnd){[Runtime.InteropServices.Marshal]::WriteInt32($scratch,40,40);$null=$monitorInfo.DynamicInvoke($monitorFrom.DynamicInvoke($Hwnd,[uint32]2),[IntPtr]::Add($scratch,40));[int[]]@(60,64,68,72|ForEach-Object{[Runtime.InteropServices.Marshal]::ReadInt32($scratch,$_)})}
 function Near([int[]]$A,[int[]]$B,[int]$Tolerance=2){if($A.Length -ne $B.Length){return $false};for($i=0;$i -lt $A.Length;$i++){if([Math]::Abs($A[$i]-$B[$i]) -gt $Tolerance){return $false}};$true}
 function Pixels([int]$X,[int]$Y,[int]$W,[int]$H){
@@ -12805,40 +12840,55 @@ try{
             # Live resize: the close button stays at the top-right corner while the right edge is dragged.
             $start=Rect $hwnd;$button=[int[]]@([int](46*$scale),[int](40*$scale))
             $reference=Pixels ($start[2]-$button[0]) $start[1] $button[0] $button[1]
-            $y=[int](($start[1]+$start[3])/2);$null=$setCursor.DynamicInvoke($start[2]-2,$y);Start-Sleep -Milliseconds 150
-            $mouse.DynamicInvoke([uint32]2,0,0,[uint32]0,[IntPtr]::Zero);Start-Sleep -Milliseconds 150
-            $differences=[Collections.Generic.List[double]]::new()
-            foreach($step in 1..8){
-                $null=$setCursor.DynamicInvoke($start[2]-2-40*$step,$y);Start-Sleep -Milliseconds 120
-                $now=Rect $hwnd;$differences.Add((Difference $reference (Pixels ($now[2]-$button[0]) $now[1] $button[0] $button[1])))
-            }
-            $null=$setCursor.DynamicInvoke($start[2]-4000,$y);Start-Sleep -Milliseconds 300
-            $smallest=Rect $hwnd
-            $mouse.DynamicInvoke([uint32]4,0,0,[uint32]0,[IntPtr]::Zero);Start-Sleep -Milliseconds 400
-            $worst=($differences|Measure-Object -Maximum).Maximum
-            Record 'caption buttons follow the edge during a live resize (mean byte difference per step)' '< 12 at every step' ($differences -join ', ') ($worst -lt 12)
-            Record 'minimum width under a drag' $minimum[0] ($smallest[2]-$smallest[0]) (($smallest[2]-$smallest[0]) -eq $minimum[0])
+            $y=[int](($start[1]+$start[3])/2)
+            $edgeX=$start[2]-[int][Math]::Max(2,[Math]::Floor(4*$scale))
+            $edgePoint=[IntPtr](($y -shl 16) -bor ($edgeX -band 0xffff))
+            $edgeHit=$send.DynamicInvoke($hwnd,[uint32]0x84,[IntPtr]::Zero,$edgePoint).ToInt64()
+            Record 'right resize edge hit test' 11 $edgeHit ($edgeHit -eq 11)
+            if($Interactive){
+                $null=$setCursor.DynamicInvoke($edgeX,$y);Start-Sleep -Milliseconds 150
+                $mouse.DynamicInvoke([uint32]2,0,0,[uint32]0,[IntPtr]::Zero);Start-Sleep -Milliseconds 150
+                $differences=[Collections.Generic.List[double]]::new()
+                foreach($step in 1..8){
+                    $null=$setCursor.DynamicInvoke($edgeX-40*$step,$y);Start-Sleep -Milliseconds 120
+                    $now=Rect $hwnd;$differences.Add((Difference $reference (Pixels ($now[2]-$button[0]) $now[1] $button[0] $button[1])))
+                }
+                $null=$setCursor.DynamicInvoke($start[2]-4000,$y);Start-Sleep -Milliseconds 300
+                $smallest=Rect $hwnd
+                $mouse.DynamicInvoke([uint32]4,0,0,[uint32]0,[IntPtr]::Zero);Start-Sleep -Milliseconds 400
+                $worst=($differences|Measure-Object -Maximum).Maximum
+                Record 'caption buttons follow the edge during a live resize (mean byte difference per step)' '< 12 at every step' ($differences -join ', ') ($worst -lt 12)
+                Record 'minimum width under a drag' $minimum[0] ($smallest[2]-$smallest[0]) (($smallest[2]-$smallest[0]) -eq $minimum[0])
+            }else{Record 'physical edge drag and live caption tracking' 'interactive desktop opt-in' 'skipped' $null}
             $null=$show.DynamicInvoke($hwnd,9);Start-Sleep -Milliseconds 400
             # Snap Layouts appears over the maximize button only when the window reports it there.
             $rect=Rect $hwnd;$x=$rect[2]-[int](69*$scale);$top=$rect[1]+[int](20*$scale)
             $hit=$send.DynamicInvoke($hwnd,[uint32]0x84,[IntPtr]::Zero,[IntPtr](($top -shl 16) -bor ($x -band 0xffff))).ToInt64()
             Record 'maximize button hit test (Snap Layouts)' 9 $hit ($hit -eq 9)
-            $sampleW=[int](240*$scale);$sampleH=[int](120*$scale)
-            $sampleX=$rect[2]-$sampleW;$sampleY=$rect[1]+[int](48*$scale)
-            $null=$setCursor.DynamicInvoke($rect[0]+[int](150*$scale),$top)
-            Start-Sleep -Milliseconds 550
-            $beforeHover=Pixels $sampleX $sampleY $sampleW $sampleH
-            $null=$setCursor.DynamicInvoke($x,$top)
-            Start-Sleep -Milliseconds 1100
-            $hoverChange=Difference $beforeHover (Pixels $sampleX $sampleY $sampleW $sampleH)
-            Record 'maximize hover opens a flyout below the caption' '> 2 mean pixel-byte difference' $hoverChange ($hoverChange -gt 2)
-            $null=$setCursor.DynamicInvoke($rect[0]+[int](150*$scale),$top)
-            Start-Sleep -Milliseconds 350
+            if($Interactive){
+                $sampleW=[int](240*$scale);$sampleH=[int](120*$scale)
+                $sampleX=$rect[2]-$sampleW;$sampleY=$rect[1]+[int](48*$scale)
+                $null=$setCursor.DynamicInvoke($rect[0]+[int](150*$scale),$top)
+                Start-Sleep -Milliseconds 550
+                $beforeHover=Pixels $sampleX $sampleY $sampleW $sampleH
+                $null=$setCursor.DynamicInvoke($x,$top)
+                Start-Sleep -Milliseconds 1100
+                $hoverChange=Difference $beforeHover (Pixels $sampleX $sampleY $sampleW $sampleH)
+                Record 'maximize hover opens a flyout below the caption' '> 2 mean pixel-byte difference' $hoverChange ($hoverChange -gt 2)
+                $null=$setCursor.DynamicInvoke($rect[0]+[int](150*$scale),$top)
+                Start-Sleep -Milliseconds 350
+            }else{Record 'Snap Layout hover' 'interactive desktop opt-in' 'skipped' $null}
             # Maximize fills the work area; restore returns the window.
             $before=Rect $hwnd
             $null=$show.DynamicInvoke($hwnd,3);Start-Sleep -Milliseconds 600
             $work=WorkArea $hwnd;$frame=Frame $hwnd
             Record 'maximized' $true $isZoomed.DynamicInvoke($hwnd) ($isZoomed.DynamicInvoke($hwnd) -eq $true)
+            $outer=Rect $hwnd
+            $client=ClientInScreen $hwnd
+            Record 'maximized geometry in screen pixels' 'outer window, DWM frame, client, monitor work area' @{
+                Dpi=$getDpi.DynamicInvoke($hwnd);Outer=$outer;Frame=$frame;Client=$client;WorkArea=$work
+            } $null
+            Record 'maximized client equals the work area' ($work -join ',') ($client -join ',') (Near $client $work)
             Record 'maximized frame equals the work area' ($work -join ',') ($frame -join ',') (Near $frame $work)
             $null=$show.DynamicInvoke($hwnd,9);Start-Sleep -Milliseconds 600
             $after=Rect $hwnd;Record 'restore after maximize returns the window' ($before -join ',') ($after -join ',') (Near $after $before)
@@ -12846,21 +12896,23 @@ try{
             Record 'minimized' $true $isIconic.DynamicInvoke($hwnd) ($isIconic.DynamicInvoke($hwnd) -eq $true)
             $null=$show.DynamicInvoke($hwnd,9);Start-Sleep -Milliseconds 600
             $after=Rect $hwnd;Record 'restore after minimize returns the window' ($before -join ',') ($after -join ',') ((-not $isIconic.DynamicInvoke($hwnd)) -and (Near $after $before))
-            # Snap with the keyboard, only while Notepad is the foreground window.
-            if($foreground.DynamicInvoke() -ne $hwnd){Record 'Win+Left, Win+Up, Win+Down' 'Notepad in the foreground' 'another window was in the foreground; no keys sent' $null}
-            else{
-                $before=Rect $hwnd
-                Chord @(0x5B,0x25)
-                $work=WorkArea $hwnd;$frame=Frame $hwnd;$half=[int[]]@($work[0],$work[1],[int]($work[0]+($work[2]-$work[0])/2),$work[3])
-                Record 'Win+Left snaps to the left half of the work area' ($half -join ',') ($frame -join ',') (Near $frame $half 3)
-                # Snap Assist offers other windows for the other half and takes the foreground; Escape dismisses it.
-                if($foreground.DynamicInvoke() -ne $hwnd){Chord @(0x1B)}
-                if($foreground.DynamicInvoke() -eq $hwnd){
-                    Chord @(0x5B,0x26);Record 'Win+Up maximizes the snapped window' $true $isZoomed.DynamicInvoke($hwnd) ($isZoomed.DynamicInvoke($hwnd) -eq $true)
-                    Chord @(0x5B,0x28);Chord @(0x5B,0x28)
-                    $after=Rect $hwnd;Record 'Win+Down twice returns the window from snap' ($before -join ',') ($after -join ',') (Near $after $before)
-                }else{Record 'Win+Up, Win+Down' 'Notepad in the foreground' 'another window was in the foreground after Snap Assist; no keys sent' $null}
-            }
+            if($Interactive){
+                # Snap with the keyboard, only while Notepad is the foreground window.
+                if($foreground.DynamicInvoke() -ne $hwnd){Record 'Win+Left, Win+Up, Win+Down' 'Notepad in the foreground' 'another window was in the foreground; no keys sent' $null}
+                else{
+                    $before=Rect $hwnd
+                    Chord @(0x5B,0x25)
+                    $work=WorkArea $hwnd;$frame=Frame $hwnd;$half=[int[]]@($work[0],$work[1],[int]($work[0]+($work[2]-$work[0])/2),$work[3])
+                    Record 'Win+Left snaps to the left half of the work area' ($half -join ',') ($frame -join ',') (Near $frame $half 3)
+                    # Snap Assist offers other windows for the other half and takes the foreground; Escape dismisses it.
+                    if($foreground.DynamicInvoke() -ne $hwnd){Chord @(0x1B)}
+                    if($foreground.DynamicInvoke() -eq $hwnd){
+                        Chord @(0x5B,0x26);Record 'Win+Up maximizes the snapped window' $true $isZoomed.DynamicInvoke($hwnd) ($isZoomed.DynamicInvoke($hwnd) -eq $true)
+                        Chord @(0x5B,0x28);Chord @(0x5B,0x28)
+                        $after=Rect $hwnd;Record 'Win+Down twice returns the window from snap' ($before -join ',') ($after -join ',') (Near $after $before)
+                    }else{Record 'Win+Up, Win+Down' 'Notepad in the foreground' 'another window was in the foreground after Snap Assist; no keys sent' $null}
+                }
+            }else{Record 'keyboard snapping' 'interactive desktop opt-in' 'skipped' $null}
         }finally{
             if(-not $process.HasExited){if($hwnd -ne [IntPtr]::Zero){$null=$post.DynamicInvoke($hwnd,[uint32]0x10,[IntPtr]::Zero,[IntPtr]::Zero)};if(-not $process.WaitForExit(10000)){$process.Kill()}}
         }
@@ -12879,7 +12931,7 @@ $ErrorActionPreference='Stop'
 if(-not $IsWindows){throw 'This direct Windows implementation requires PowerShell 7 on Windows.'}
 # Notepad's own conformance checks: the document model, and the native window, Direct2D and DirectWrite.
 if($VerifyModel){Invoke-Model.Verify;return}
-if($VerifyWindow){Invoke-Window.Verify;return}
+if($VerifyWindow){Invoke-Window.Verify -Interactive:$InteractiveWindowVerification;return}
 if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Launch with pwsh -STA -File Notepad.ps1.'}
 if($VerifyGraphics){if($RunSeconds -gt 0){Invoke-Graphics.Smoke -Seconds $RunSeconds}else{Invoke-Graphics.Smoke};return}
 
@@ -17644,7 +17696,7 @@ function Paint-Chrome {
     $paintChrome=!$settings.gradientEnabled -or ($customChrome -and $opaqueChrome)
     if($paintChrome){$graphics.Fill(0,0,$w,42,(Surface-Hex $titleColor),0)}
     Node 'titlebar-drag' 0 0 $w 42 ([FluentAction]::Drag) $null 'default';Paint-AppIcon 'app-icon' 24 13 14
-    $x=54.0;$right=$w-138
+    $x=54.0;$right=[NotepadWindow]::CaptionButtonLeft($w,3)
     $tabSpace=$right-$x-42
     $capacity=[Math]::Max(1,[int][Math]::Floor($tabSpace/112))
     $overflow=$state.Tabs.Count -gt $capacity
@@ -17697,9 +17749,9 @@ function Paint-Chrome {
     }
     $x=[Math]::Min($x+4,$right-36)
     Button 'btn-add-tab' $x 6 32 32 ([FluentAction]::NewTab) '' 'plus' $null $false $false 14
-    Button 'btn-win-min' ($w-138) 0 46 40 ([FluentAction]::Minimize) '' 'minimize' $null $false $false 10
-    Button 'btn-win-max' ($w-92) 0 46 40 ([FluentAction]::Maximize) '' 'maximize' $null $false $false 10
-    Button 'btn-win-close' ($w-46) 0 46 40 ([FluentAction]::CloseWindow) '' 'close' $null $false $false 10
+    Button 'btn-win-min' ([NotepadWindow]::CaptionButtonLeft($w,3)) 0 ([NotepadWindow]::CaptionButtonWidth()) ([NotepadWindow]::CaptionButtonHeight()) ([FluentAction]::Minimize) '' 'minimize' $null $false $false 10
+    Button 'btn-win-max' ([NotepadWindow]::CaptionButtonLeft($w,2)) 0 ([NotepadWindow]::CaptionButtonWidth()) ([NotepadWindow]::CaptionButtonHeight()) ([FluentAction]::Maximize) '' 'maximize' $null $false $false 10
+    Button 'btn-win-close' ([NotepadWindow]::CaptionButtonLeft($w,1)) 0 ([NotepadWindow]::CaptionButtonWidth()) ([NotepadWindow]::CaptionButtonHeight()) ([FluentAction]::CloseWindow) '' 'close' $null $false $false 10
     if($paintChrome){$graphics.Fill(0,42,$w,38,(Surface-Hex $ribbonColor),0)}
     $mx=8.0
     foreach($entry in [NotepadMenuEntry[]]@(@{Name='file';Text='File';Width=44},@{Name='edit';Text='Edit';Width=44},@{Name='view';Text='View';Width=48})){
@@ -18073,9 +18125,9 @@ function Paint-Settings {
     # The title bar drags the window, as on the editor page; the buttons drawn after it take their own clicks.
     Node 'titlebar-drag' 0 0 $w 40 ([FluentAction]::Drag) $null 'default'
     Button 'settings-btn-back' 8 4 32 32 ([FluentAction]::Back) '' 'back';Paint-AppIcon 'settings-app-icon' 48 11 18;Label 'Notepad' 88 12 200 (Color 'text-primary') 12
-    Button 'settings-win-min' ($w-138) 0 46 40 ([FluentAction]::Minimize) '' 'minimize' $null $false $false 10
-    Button 'settings-win-max' ($w-92) 0 46 40 ([FluentAction]::Maximize) '' 'maximize' $null $false $false 10
-    Button 'settings-win-close' ($w-46) 0 46 40 ([FluentAction]::CloseWindow) '' 'close' $null $false $false 10
+    Button 'settings-win-min' ([NotepadWindow]::CaptionButtonLeft($w,3)) 0 ([NotepadWindow]::CaptionButtonWidth()) ([NotepadWindow]::CaptionButtonHeight()) ([FluentAction]::Minimize) '' 'minimize' $null $false $false 10
+    Button 'settings-win-max' ([NotepadWindow]::CaptionButtonLeft($w,2)) 0 ([NotepadWindow]::CaptionButtonWidth()) ([NotepadWindow]::CaptionButtonHeight()) ([FluentAction]::Maximize) '' 'maximize' $null $false $false 10
+    Button 'settings-win-close' ([NotepadWindow]::CaptionButtonLeft($w,1)) 0 ([NotepadWindow]::CaptionButtonWidth()) ([NotepadWindow]::CaptionButtonHeight()) ([FluentAction]::CloseWindow) '' 'close' $null $false $false 10
     $col=[Math]::Min(650,$w-118);$left=($w-$col)/2;$right=$left
     $y=74-$ui.SettingsScroll
     $graphics.Clip(0,40,($w-12),($h-40));$ui.HitClip=@(0,40,($w-12),($h-40))
