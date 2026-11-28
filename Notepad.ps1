@@ -12739,6 +12739,7 @@ $records=[Collections.Generic.List[object]]::new()
 function Bind([string]$Name,[Type]$Return,[Type[]]$Types,[string]$Library='user32.dll'){$native.GetExportCall($Library,$Name,$Return,$Types)}
 function Record([string]$Check,[object]$Expected,[object]$Observed,[object]$Holds){$records.Add([pscustomobject]@{Check=$Check;Expected=$Expected;Observed=$Observed;Holds=$Holds})}
 $dpiContext=Bind 'SetThreadDpiAwarenessContext' ([IntPtr]) @([IntPtr]);$previousDpi=$dpiContext.DynamicInvoke([IntPtr](-4))
+$getClassName=Bind 'GetClassNameW' ([int]) @([IntPtr],[IntPtr],[int])
 $getRect=Bind 'GetWindowRect' ([bool]) @([IntPtr],[IntPtr])
 $getDpi=Bind 'GetDpiForWindow' ([uint32]) @([IntPtr])
 $show=Bind 'ShowWindow' ([bool]) @([IntPtr],[int])
@@ -12780,12 +12781,22 @@ function Chord([byte[]]$Keys){foreach($k in $Keys){$key.DynamicInvoke($k,[byte]0
 $expectedBackdrop=@{mica=2;acrylic=3;reverseMica=4}
 try{
     foreach($material in 'mica','acrylic','reverseMica'){
-        $process=Start-Process -FilePath ([Environment]::ProcessPath) -ArgumentList @('-NoProfile','-STA','-File',('"'+[IO.Path]::Join($PSScriptRoot,'Start Notepad from Source.ps1')+'"'),'-NoSession','-NoAnimation','-RunSeconds','90','-Backdrop',$material) -PassThru
+        $process=Start-Process -FilePath ([Environment]::ProcessPath) -ArgumentList @('-NoProfile','-STA','-File',('"'+[IO.Path]::Join($PSScriptRoot,'Start Notepad from Source.ps1')+'"'),'-NoSession','-NoAnimation','-RunSeconds','90','-Backdrop',$material) -WindowStyle Hidden -PassThru
         try{
             $until=[DateTime]::UtcNow.AddSeconds(90)
-            while($process.MainWindowHandle -eq [IntPtr]::Zero -and -not $process.HasExited -and [DateTime]::UtcNow -lt $until){Start-Sleep -Milliseconds 250;$process.Refresh()}
-            if($process.MainWindowHandle -eq [IntPtr]::Zero){Record "$material window" 'a window' 'none' $false;continue}
-            $hwnd=$process.MainWindowHandle;Start-Sleep -Milliseconds 1500
+            $hwnd=[IntPtr]::Zero
+            while($hwnd -eq [IntPtr]::Zero -and -not $process.HasExited -and [DateTime]::UtcNow -lt $until){
+                Start-Sleep -Milliseconds 250
+                $process.Refresh()
+                $candidate=$process.MainWindowHandle
+                if($candidate -ne [IntPtr]::Zero){
+                    $length=$getClassName.DynamicInvoke($candidate,$scratch,128)
+                    $class=[Runtime.InteropServices.Marshal]::PtrToStringUni($scratch,$length)
+                    if($class.StartsWith('NotepadPS_',[StringComparison]::Ordinal)){$hwnd=$candidate}
+                }
+            }
+            if($hwnd -eq [IntPtr]::Zero){Record "$material window" 'a window' 'none' $false;continue}
+            Start-Sleep -Milliseconds 1500
             $null=$dwmGet.DynamicInvoke($hwnd,[uint32]38,$scratch,[uint32]4);$observed=[Runtime.InteropServices.Marshal]::ReadInt32($scratch)
             Record "backdrop $material" $expectedBackdrop[$material] $observed ($observed -eq $expectedBackdrop[$material])
             if($material -ne 'mica'){continue}
@@ -12851,9 +12862,10 @@ try{
                 }else{Record 'Win+Up, Win+Down' 'Notepad in the foreground' 'another window was in the foreground after Snap Assist; no keys sent' $null}
             }
         }finally{
-            if(-not $process.HasExited){$null=$post.DynamicInvoke($process.MainWindowHandle,[uint32]0x10,[IntPtr]::Zero,[IntPtr]::Zero);if(-not $process.WaitForExit(10000)){$process.Kill()}}
+            if(-not $process.HasExited){if($hwnd -ne [IntPtr]::Zero){$null=$post.DynamicInvoke($hwnd,[uint32]0x10,[IntPtr]::Zero,[IntPtr]::Zero)};if(-not $process.WaitForExit(10000)){$process.Kill()}}
         }
     }
+    [IO.Directory]::CreateDirectory("$root/artifacts") | Out-Null
     $records|ConvertTo-Json -Depth 4|Set-Content "$root\artifacts\window-checks.json"
     $records
 }finally{$native.Free($scratch);$null=$dpiContext.DynamicInvoke($previousDpi);$native.Dispose()}
@@ -13936,7 +13948,13 @@ if ($VerifyNativeFeatures) {
     $nativeReplay=Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -ArgumentList @('-NoProfile','-STA','-File',('"'+(Join-Path $PSScriptRoot 'Start Notepad from Source.ps1')+'"'),'-NoSession','-Width','1000','-Height','720','-RunSeconds','120','-DiagnosticPath',('"'+$livePath+'"')) -WindowStyle Hidden -RedirectStandardError $startupErrors -PassThru
     $replayStates=[Collections.Generic.List[object]]::new();$replayChecks=[Collections.Generic.List[object]]::new()
     $replayRoot=[IntPtr]::Zero;$replayWalker=[IntPtr]::Zero;$replayUia=[IntPtr]::Zero;$replayUnknown=[IntPtr]::Zero
+    # SendMessage virtualizes mouse coordinates when the sender and target use different DPI contexts.
+    $replayDpiType=New-NativeDelegateType 'NativeReplayDpiContext' ([IntPtr]) ([type[]]@([IntPtr]))
+    $setReplayDpi=Get-NativeFunction 'user32.dll' 'SetThreadDpiAwarenessContext' $replayDpiType
+    $previousReplayDpi=[IntPtr]::Zero
     try {
+        $previousReplayDpi=$setReplayDpi.DynamicInvoke([IntPtr](-4))
+        if($previousReplayDpi -eq [IntPtr]::Zero){throw 'Could not set the replay thread DPI context.'}
         for($i=0;$i -lt 300 -and !$nativeReplay.HasExited -and -not(Test-Path $livePath);$i++){Start-Sleep -Milliseconds 100}
         if(-not(Test-Path $livePath)){throw ('The native feature replay did not expose its diagnostic state. '+(Get-Content -LiteralPath $startupErrors -Raw))}
         # Do not query UIA while the HWND is still moving outside the virtual desktop.
@@ -14210,6 +14228,7 @@ if ($VerifyNativeFeatures) {
         $replayChecks | Format-Table -AutoSize
         if(@($replayChecks|Where-Object Verdict -eq 'FALSE').Count){throw 'The native feature replay found a defect.'}
     }finally{
+        if($previousReplayDpi -ne [IntPtr]::Zero){$null=$setReplayDpi.DynamicInvoke($previousReplayDpi)}
         [pscustomobject]@{TimeUtc=[DateTime]::UtcNow;SourceSHA256=(Get-FileHash (Join-Path $PSScriptRoot 'Notepad.ps1') -Algorithm SHA256).Hash;States=$replayStates.ToArray();Checks=$replayChecks.ToArray()}|Export-Clixml (Join-Path $UIAutomationTestDataDirectory 'native-feature-replay-last-attempt.clixml')
         foreach($pointer in @($replayRoot,$replayWalker,$replayUia,$replayUnknown)){if($pointer -ne [IntPtr]::Zero){[void][Runtime.InteropServices.Marshal]::Release($pointer)}}
         $nativeReplay.Refresh();if(-not $nativeReplay.HasExited){$nativeReplay.Kill()}
